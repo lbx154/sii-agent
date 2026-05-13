@@ -45,4 +45,4 @@ def dispatch(name: str, arguments: dict[str, Any]) -> str:
 
 
 # import side-effects: register built-in tools
-from . import wiki, search, browser, browsecomp, finalize  # noqa: E402,F401
+from . import wiki, search, browser, vision, browsecomp, finalize  # noqa: E402,F401

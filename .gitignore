@@ -9,4 +9,6 @@ data/browsecomp-plus/
 .venv/
 *.egg-info/
 .playwright/
+third_party/
+saves/
 *.pdf

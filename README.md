@@ -45,6 +45,7 @@ bash scripts/start_qwen_vllm.sh
 - `browsecomp_search` / `browsecomp_get_document`: 面向 BrowseComp-Plus 固定语料的 SQLite FTS5 检索工具，输出官方 docid，便于计算 retrieval recall 和提交打榜结果。
 - `browse`: 静态网页正文抽取；`browse_many`: 并发读取多 URL，适合一次性比对多个搜索结果页面。
 - Playwright 沙盒浏览器：`browser_open` / `browser_text` / `browser_click` / `browser_type` / `browser_close` 支持真实页面访问、点击、输入和会话状态；如机器未安装 Chromium，先运行 `python -m playwright install chromium`。
+- `image_to_text`: 使用 `.env` 中 GPT-5.4 OpenAI-compatible endpoint 对图片 URL/本地图片做 OCR 和视觉证据描述，用于图搜文、截图、文档图片和图表线索。
 - 工具沙盒：`uvicorn tools.server:app --host 0.0.0.0 --port 8080` 可通过 HTTP 暴露 `/tools`、`/call` 和有界并发的 `/call_many`。
 
 ## 并发评测 / 批量进化
@@ -58,6 +59,23 @@ bash scripts/start_qwen_vllm.sh
 - `python -m evaluation.run_browsecomp --mode evolved --n 0 --concurrency 32` 会解密官方 query 集、本地运行 agent，并在 `logs/browsecomp/.../runs/` 生成官方兼容 JSON 文件。
 - 输出目录同时包含 `browsecomp_plus_decrypted.jsonl` 和 `qrel_evidence.txt`，可配合 BrowseComp-Plus 官方 `scripts_evaluation/evaluate_run.py --input_dir <runs> --ground_truth <...> --qrel_evidence <...>` 做 judge 评分。
 - `python -m evaluation.merge_browsecomp_runs --run-dirs <run-a> <run-b> ... --out <merged>` 可用无 gold 的 LLM selector 在多条 agent 轨迹答案中选择最终答案；`python -m evaluation.route_browsecomp_runs --primary-run <cheap-run> --fallback-run <selector-run> --out <routed>` 可只在廉价轨迹出现拒答、超长答案或搜索预算打满时切到更贵的 selector run。
+
+## GPT-5.4 OPD / 偏好蒸馏
+- 数据：2Wiki 有 `train/validation/test`，可用 `--split train` 做 OPD 训练；当前 SimpleQA loader 没有 public train split，只有 `test` 和很小的 `few_shot`，不要把 SimpleQA test 同时用于训练和评测。
+- 专家：`python -m training.opd` 默认读取 `.env` 中的 `OPD_EXPERT_MODEL` / `AZURE_OPENAI_DEPLOYMENT`，使用 GPT-5.4 给多条 agent 轨迹打 chosen/rejected 偏好。
+- 数学口径：这里的 OPD 不是自定义 loss，而是“离线偏好数据上的 KL-regularized policy distillation”。默认用 DPO/sigmoid：
+  `-log σ(β[(logπθ(y+)−logπref(y+)) − (logπθ(y−)−logπref(y−))])`，即用 reference model 的 reverse-KL 约束把 GPT-5.4 偏好蒸馏进 Qwen student。LlamaFactory 的 DPO trainer 内部也设置 `f_divergence_type="reverse_kl"`。
+- 训练：脚本会导出 LlamaFactory ranking 数据、`dataset_info.json`、DPO 配置和 `train_llamafactory_opd.sh`；默认 `pref_loss: sigmoid`。默认 `--lf-export-mode answer` 只优化最终答案文本，最稳；`final_tool` / `action` 可导出 Qwen3.5 tool-call 格式用于实验，但会更强地改变 ReAct 工具策略。ORPO/SimPO 是 reference-free ablation，不作为 OPD 默认。
+- 两卡训练：生成的 `train_llamafactory_opd.sh` 默认 `CUDA_VISIBLE_DEVICES=4,5 FORCE_TORCHRUN=1`，会在缺少 `llamafactory-cli` 时 clone/install `hiyouga/LLaMA-Factory` 到 `third_party/`。
+
+示例：
+```bash
+python -m evaluation.run_eval --task 2wiki --split train --mode baseline --n 200 --concurrency 32 --save-traces --out logs/opd_traces
+python -m evaluation.run_eval --task 2wiki --split train --mode evolved --n 200 --concurrency 32 --evolve-batch-size 8 --save-traces --out logs/opd_traces
+python -m training.opd --runs logs/opd_traces/<baseline-run> logs/opd_traces/<evolved-run> --out logs/opd/gpt54_2wiki --expert llm --pref-loss sigmoid --model-name-or-path Qwen/Qwen3.5-9B --lf-export-mode answer --lf-template qwen3_5_nothink
+bash logs/opd/gpt54_2wiki/llamafactory/train_llamafactory_opd.sh
+python -m evaluation.apply_opd_policy --policy logs/opd/gpt54_2wiki/opd_policy.json --runs <heldout-run-a> <heldout-run-b> --out logs/opd_eval/heldout
+```
 
 ## 评分项映射
 | 评分维度 | 代码位置 |

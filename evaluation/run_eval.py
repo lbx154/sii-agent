@@ -15,7 +15,7 @@ from agent.runner import RunOutcome, run_baseline, run_evolved
 from agent.scoring import score_answer
 from harness.controller import HarnessConfig
 from memory.store import MemoryStore
-from .datasets import LOADERS
+from .datasets import DEFAULT_SPLITS, LOADERS, load_examples
 
 console = Console()
 
@@ -29,6 +29,8 @@ def _record(ex: dict, outcome: RunOutcome, save_traces: bool = False) -> dict:
     scores = score_answer(outcome.result.final_answer, ex["answer"])
     record = {
         "id": ex["id"],
+        "task": ex.get("task"),
+        "split": ex.get("split"),
         "question": ex["question"],
         "expected": ex["answer"],
         "predicted": outcome.result.final_answer,
@@ -109,11 +111,6 @@ def _run_parallel_batch(
             yield record
 
 
-def _load_examples(task: str, n: int, offset: int) -> list[dict]:
-    limit = n + offset if n is not None else None
-    return list(LOADERS[task](limit))[offset:]
-
-
 def _prepare_memory(
     mode: str,
     out: Path,
@@ -132,6 +129,7 @@ def _prepare_memory(
 def run(
     task: str,
     mode: str,
+    split: str | None,
     n: int,
     out_dir: str,
     max_steps: int,
@@ -167,7 +165,8 @@ def run(
     exact_correct = 0
     sum_f1 = 0.0
     n_f1 = 0
-    examples = _load_examples(task, n, offset)
+    split = split or DEFAULT_SPLITS[task]
+    examples = load_examples(task, n, offset, split=split)
     t0 = time.time()
 
     if mode == "baseline":
@@ -226,7 +225,7 @@ def run(
 
     f_jsonl.close()
     summary = {
-        "task": task, "mode": mode, "n": n_total,
+        "task": task, "split": split, "mode": mode, "n": n_total,
         "offset": offset,
         "accuracy": n_correct / n_total if n_total else 0.0,
         "exact_match": exact_correct / n_total if n_total else 0.0,
@@ -255,6 +254,11 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--task", choices=list(LOADERS), required=True)
     p.add_argument("--mode", choices=["baseline", "evolved"], required=True)
+    p.add_argument(
+        "--split",
+        default=None,
+        help="Dataset split. Defaults to test for SimpleQA and validation for 2Wiki. 2Wiki also supports train/test; SimpleQA has no public train split.",
+    )
     p.add_argument("--n", type=int, default=20)
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--max-steps", type=int, default=8)
@@ -288,6 +292,7 @@ def main():
     run(
         args.task,
         args.mode,
+        args.split,
         args.n,
         args.out,
         args.max_steps,

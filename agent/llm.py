@@ -48,4 +48,10 @@ def chat(messages: list[dict], tools: list[dict] | None = None, **kw) -> Any:
         payload["tool_choice"] = kw.pop("tool_choice", "auto")
         payload["parallel_tool_calls"] = kw.pop("parallel_tool_calls", False)
     payload.update(kw)
+    if os.getenv("LLM_BACKEND", "azure").lower() == "vllm" and os.getenv("VLLM_ENABLE_THINKING", "0").lower() not in {"1", "true", "yes"}:
+        extra_body = dict(payload.get("extra_body") or {})
+        chat_template_kwargs = dict(extra_body.get("chat_template_kwargs") or {})
+        chat_template_kwargs.setdefault("enable_thinking", False)
+        extra_body["chat_template_kwargs"] = chat_template_kwargs
+        payload["extra_body"] = extra_body
     return client.chat.completions.create(**payload)
