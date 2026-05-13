@@ -1,0 +1,264 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{fancyhdr}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!60!black,
+  citecolor=blue!50!black
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{SII-Agent 实验报告}
+\rhead{2026-05-13}
+\cfoot{\thepage}
+
+\setlist[itemize]{leftmargin=1.6em,itemsep=0.2em,topsep=0.2em}
+\setlist[enumerate]{leftmargin=1.8em,itemsep=0.2em,topsep=0.2em}
+\renewcommand{\arraystretch}{1.18}
+
+\title{\textbf{SII-Agent 自进化任务求解实验报告}\\
+\large 从初始不收敛到 BrowseComp-Plus 全量可打榜}
+\author{SII-Agent / Qwen3.5-9B}
+\date{2026-05-13}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本报告总结了本轮从 SimpleQA、2Wiki 到 BrowseComp-Plus 的完整实验过程。
+系统最初存在模型反复搜索、不提交最终答案、BrowseComp 固定语料检索未接入、反思可能泄漏 gold answer、局部字符串评分偏宽等问题。
+经过 ReAct/Harness 收敛控制、严格评分、固定语料 BM25 检索、无 gold 反思、长期记忆与 batch-wise test-time evolution 等改造后，系统在 SimpleQA、2Wiki 和 BrowseComp-Plus 上均表现出相对 baseline 的提升。
+BrowseComp-Plus 全量 830 题使用 Qwen3-32B 作为 LLM-as-judge 评测，baseline 准确率为 25.54\%，ours/evolved 为 31.57\%，同时 evidence recall 从 31.65\% 提升到 40.95\%。
+\end{abstract}
+
+\section{实验目标}
+
+本轮工作的目标是实现夏令营赛题要求中的自进化任务求解 Agent，并进行可复现实验：
+
+\begin{itemize}
+  \item 实现工具增强的 ReAct Agent，包括搜索、浏览和最终答案提交工具。
+  \item 引入 Harness，对最大步数、超时、重复工具调用、工具白名单和最终收敛进行控制。
+  \item 实现 Reflection 与 Memory，让系统能够在测试时从失败轨迹中总结策略。
+  \item 在 SimpleQA 和 2Wiki 上比较 baseline 与 evolved。
+  \item 接入 BrowseComp-Plus 固定语料库，生成 leaderboard-compatible run files，并用 Qwen3-32B 进行 LLM-as-judge 评测。
+\end{itemize}
+
+\section{方法概述}
+
+\subsection{Retriever}
+
+BrowseComp-Plus 实验中使用的 retriever 是 \textbf{BM25}，实现方式为 SQLite FTS5：
+
+\begin{itemize}
+  \item 语料：\texttt{Tevatron/browsecomp-plus-corpus} 官方固定 corpus。
+  \item 索引：\texttt{data/browsecomp-plus/browsecomp\_fts.sqlite}。
+  \item 排序：SQLite FTS5 的 \texttt{bm25(docs\_fts, 1.0, 0.2)}。
+  \item 工具：\texttt{browsecomp\_search(query, k)} 与 \texttt{browsecomp\_get\_document(docid)}。
+\end{itemize}
+
+这一路径只检索 BrowseComp-Plus 提供的固定文档库，不使用开放互联网搜索。
+与 Qwen3-Embed-8B 等 dense retriever 相比，BM25/FTS5 不需要 embedding 模型、GPU 或向量库，因此成本更低，但召回上限通常低于强 dense retriever。
+
+\subsection{ReAct + Harness}
+
+核心解题循环为：
+
+\begin{enumerate}
+  \item 模型根据问题生成一个工具调用。
+  \item 工具返回检索结果或文档内容。
+  \item 模型根据累积证据继续搜索、读取文档或提交最终答案。
+\end{enumerate}
+
+Harness 负责以下约束：
+
+\begin{itemize}
+  \item 最大步数、总 wall time、单次 LLM 调用 timeout。
+  \item 工具白名单，BrowseComp 只允许 \texttt{browsecomp\_search}、\texttt{browsecomp\_get\_document}、\texttt{final\_answer}。
+  \item 重复工具调用检测，避免同一 query 反复搜索。
+  \item 最后一步强制只开放 \texttt{final\_answer}，工具预算耗尽后进行 forced finalization。
+\end{itemize}
+
+\subsection{Reflection 与 Memory}
+
+Evolved 模式在 baseline ReAct 之上加入：
+
+\begin{itemize}
+  \item \textbf{Reflection}：失败或未完成后，模型根据轨迹总结 failure mode、root cause、corrective strategy 与 reusable lesson。
+  \item \textbf{Memory}：将 episode 与 lesson 写入 JSONL 文件，并在后续 batch 中检索相关 lesson 放入 prompt。
+  \item \textbf{Retry}：当一次尝试失败时，将 reflection 作为 retry hint，再进行一次解题。
+\end{itemize}
+
+本次 BrowseComp evolved 使用的是 benchmark-local test-time evolution memory，即从空 memory 开始，在 BrowseComp 内部按 batch 积累经验。
+它不是跨 benchmark 预先积累的长期 prior memory，也没有更新模型参数。
+默认不将 gold answer 传给 reflection，并且写入 memory 前会 redaction，避免答案泄漏。
+
+\section{从不工作到可工作的关键修复}
+
+初始系统在 smoke test 中出现了多个问题：
+
+\begin{itemize}
+  \item Qwen3.5-9B 倾向于不断调用 search，不提交 \texttt{final\_answer}，SimpleQA smoke 出现 0\% accuracy、\texttt{stop\_reason=max\_steps}。
+  \item 原评分逻辑使用宽松 substring matching，可能虚高准确率。
+  \item Reflection 如果直接看到 expected answer，会造成长期 memory 泄漏 gold。
+  \item BrowseComp-Plus 需要固定 corpus docid，而不是普通网页或 wiki25 docid。
+  \item 长上下文高并发时，单卡 9B vLLM 发生 \texttt{APITimeoutError}。
+\end{itemize}
+
+对应修复如下：
+
+\begin{itemize}
+  \item 将最后一步工具限制为 \texttt{final\_answer}，并加入工具预算耗尽后的 forced finalization。
+  \item 引入 normalized exact match 与 token F1，去掉宽松 substring scoring。
+  \item Reflection 默认不接收 expected answer；memory 中 redaction gold answer。
+  \item 新增 BrowseComp-Plus FTS5 index builder、检索工具与 official-compatible run writer。
+  \item 将 9B vLLM 重启到 GPU 0 和 GPU 3，\texttt{tensor-parallel-size=2}，并发提升到 128。
+\end{itemize}
+
+\section{实验设置}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\toprule
+项目 & 设置 \\
+\midrule
+解题模型 & Qwen/Qwen3.5-9B, vLLM, OpenAI-compatible API \\
+BrowseComp judge & Qwen/Qwen3-32B, LLM-as-judge, \texttt{enable\_thinking=false} \\
+BrowseComp retriever & BM25, SQLite FTS5 over fixed BrowseComp-Plus corpus \\
+SimpleQA/2Wiki 并发 & 16 \\
+BrowseComp 并发 & 128 \\
+BrowseComp 样本数 & 830 / full set \\
+BrowseComp max steps & 10 \\
+BrowseComp memory & evolved 使用 fresh benchmark-local memory，batch size 128 \\
+\bottomrule
+\end{tabular}
+\caption{主要实验设置}
+\end{table}
+
+\section{SimpleQA 与 2Wiki 结果}
+
+SimpleQA 与 2Wiki 使用本地 exact/F1 评分。Evolved 模式包含 Reflection、Memory 和 retry，且不使用 gold reflection。
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrr}
+\toprule
+任务 & 模式 & 样本数 & Accuracy & Avg F1 & Avg Tool Calls \\
+\midrule
+SimpleQA & baseline & 20 & 45.00\% & 0.503 & 4.25 \\
+SimpleQA & evolved & 20 & \textbf{65.00\%} & \textbf{0.736} & \textbf{3.40} \\
+2Wiki & baseline & 20 & 30.00\% & 0.534 & 5.15 \\
+2Wiki & evolved & 20 & \textbf{45.00\%} & \textbf{0.624} & \textbf{5.05} \\
+\bottomrule
+\end{tabular}
+\caption{SimpleQA 与 2Wiki baseline/evolved 对比}
+\end{table}
+
+结果表明，evolved 在两个小规模文本 QA benchmark 上均优于 baseline。
+SimpleQA 中准确率提升 20 个百分点，同时平均工具调用从 4.25 降至 3.40。
+2Wiki 中准确率提升 15 个百分点，工具调用基本持平。
+
+\section{BrowseComp-Plus 结果}
+
+\subsection{本地 exact/F1 统计}
+
+BrowseComp-Plus 先写出 official-compatible run JSON，再计算本地 exact/F1 与 evidence recall。
+这部分不是最终 leaderboard 口径，但可用于调试与 sanity check。
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+模式 & 样本数 & Local Acc. & Completed & Evidence Recall & Avg Steps & Avg Tool Calls \\
+\midrule
+baseline & 830 & 16.27\% & 99.88\% & 31.65\% & 9.55 & 9.52 \\
+evolved & 830 & \textbf{24.34\%} & 99.76\% & \textbf{40.95\%} & 9.57 & 9.53 \\
+\bottomrule
+\end{tabular}
+\caption{BrowseComp-Plus 本地统计}
+\end{table}
+
+\subsection{Qwen3-32B LLM-as-judge 官方口径}
+
+最终使用 Qwen3-32B 按 BrowseComp-Plus 官方 judge prompt 评估答案等价性。
+Judge 使用 OpenAI-compatible chat endpoint，并显式关闭 thinking。
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+模式 & Accuracy & Recall & Search Calls & Calibration Error \\
+\midrule
+baseline & 25.54\% & 31.65\% & 7.89 & 66.88\% \\
+evolved & \textbf{31.57\%} & \textbf{40.95\%} & \textbf{7.83} & \textbf{57.62\%} \\
+\bottomrule
+\end{tabular}
+\caption{BrowseComp-Plus 全量 830 题，Qwen3-32B LLM-as-judge 结果}
+\end{table}
+
+Evolved 相比 baseline：
+
+\begin{itemize}
+  \item Accuracy 从 25.54\% 提升到 31.57\%，提升 6.03 个百分点。
+  \item Evidence Recall 从 31.65\% 提升到 40.95\%，提升 9.30 个百分点。
+  \item Search Calls 从 7.89 略降到 7.83，说明提升不是靠更多搜索调用堆出来的。
+  \item Calibration Error 从 66.88\% 降到 57.62\%，说明 judge 提取到的 confidence 与正确率更一致。
+\end{itemize}
+
+\section{结果解读}
+
+结果说明，当前 evolved agent 的主要收益来自更好的 test-time 搜索策略，而不是更贵的 retriever 或更多工具调用。
+BM25/FTS5 是低成本 retriever，理论召回上限弱于 Qwen3-Embed-8B 等 dense retriever。
+但在相同 retriever 下，Reflection 与 Memory 能让后续 batch 避免重复低效搜索，更倾向拆解日期、事件、实体和线索组合，因此 evidence recall 明显提升。
+
+同时，Search Calls 没有增加，说明 evolved 不是简单扩大搜索预算，而是提高了每次搜索的有效性。
+这与 SimpleQA/2Wiki 中工具调用下降或持平、准确率上升的现象一致。
+
+\section{局限与后续工作}
+
+\begin{itemize}
+  \item 当前 BrowseComp memory 是 benchmark-local test-time evolution，不是跨 benchmark 预训练 memory。
+  \item Retriever 是 BM25/FTS5，成本低但召回上限有限。若换用 Qwen3-Embed-8B 或 hybrid retriever，可能进一步提高 recall。
+  \item BrowseComp 中仍有极少数异常工具名残留计数，如 \texttt{web\_search}、\texttt{wiki\_search}、\texttt{browse\_comp\_search}，正式提交前应清洗为固定 corpus retriever 口径。
+  \item Evolved 的提升来自 batch-wise test-time adaptation；若 leaderboard 严格要求每题完全独立，应在提交说明中标注 scaffold 为 custom。
+  \item 后续可以先在 SimpleQA/2Wiki 或训练 split 上积累通用搜索 memory，再以 read-only 方式迁移到 BrowseComp，形成真正跨 benchmark 的 persistent memory。
+\end{itemize}
+
+\section{主要产物路径}
+
+\begin{longtable}{p{0.42\textwidth}p{0.48\textwidth}}
+\toprule
+路径 & 内容 \\
+\midrule
+\endhead
+\url{logs/eval/simpleqa_baseline_1778676754} & SimpleQA baseline 结果 \\
+\url{logs/eval/simpleqa_evolved_1778676815} & SimpleQA evolved 结果 \\
+\url{logs/eval/2wiki_baseline_1778676754} & 2Wiki baseline 结果 \\
+\url{logs/eval/2wiki_evolved_1778676815} & 2Wiki evolved 结果 \\
+\url{logs/eval/browsecomp_baseline_1778682823/runs} & BrowseComp baseline official-compatible run JSON \\
+\url{logs/eval/browsecomp_baseline_1778682823/official_qwen32b_eval} & Baseline Qwen3-32B judge 输出 \\
+\url{logs/eval/browsecomp_evolved_1778685529/runs} & BrowseComp evolved official-compatible run JSON \\
+\url{logs/eval/browsecomp_evolved_1778685529/official_qwen32b_live_eval} & Evolved Qwen3-32B judge 输出 \\
+\url{logs/eval/browsecomp_evolved_1778685529/leaderboard_submission_llm_judge.json} & Evolved leaderboard submission JSON \\
+\bottomrule
+\end{longtable}
+
+\section{结论}
+
+本轮实验从最初不收敛、无法稳定提交最终答案的状态，迭代到可以在 BrowseComp-Plus 全量 830 题上高并发生成并用 Qwen3-32B 完成 LLM-as-judge 评测。
+在 SimpleQA、2Wiki 和 BrowseComp-Plus 三类任务上，evolved agent 均优于 baseline。
+最关键的结论是：在低成本 BM25 retriever 不变的情况下，Reflection + Memory + Harness 约束带来的 test-time evolution 能够显著提升搜索召回与最终答案质量。
+
+\end{document}

@@ -46,5 +46,6 @@ def chat(messages: list[dict], tools: list[dict] | None = None, **kw) -> Any:
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = kw.pop("tool_choice", "auto")
+        payload["parallel_tool_calls"] = kw.pop("parallel_tool_calls", False)
     payload.update(kw)
     return client.chat.completions.create(**payload)

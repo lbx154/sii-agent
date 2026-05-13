@@ -8,6 +8,7 @@ import re
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from threading import RLock
 
 
 @dataclass
@@ -39,26 +40,35 @@ def _tokens(s: str) -> set[str]:
 
 
 class MemoryStore:
-    def __init__(self, root: str | os.PathLike = "logs/memory"):
+    def __init__(self, root: str | os.PathLike = "logs/memory", read_only: bool = False):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.episodes_path = self.root / "episodes.jsonl"
         self.lessons_path = self.root / "lessons.jsonl"
+        self.read_only = read_only
+        self._lock = RLock()
 
     # ---------------- writers ----------------
     def add_episode(self, ep: Episode) -> None:
-        with self.episodes_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(asdict(ep), ensure_ascii=False) + "\n")
+        if self.read_only:
+            return
+        with self._lock:
+            with self.episodes_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(asdict(ep), ensure_ascii=False) + "\n")
 
     def add_lesson(self, lesson: Lesson) -> None:
-        with self.lessons_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(asdict(lesson), ensure_ascii=False) + "\n")
+        if self.read_only:
+            return
+        with self._lock:
+            with self.lessons_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(asdict(lesson), ensure_ascii=False) + "\n")
 
     # ---------------- readers ----------------
     def _read(self, path: Path) -> list[dict]:
-        if not path.exists():
-            return []
-        return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+        with self._lock:
+            if not path.exists():
+                return []
+            return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
 
     def all_lessons(self) -> list[dict]:
         return self._read(self.lessons_path)

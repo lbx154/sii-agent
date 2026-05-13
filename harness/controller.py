@@ -10,6 +10,11 @@ from typing import Any
 class HarnessConfig:
     max_steps: int = 8
     max_wall_seconds: float = 120.0
+    max_llm_tokens: int = 1536
+    max_llm_call_seconds: float = 60.0
+    min_llm_call_seconds: float = 20.0
+    allowed_tools: tuple[str, ...] | None = None
+    finalize_on_stop: bool = True
     max_repeats: int = 2          # same tool+args within window → flagged
     max_consecutive_no_tool: int = 2  # LLM keeps "thinking" without acting
 
@@ -23,6 +28,8 @@ class HarnessResult:
     stop_reason: str = ""         # "final" | "max_steps" | "timeout" | "loop" | "error"
     trajectory: list[dict] = field(default_factory=list)
     tool_calls: int = 0
+    tool_call_counts: dict[str, int] = field(default_factory=dict)
+    finish_reasons: dict[str, int] = field(default_factory=dict)
 
 
 class StepGuard:

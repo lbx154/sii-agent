@@ -5,6 +5,7 @@ logs/
 data/raw/
 data/cache/
 data/wiki25/
+data/browsecomp-plus/
 .venv/
 *.egg-info/
 .playwright/

@@ -1,5 +1,6 @@
 """Tool registry — OpenAI function-calling spec + dispatcher."""
 from __future__ import annotations
+from collections.abc import Iterable
 from typing import Any, Callable
 
 TOOL_REGISTRY: dict[str, dict] = {}
@@ -22,8 +23,13 @@ def register(name: str, description: str, parameters: dict):
     return deco
 
 
-def tool_specs() -> list[dict]:
-    return [t["spec"] for t in TOOL_REGISTRY.values()]
+def tool_specs(names: Iterable[str] | None = None) -> list[dict]:
+    allowed = set(names) if names is not None else None
+    return [
+        t["spec"]
+        for name, t in TOOL_REGISTRY.items()
+        if allowed is None or name in allowed
+    ]
 
 
 def dispatch(name: str, arguments: dict[str, Any]) -> str:
@@ -39,4 +45,4 @@ def dispatch(name: str, arguments: dict[str, Any]) -> str:
 
 
 # import side-effects: register built-in tools
-from . import wiki, search, browser, finalize  # noqa: E402,F401
+from . import wiki, search, browser, browsecomp, finalize  # noqa: E402,F401

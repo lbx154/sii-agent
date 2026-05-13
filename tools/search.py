@@ -1,5 +1,6 @@
 """Search tools — DuckDuckGo online search + local wiki25 fallback."""
 from __future__ import annotations
+import json
 import os
 from .registry import register
 from .wiki import wiki_search
@@ -44,6 +45,24 @@ def web_search(query: str, k: int = 5) -> str:
     return "\n\n".join(sections) if sections else "(no results)"
 
 
+@register(
+    "image_search",
+    "Search web images and return JSON image/page results. Use when visual evidence, image sources, "
+    "or image-to-page lookup may help answer a question.",
+    {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "image search query"},
+            "k": {"type": "integer", "default": 5, "minimum": 1, "maximum": 20},
+        },
+        "required": ["query"],
+    },
+)
+def image_search(query: str, k: int = 5) -> str:
+    k = max(1, min(20, int(k)))
+    return _guarded_search("DuckDuckGo image", lambda: _ddg_images(query, k))
+
+
 def _guarded_search(label: str, fn) -> str:
     try:
         return fn()
@@ -61,6 +80,26 @@ def _ddg(query: str, k: int) -> str:
         for i, r in enumerate(ddgs.text(query, max_results=k), 1):
             out.append(f"[{i}] {r.get('title','')}\n    {r.get('href','')}\n    {r.get('body','')[:300]}")
     return "\n".join(out) if out else "(no results)"
+
+
+def _ddg_images(query: str, k: int) -> str:
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        return "ERROR: ddgs not installed"
+    out = []
+    with DDGS() as ddgs:
+        for i, r in enumerate(ddgs.images(query, max_results=k), 1):
+            out.append(
+                {
+                    "rank": i,
+                    "title": r.get("title", ""),
+                    "page_url": r.get("url") or r.get("href") or "",
+                    "image_url": r.get("image") or r.get("thumbnail") or "",
+                    "source": r.get("source", ""),
+                }
+            )
+    return json.dumps({"query": query, "results": out}, ensure_ascii=False, indent=2) if out else "(no results)"
 
 
 def _tavily(query: str, k: int) -> str:

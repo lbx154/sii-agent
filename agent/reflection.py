@@ -30,10 +30,27 @@ def _summarize_traj(traj: list[dict], max_steps: int = 12) -> str:
     return "\n".join(parts)
 
 
-def reflect(question: str, expected: str | None, result: HarnessResult) -> dict:
+def reflect(
+    question: str,
+    expected: str | None,
+    result: HarnessResult,
+    correct: bool | None = None,
+    include_expected: bool = False,
+) -> dict:
+    expected_line = (
+        f"EXPECTED (gold): {expected}"
+        if include_expected and expected is not None
+        else "EXPECTED: withheld; do not guess or memorize gold answers"
+    )
+    eval_line = (
+        "EXTERNAL_EVAL: previous answer was judged incorrect"
+        if correct is False
+        else "EXTERNAL_EVAL: unknown"
+    )
     user = (
         f"QUESTION: {question}\n"
-        f"EXPECTED (gold, if any): {expected}\n"
+        f"{expected_line}\n"
+        f"{eval_line}\n"
         f"AGENT_FINAL_ANSWER: {result.final_answer}\n"
         f"STOP_REASON: {result.stop_reason}\n"
         f"STEPS: {result.steps}, TOOL_CALLS: {result.tool_calls}, ELAPSED: {result.elapsed:.1f}s\n\n"
@@ -42,6 +59,8 @@ def reflect(question: str, expected: str | None, result: HarnessResult) -> dict:
     resp = chat(
         [{"role": "system", "content": REFLECT_SYS}, {"role": "user", "content": user}],
         response_format={"type": "json_object"},
+        max_tokens=512,
+        timeout=45,
     )
     raw = resp.choices[0].message.content or "{}"
     try:
