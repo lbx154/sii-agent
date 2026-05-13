@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+logs/
+data/raw/
+data/cache/
+data/wiki25/
+.venv/
+*.egg-info/
+.playwright/
+*.pdf
