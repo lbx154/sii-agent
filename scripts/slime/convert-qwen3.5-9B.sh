@@ -29,7 +29,7 @@ cd "${SLIME_DIR}"
 export CUDA_VISIBLE_DEVICES="${CONVERT_CUDA_VISIBLE_DEVICES}"
 export PYTHONPATH="${MEGATRON_PATH}:${SLIME_DIR}:${REPO_ROOT}:${PYTHONPATH:-}"
 
-torchrun --nproc-per-node "${CONVERT_GPUS}" tools/convert_hf_to_torch_dist.py \
+torchrun --nproc-per-node "${CONVERT_GPUS}" "${REPO_ROOT}/scripts/slime/convert_hf_to_torch_dist_qwen35.py" \
   "${MODEL_ARGS[@]}" \
   --hf-checkpoint "${HF_CHECKPOINT}" \
   --save "${SAVE_PATH}"
