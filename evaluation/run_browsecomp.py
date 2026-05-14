@@ -124,6 +124,7 @@ def _run_one(
     memory: MemoryStore | None,
     memory_context: str | None,
     allow_reflection: bool,
+    save_traces: bool,
 ) -> tuple[dict, dict]:
     reset_retrieved_docids()
     question = str(ex["query"])
@@ -145,7 +146,7 @@ def _run_one(
 
     retrieved_docids = get_retrieved_docids()
     official = _official_record(ex, outcome, retrieved_docids)
-    local = _local_record(ex, outcome, retrieved_docids)
+    local = _local_record(ex, outcome, retrieved_docids, save_traces=save_traces)
     return official, local
 
 
@@ -180,7 +181,7 @@ def _evidence_docids(ex: dict) -> set[str]:
     }
 
 
-def _local_record(ex: dict, outcome: RunOutcome, retrieved_docids: list[str]) -> dict:
+def _local_record(ex: dict, outcome: RunOutcome, retrieved_docids: list[str], save_traces: bool = False) -> dict:
     scores = score_answer(outcome.result.final_answer, ex.get("answer"))
     evidence = _evidence_docids(ex)
     recall = (
@@ -188,7 +189,10 @@ def _local_record(ex: dict, outcome: RunOutcome, retrieved_docids: list[str]) ->
         if evidence
         else None
     )
-    return {
+    record = {
+        "id": f"browsecomp-{ex['query_id']}",
+        "task": "browsecomp-plus",
+        "split": "test",
         "query_id": str(ex["query_id"]),
         "question": ex["query"],
         "expected": ex.get("answer"),
@@ -206,6 +210,9 @@ def _local_record(ex: dict, outcome: RunOutcome, retrieved_docids: list[str]) ->
         "evidence_recall": recall,
         "reflection": outcome.reflection,
     }
+    if save_traces:
+        record["trajectory"] = outcome.result.trajectory
+    return record
 
 
 def _write_auxiliary_files(examples: list[dict], out: Path) -> None:
@@ -260,6 +267,7 @@ def run(
     allow_reflection: bool,
     resume_dir: str | None = None,
     memory_k: int = 3,
+    save_traces: bool = False,
 ) -> dict:
     assert mode in {"baseline", "evolved"}
     cfg = HarnessConfig(
@@ -303,7 +311,7 @@ def run(
     elif mode == "baseline":
         with ThreadPoolExecutor(max_workers=max(1, min(concurrency, len(examples)))) as pool:
             futures = [
-                pool.submit(_run_one, ex, mode, cfg, memory, None, allow_reflection)
+                pool.submit(_run_one, ex, mode, cfg, memory, None, allow_reflection, save_traces)
                 for ex in examples
             ]
             for future in track(as_completed(futures), total=len(futures), description="browsecomp/baseline"):
@@ -327,6 +335,7 @@ def run(
                         memory,
                         memory_contexts[str(ex["query_id"])],
                         allow_reflection,
+                        save_traces,
                     )
                     for ex in batch
                 ]
@@ -360,6 +369,7 @@ def run(
         "memory_root": str(memory.root) if memory else None,
         "memory_mode": memory_mode if mode == "evolved" else None,
         "memory_k": memory_k if mode == "evolved" else None,
+        "save_traces": save_traces,
         "resume_dir": str(out) if resume_dir else None,
         "resumed_skipped": len(all_examples) - len(examples) if resume_dir else 0,
         "wall_seconds": time.time() - t0,
@@ -392,6 +402,7 @@ def main() -> None:
     parser.add_argument("--no-reflection", action="store_true")
     parser.add_argument("--out", default="logs/browsecomp")
     parser.add_argument("--memory-k", type=int, default=3)
+    parser.add_argument("--save-traces", action="store_true")
     parser.add_argument(
         "--resume-dir",
         default=None,
@@ -417,6 +428,7 @@ def main() -> None:
         not args.no_reflection,
         args.resume_dir,
         args.memory_k,
+        args.save_traces,
     )
 
 

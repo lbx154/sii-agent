@@ -26,7 +26,8 @@ def load_simpleqa(n: int | None = None, split: str = "test") -> Iterator[dict]:
             key_q, key_a = "question", "answer"
     else:
         ds = load_dataset("lighteval/SimpleQA", split=split)
-        key_q, key_a = "question", "answer"
+        key_q = "question" if "question" in ds.column_names else "problem"
+        key_a = "answer"
     for i, ex in enumerate(ds):
         if n is not None and i >= n:
             break

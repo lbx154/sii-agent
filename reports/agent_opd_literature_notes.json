@@ -1,0 +1,57 @@
+{
+  "summary": "Agent OPD should optimize trajectories or critical steps, not only final-answer text. Tool observations are environment outputs and must be treated as prompt/context, not trainable model output.",
+  "references": [
+    {
+      "title": "Reinforced Self-Training (ReST) meets ReAct: Self-Improvement for Multi-Step Reasoning LLM Agent",
+      "arxiv": "2312.10003",
+      "lesson": "Collect ReAct trajectories on training questions, score outcomes, train on accepted trajectories and contrast accepted vs rejected trajectories, then iterate with a growing batch."
+    },
+    {
+      "title": "Direct Multi-Turn Preference Optimization for Language Agents",
+      "arxiv": "2406.14868",
+      "lesson": "Single-turn DPO assumptions break for multi-turn agents; length and state-action occupancy matter for trajectory preferences."
+    },
+    {
+      "title": "AgentQ: Advanced Reasoning and Learning for Autonomous AI Agents",
+      "arxiv": "2408.07199",
+      "lesson": "Use search/MCTS-style exploration to produce successful and failed trajectories at comparable states, then optimize off-policy preferences."
+    },
+    {
+      "title": "Step-DPO: Step-wise Preference Optimization for Long-chain Reasoning of LLMs",
+      "arxiv": "2406.18629",
+      "lesson": "Construct pairs as shared prefix plus preferred next step vs rejected next step to localize credit assignment."
+    },
+    {
+      "title": "SDPO: Segment-Level Direct Preference Optimization for Social Agents",
+      "arxiv": "2501.01821",
+      "lesson": "Apply preference loss only from the divergence segment onward instead of penalizing identical prefixes."
+    },
+    {
+      "title": "Search-R1: Training LLMs to Reason and Leverage Search via RL",
+      "arxiv": "2503.09516",
+      "lesson": "Mask retrieved/search-result tokens from loss; only model-generated thoughts, tool calls, and answers should receive gradient."
+    },
+    {
+      "title": "WebRL: Training LLM Web Agents via Self-Evolving Online Curriculum Reinforcement Learning",
+      "arxiv": "2411.02337",
+      "lesson": "Web/search agents benefit from online rollout, outcome reward models, and curriculum over static offline answer pairs."
+    },
+    {
+      "title": "FireAct: Toward Language Agent Fine-tuning",
+      "arxiv": "2310.05915",
+      "lesson": "Tool-use fine-tuning needs diverse full trajectories; format-following and tool reasoning must be trained explicitly."
+    },
+    {
+      "title": "Agent-FLAN: Designing Data and Methods of Effective Agent Tuning for Large Language Models",
+      "arxiv": "2403.12881",
+      "lesson": "Separate format learning, capability learning, and hallucination mitigation; mixing them can cause tool-use side effects."
+    }
+  ],
+  "implementation_decisions": [
+    "Use LlamaFactory action export for step-level DPO: prompt is the shared prefix including prior observations, chosen/rejected are divergent next tool calls or final-answer calls.",
+    "Keep observations in the prompt so PairwiseDatasetProcessor masks them with IGNORE_INDEX; do not put observations in chosen/rejected responses.",
+    "Use long cutoff_len for agent trajectories: 32768 for current 2Wiki/BrowseComp work, with 65536 as the next option if BrowseComp traces exceed the context.",
+    "Filter to same-question outcome-different pairs and require winner correctness; drop both-wrong pairs and wrong-over-right labels unless inverted by gold correctness.",
+    "Continue to use one adapter for all benchmarks, but compare it under the same harness and held-out ids for each benchmark."
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "experiment": "opd_v9_failure_analysis",
+  "summary": "The v9 adapter underperformed because the answer-only DPO data optimized answer style more than agent tool policy or factual grounding.",
+  "metrics": {
+    "base_2wiki_validation_n100_accuracy": 0.30,
+    "v9_2wiki_validation_n100_accuracy": 0.34,
+    "base_simpleqa_test_n100_accuracy": 0.53,
+    "v9_simpleqa_test_n100_accuracy": 0.51,
+    "base_simpleqa_test_n100_f1": 0.6459721129231962,
+    "v9_simpleqa_test_n100_f1": 0.6651206452973776,
+    "v9_browsecomp_n120_local_accuracy": 0.15,
+    "browsecomp_smart_router_official_style_accuracy": 37.35
+  },
+  "preference_data_diagnosis": {
+    "total_v9_pairs": 600,
+    "winner_correct_loser_wrong": 98,
+    "winner_wrong_loser_correct": 33,
+    "both_correct": 120,
+    "both_wrong": 349,
+    "main_issue": "Most pairs did not provide a clean correct-over-incorrect signal; GPT-5.4 often preferred more complete or better-supported text even when strict gold scoring favored the other answer."
+  },
+  "trace_findings": [
+    {
+      "issue": "over_search_after_right_answer",
+      "example": "SimpleQA IEEE Frank Rosenblatt Award 2010: base answered Michio Sugeno after one search; v9 continued searching/browsing and ended with Hans-Paul Schwefel."
+    },
+    {
+      "issue": "verbose_or_overqualified_answer",
+      "example": "2Wiki father of Stefan I. Nenitescu: base answered Galati; v9 answered Galati, Romania, which missed the strict expected answer."
+    },
+    {
+      "issue": "tool_policy_not_distilled",
+      "example": "The v9 LlamaFactory export was question-to-final-answer DPO, so tool observations and action decisions were not part of the optimized target."
+    },
+    {
+      "issue": "browsecomp_distribution_mismatch",
+      "example": "Training only on 2Wiki answer preferences did not teach fixed-corpus BrowseComp retrieval, document selection, or router behavior."
+    }
+  ],
+  "next_iteration_constraints": [
+    "Filter or invert preference pairs using gold correctness before DPO export.",
+    "Canonicalize chosen answers to short references only when the training split provides a safe reference.",
+    "For BrowseComp, require evidence support before replacing a model answer with the gold answer.",
+    "Evaluate one adapter under the same harness on held-out 2Wiki, SimpleQA, and BrowseComp ids."
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "question": "Which of slime, Relax, and ms-swift is most suitable for SII-Agent OPD after answer-only DPO failed to improve 2Wiki, SimpleQA, and BrowseComp together?",
+  "summary": {
+    "recommendation": "Use ms-swift first for the next practical agent-training iteration, while treating slime as the target framework if we decide to move to true large-scale online OPD with token-level teacher log-probs. Do not adopt Relax immediately unless we are ready to pay a much larger Ray/Megatron/SGLang integration cost.",
+    "why": [
+      "Our bottleneck is not just the preference loss; it is collecting multi-turn ReAct rollouts with tool observations masked from loss and reward tied to final correctness/evidence. ms-swift already exposes multi-turn GRPO schedulers, custom tool/environment logic, response_loss_mask, rollout_infos, async vLLM rollout, external plugins, and reward functions, so it maps directly to the current Python agent harness.",
+      "slime has explicit OPD support with reverse-KL-style teacher matching on the student's own rollouts and external SGLang teacher mode, which is mathematically closer to canonical on-policy distillation than our LlamaFactory DPO approximation. However, using slime for the current repo likely requires more rewrite around Megatron/Ray/SGLang rollout plumbing than ms-swift.",
+      "Relax has first-class async agentic RL and OPD, but is a newer production-scale engine built around Ray Serve, TransferQueue, Megatron, SGLang, and service separation. It is attractive for multi-node/high-throughput future work, but too heavy for the immediate two-GPU LoRA iteration on GPUs 4/5."
+    ]
+  },
+  "frameworks": {
+    "ms-swift": {
+      "fit": "best immediate fit",
+      "strengths": [
+        "Supports DPO-family offline alignment and GRPO/RLHF workflows.",
+        "Has multi-turn rollout support via MultiTurnScheduler for tool-call style training.",
+        "Supports response_loss_mask/loss_mask so environment/tool observations can be masked out while model actions remain trainable.",
+        "Supports custom schedulers and reward functions through external_plugins.",
+        "Supports async vLLM rollout/server mode and LoRA weight sync, which matches the current vLLM-based setup better than a full Megatron conversion."
+      ],
+      "risks": [
+        "It does not appear to expose slime/Relax-style OPD as a named first-class algorithm in the checked docs; canonical OPD would need to be implemented as a reward/KL or custom trainer path.",
+        "We still need to write a SII ReAct scheduler that calls our search/BrowseComp tools and returns correct masks and trajectory metadata."
+      ],
+      "use_for_sii": "Implement online multi-turn GRPO first: reward = final answer correctness + retrieval/evidence recall + concise final answer, with tool observations masked. Add teacher-distillation later through a custom reward/KL path if needed."
+    },
+    "slime": {
+      "fit": "best canonical OPD target",
+      "strengths": [
+        "Explicit on-policy distillation example: student trains on its own rollouts while matching teacher token-level log-probabilities.",
+        "OPD is implemented as an additive KL penalty orthogonal to GRPO/PPO/REINFORCE-style advantage estimators.",
+        "Supports external SGLang teacher mode, useful when GPT/large teacher differs from the student architecture.",
+        "Large and active project with RL scaling focus."
+      ],
+      "risks": [
+        "More framework integration is required: Ray/Megatron/SGLang data flow, model conversion or compatible checkpoints, and custom agent rollout wiring.",
+        "The out-of-box OPD examples are math-style rollouts, so SII's tool environment still needs custom rollout/reward implementation."
+      ],
+      "use_for_sii": "Choose slime if the next step is true canonical OPD: on-policy ReAct rollouts from the current student, GPT-5.4/large teacher token log-probs on the same action tokens, reverse-KL teacher matching, and correctness/evidence reward."
+    },
+    "Relax": {
+      "fit": "best production-scale async engine, not immediate fit",
+      "strengths": [
+        "Explicit OPD support, including SGLang and Megatron teacher modes.",
+        "Agentic RL support: multi-turn interaction, loss masking, flexible termination, and execute-observe-decide loops.",
+        "Fully async service architecture can keep rollout, actor, reference, advantage, and teacher components on separate GPU clusters.",
+        "Strong for future multi-node scaling and high-throughput online training."
+      ],
+      "risks": [
+        "Highest integration cost: Ray Serve, TransferQueue, Megatron backend, SGLang rollout, checkpoint conversion, and service orchestration.",
+        "Overkill for the current two-GPU LoRA training loop and rapid benchmark iteration."
+      ],
+      "use_for_sii": "Defer until we need multi-node async scaling or multimodal agentic RL. Borrow design ideas now: separated rollout/actor/reference services, max staleness control, and explicit observation loss masking."
+    }
+  },
+  "next_training_plan": [
+    "Finish the current v13 LlamaFactory step-final run and evaluate it, but do not keep iterating blind offline DPO if it does not improve all three tasks.",
+    "Patch SII traces to store the same 8000-token tool observations that runtime sees, not the current 1000-character saved observation truncation.",
+    "Prototype ms-swift multi-turn GRPO around the existing ReAct environment on GPUs 4/5 with high rollout concurrency.",
+    "Use held-out-safe 2Wiki train, SimpleQA dev/few-shot carveout, and BrowseComp train-carveout prompts. Reward only final correctness/evidence, not answer verbosity.",
+    "If GRPO stabilizes, add slime-style OPD teacher KL: student samples its own trajectories, teacher scores only model action/final-answer tokens, observations remain mask=0."
+  ],
+  "sources_checked": [
+    "THUDM/slime README and examples/on_policy_distillation/README.md",
+    "redai-infra/Relax README, examples/on_policy_distillation/README.md, and OPD loss implementation",
+    "modelscope/ms-swift README and GRPO multi-turn documentation"
+  ]
+}

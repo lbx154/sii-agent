@@ -1,0 +1,149 @@
+{
+  "question": "With eight B200 GPUs available after the current run, which OPD library and Qwen3.5 teacher model are most suitable for SII-Agent OPD?",
+  "opd_library_recommendation": {
+    "primary": "THUDM/slime",
+    "why": [
+      "It has first-class OPD: student rollouts plus teacher token log-probs, added as a reverse-KL style penalty on top of GRPO/PPO/REINFORCE-style training.",
+      "It directly connects Megatron training with SGLang rollout/teacher serving and explicitly supports Qwen3.5, Qwen3.5 MoE, Qwen3 MoE, Qwen2.5, DeepSeek V3/R1, and Llama.",
+      "Its tau-bench example already demonstrates agentic multi-turn tool-use training, assistant-token loss masks, and environment/tool observation masking, which matches the SII-Agent failure mode we saw with answer-only DPO.",
+      "Eight B200 GPUs make the extra integration cost more worthwhile because we can run actor/training, student rollout, and a strong SGLang teacher concurrently."
+    ],
+    "secondary": "modelscope/ms-swift",
+    "why_not_primary": "It is easier for a quick custom multi-turn GRPO prototype and has excellent scheduler/loss-mask hooks, but OPD teacher KL is not the first-class path we need; we would have to implement teacher forced-logprob KL ourselves.",
+    "future_scale": "redai-infra/Relax",
+    "why_not_now": "It has the strongest fully async service architecture and OPD/agentic RL support, but it is heavier than slime and better suited once we need multi-node or production-grade async clusters."
+  },
+  "qwen35_agent_benchmarks": {
+    "Qwen3.5-9B": {
+      "general_agent": {
+        "BFCL-V4": 66.1,
+        "TAU2-Bench": 79.1,
+        "VITA-Bench": 29.8,
+        "DeepPlanning": 18.0
+      },
+      "note": "Good student baseline; not the best teacher because larger Qwen3.5 models dominate most agent/search benchmarks."
+    },
+    "Qwen3.5-27B": {
+      "general_agent": {
+        "BFCL-V4": 68.5,
+        "TAU2-Bench": 79.0,
+        "VITA-Bench": 41.9,
+        "DeepPlanning": 22.6
+      },
+      "search_agent": {
+        "HLE_with_tool": 48.5,
+        "BrowseComp": 61.0,
+        "BrowseComp_zh": 62.1,
+        "WideSearch": 61.1,
+        "Seal-0": 47.2
+      },
+      "coding_agent": {
+        "SWE-bench_Verified": 72.4,
+        "Terminal_Bench_2": 41.6
+      },
+      "note": "Best middle-size model on VITA-Bench, HLE-with-tool, Seal-0, and SWE-bench Verified; cheap dense fallback teacher."
+    },
+    "Qwen3.5-35B-A3B": {
+      "general_agent": {
+        "BFCL-V4": 67.3,
+        "TAU2-Bench": 81.2,
+        "VITA-Bench": 31.9,
+        "DeepPlanning": 22.8
+      },
+      "search_agent": {
+        "HLE_with_tool": 47.4,
+        "BrowseComp": 61.0,
+        "BrowseComp_zh": 69.5,
+        "WideSearch": 57.1,
+        "Seal-0": 41.4
+      },
+      "coding_agent": {
+        "SWE-bench_Verified": 69.2,
+        "Terminal_Bench_2": 40.5
+      },
+      "note": "Highest middle-size TAU2-Bench and very cheap active compute; good fast teacher for tool-use style."
+    },
+    "Qwen3.5-122B-A10B": {
+      "general_agent": {
+        "BFCL-V4": 72.2,
+        "TAU2-Bench": 79.5,
+        "VITA-Bench": 33.6,
+        "DeepPlanning": 24.1
+      },
+      "search_agent": {
+        "HLE_with_tool": 47.5,
+        "BrowseComp": 63.8,
+        "BrowseComp_zh": 69.9,
+        "WideSearch": 60.5,
+        "Seal-0": 44.1
+      },
+      "coding_agent": {
+        "SWE-bench_Verified": 72.0,
+        "Terminal_Bench_2": 49.4
+      },
+      "note": "Best practical high-quality teacher: strongest middle-size BFCL, DeepPlanning, BrowseComp, BrowseComp-zh, and Terminal Bench 2."
+    },
+    "Qwen3.5-397B-A17B": {
+      "general_agent": {
+        "BFCL-V4": 72.9,
+        "TAU2-Bench": 86.7,
+        "VITA-Bench": 49.7,
+        "DeepPlanning": 34.3,
+        "Tool_Decathlon": 38.3,
+        "MCP-Mark": 46.1
+      },
+      "search_agent": {
+        "HLE_with_tool": 48.3,
+        "BrowseComp": "69.0/78.6",
+        "BrowseComp_zh": 70.3,
+        "WideSearch": 74.0,
+        "Seal-0": 46.9
+      },
+      "coding_agent": {
+        "SWE-bench_Verified": 76.4,
+        "SWE-bench_Multilingual": 69.3,
+        "SecCodeBench": 68.3,
+        "Terminal_Bench_2": 52.5
+      },
+      "note": "Best overall teacher by agent/search benchmarks, but serving cost is high. Use FP8/quantized SGLang if stable; BF16 likely consumes most or all eight B200s."
+    }
+  },
+  "teacher_recommendation": {
+    "first_true_opd_teacher": "Qwen/Qwen3.5-122B-A10B",
+    "reason": "It is the best practical balance of quality, memory, and concurrent online OPD throughput on eight B200s. It dominates middle-size Qwen3.5 on BFCL, BrowseComp, BrowseComp-zh, DeepPlanning, and Terminal Bench 2.",
+    "fast_iteration_teacher": "Qwen/Qwen3.5-35B-A3B",
+    "reason_fast": "Very cheap active compute and strong TAU2/tool-use score, useful for debugging OPD rollout/masking before expensive teacher runs.",
+    "best_quality_teacher": "Qwen/Qwen3.5-397B-A17B",
+    "reason_best": "Strongest official Qwen3.5 agent/search model, especially TAU2, VITA, BrowseComp, WideSearch, MCP-Mark, and SWE-bench. Use once SGLang/vLLM forced logprob serving is validated in FP8/quantized mode."
+  },
+  "suggested_8xb200_layouts": [
+    {
+      "layout": "practical_online",
+      "teacher": "Qwen3.5-122B-A10B FP8 or BF16 TP2",
+      "allocation": "2 GPUs teacher, 2 GPUs student rollout, 4 GPUs actor/training/reference",
+      "goal": "First stable strict OPD run."
+    },
+    {
+      "layout": "fast_debug",
+      "teacher": "Qwen3.5-35B-A3B BF16/FP8 TP1-2",
+      "allocation": "1-2 GPUs teacher, rest for rollout/training",
+      "goal": "Debug SII multi-turn masking and reward/KL plumbing quickly."
+    },
+    {
+      "layout": "quality_push",
+      "teacher": "Qwen3.5-397B-A17B FP8 TP4 or quantized TP4",
+      "allocation": "4 GPUs teacher, 2 GPUs student rollout, 2 GPUs actor/training",
+      "goal": "Highest-quality OPD teacher after pipeline is stable."
+    }
+  ],
+  "sources": [
+    "Qwen/Qwen3.5-9B Hugging Face model card",
+    "Qwen/Qwen3.5-27B Hugging Face model card",
+    "Qwen/Qwen3.5-35B-A3B Hugging Face model card",
+    "Qwen/Qwen3.5-122B-A10B Hugging Face model card",
+    "Qwen/Qwen3.5-397B-A17B Hugging Face model card",
+    "THUDM/slime README, OPD example, and tau-bench agent example",
+    "modelscope/ms-swift multi-turn GRPO documentation",
+    "redai-infra/Relax README and OPD documentation checked earlier"
+  ]
+}

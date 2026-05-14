@@ -1,0 +1,128 @@
+{
+  "question": "What strong local teacher models are feasible on two NVIDIA B200 GPUs for mathematically standard OPD, and what teacher models are used in current OPD examples?",
+  "local_hardware_observation": {
+    "gpu_type": "NVIDIA B200",
+    "memory_per_gpu_mib": 183359,
+    "two_gpu_total_gib": 358,
+    "currently_free_gpus": [
+      6,
+      7
+    ],
+    "note": "GPUs 4 and 5 were still occupied by the v13 LlamaFactory training run when checked; GPUs 6 and 7 were essentially idle."
+  },
+  "current_opd_teacher_examples": [
+    {
+      "source": "THUDM/slime examples/on_policy_distillation",
+      "student": "Qwen3-8B",
+      "teacher": "Qwen3-32B",
+      "teacher_backend": "SGLang external server or Megatron-loaded teacher",
+      "details": "Student trains on its own rollouts; teacher token log-probs are used as an OPD KL penalty on top of GRPO/PPO/REINFORCE-style advantage estimators."
+    },
+    {
+      "source": "redai-infra/Relax examples/on_policy_distillation",
+      "student": "Qwen3-8B",
+      "teacher": "Qwen3-32B for heterogeneous SGLang mode; same-architecture teacher for Megatron mode",
+      "teacher_backend": "SGLang or Megatron",
+      "details": "SGLang teacher supports 32B -> 8B heterogeneous distillation; Megatron teacher currently requires teacher/student architecture shape compatibility."
+    },
+    {
+      "source": "Thinking Machines Tinker cookbook basic OPD recipe",
+      "student": "Qwen/Qwen3-8B-Base",
+      "teacher": "Qwen/Qwen3-8B by default, often from a stronger post-trained or checkpointed policy",
+      "teacher_backend": "Tinker sampling client with compute_logprobs",
+      "details": "Uses reverse KL on student-sampled trajectories. Their blog also discusses Qwen3-32B as the reasoning teacher and self/previous-policy teachers for behavior recovery."
+    },
+    {
+      "source": "Thinking Machines Tinker multi-teacher recipe",
+      "student": "Qwen/Qwen3-8B",
+      "teacher": "Qwen/Qwen3-32B for DeepMath, Qwen/Qwen3-235B-A22B-Instruct-2507 for Tulu3",
+      "teacher_backend": "Tinker sampling clients",
+      "details": "Shows dataset-specific teachers and confirms that very large MoE teachers are used when logprob serving is available."
+    },
+    {
+      "source": "Thinking Machines Harbor multi-turn tool-use recipe",
+      "student": "moonshotai/Kimi-K2-Thinking",
+      "teacher": "moonshotai/Kimi-K2-Thinking",
+      "teacher_backend": "Tinker sampling client",
+      "details": "Multi-turn tool-use OPD masks environment/tool tokens and trains only student-generated tokens against teacher KL."
+    },
+    {
+      "source": "Qwen3 Technical Report",
+      "student": "smaller Qwen3 models",
+      "teacher": "larger/flagship Qwen3 models",
+      "teacher_backend": "internal training stack",
+      "details": "Report states smaller models use strong-to-weak distillation with both off-policy and on-policy transfer from larger models; exact public scripts are not provided in the report."
+    }
+  ],
+  "two_b200_feasible_teachers": [
+    {
+      "model": "Qwen/Qwen3-32B or Qwen/QwQ-32B",
+      "fit": "easy",
+      "precision": "BF16/FP16",
+      "why": "About 64GB weights before KV cache. Runs comfortably on one B200 or two B200 with large context and high batch. This is the most common public OPD teacher in slime/Relax examples.",
+      "recommended_for_sii": "Primary safe teacher for first true OPD implementation."
+    },
+    {
+      "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+      "fit": "easy",
+      "precision": "BF16/FP16",
+      "why": "Same 32B memory class, strong reasoning style, Qwen-family tokenizer/model compatibility is favorable.",
+      "recommended_for_sii": "Good reasoning teacher ablation, especially for 2Wiki/SimpleQA reasoning traces."
+    },
+    {
+      "model": "Qwen/Qwen3-30B-A3B-Instruct-2507 or Thinking-2507",
+      "fit": "easy",
+      "precision": "BF16/FP16",
+      "why": "30B total / 3B activated MoE. Strong recent Qwen3 agent/tool-use and long-context model, very cheap active compute relative to dense 32B.",
+      "recommended_for_sii": "Best practical teacher candidate for agent/tool behavior if vLLM/SGLang logprob support is stable."
+    },
+    {
+      "model": "Qwen/Qwen2.5-72B-Instruct or similar 70B dense",
+      "fit": "comfortable",
+      "precision": "BF16/FP16",
+      "why": "About 140-144GB weights before KV cache, within 2xB200. Long context and high batching reduce available KV cache, but feasible with tensor parallel 2.",
+      "recommended_for_sii": "Useful if 32B teachers are too weak, but less current than Qwen3-30B/32B."
+    },
+    {
+      "model": "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
+      "fit": "comfortable",
+      "precision": "BF16/FP16",
+      "why": "70B dense fits in 2xB200 and is a strong reasoning teacher, but tokenizer/style mismatch with Qwen student may complicate token-level KL rendering.",
+      "recommended_for_sii": "Use as judge/generator or secondary teacher, not first OPD teacher."
+    },
+    {
+      "model": "Qwen/Qwen3-235B-A22B-Instruct-2507 or Thinking-2507",
+      "fit": "possible but tight",
+      "precision": "FP8 or INT4/AWQ/GPTQ",
+      "why": "BF16 weights are about 470GB and do not fit on two B200s. FP8 weights are about 235GB before KV cache and may fit with careful engine settings; INT4 is much easier but logprob quality and framework support must be validated.",
+      "recommended_for_sii": "Best-quality target teacher if we can serve FP8/quantized logprobs reliably; not the fastest first implementation."
+    },
+    {
+      "model": "DeepSeek-R1/V3 full 671B MoE",
+      "fit": "not recommended",
+      "precision": "INT4 maybe fits weights only, FP8/BF16 no",
+      "why": "Even INT4 is about 335GB before KV cache/overhead, leaving too little headroom on two B200s for long context and batching.",
+      "recommended_for_sii": "Do not use for local OPD on two B200s."
+    }
+  ],
+  "recommendation": {
+    "first_teacher": "Qwen/Qwen3-32B or Qwen/Qwen3-30B-A3B-Instruct-2507 served by SGLang/vLLM on GPUs 6 and 7",
+    "reason": "These fit comfortably, match public OPD precedent, have Qwen-style tool/chat rendering close to the 9B student, and can provide forced logprobs for student trajectories.",
+    "stretch_teacher": "Qwen/Qwen3-235B-A22B-Instruct-2507 in FP8/INT4 if serving logprobs is stable",
+    "avoid_initially": "Closed Azure GPT-5.4 as token-level teacher, because this endpoint returns logprobs only for its own generated tokens and did not support completions echo/forced scoring."
+  },
+  "implementation_notes_for_sii": [
+    "Use teacher logprobs only on student-generated assistant/action/final-answer tokens; mask user/system/tool observation tokens.",
+    "Keep teacher/student chat template rendering aligned. Same-family Qwen teachers reduce tokenizer/template mismatch risk.",
+    "For agent OPD, Qwen3 Thinking teachers may have tool-use caveats in vLLM/SGLang if reasoning_content is stripped; pass full content or prefer Instruct/non-thinking mode for tool-call scoring.",
+    "A multi-teacher setup is attractive: Qwen3-32B or DeepSeek-R1-Distill-Qwen-32B for 2Wiki/SimpleQA reasoning, Qwen3-30B-A3B-Instruct or Qwen3-235B-A22B for agent/tool behavior if available."
+  ],
+  "sources_checked": [
+    "THUDM/slime examples/on_policy_distillation README and run-qwen3-8B-opd.sh",
+    "redai-infra/Relax examples/on_policy_distillation README",
+    "Thinking Machines On-Policy Distillation blog",
+    "thinking-machines-lab/tinker-cookbook distillation recipes",
+    "Qwen3 README and Qwen3 Technical Report HTML",
+    "Hugging Face public model metadata for Qwen3, QwQ, and DeepSeek distill models"
+  ]
+}

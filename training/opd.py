@@ -27,13 +27,15 @@ import random
 import re
 import shlex
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import yaml
 from dotenv import load_dotenv
+
+from agent.scoring import normalize_answer, score_answer
 
 
 REFUSAL_PHRASES = (
@@ -196,15 +198,104 @@ def _record_cost(record: dict[str, Any]) -> float:
     return float(record.get("tool_calls") or 0) + 0.25 * float(record.get("steps") or 0)
 
 
+def _expected_answer(record: dict[str, Any]) -> str | None:
+    expected = record.get("expected")
+    if expected is None:
+        expected = record.get("answer")
+    if expected is None:
+        return None
+    text = str(expected).strip()
+    return text or None
+
+
+def _predicted_answer(record: dict[str, Any]) -> str:
+    return str(record.get("predicted") or "").strip()
+
+
+def _score_against_expected(record: dict[str, Any]) -> dict[str, float | bool | None]:
+    expected = _expected_answer(record)
+    if expected is not None:
+        return score_answer(_predicted_answer(record), expected)
+    return {
+        "correct": bool(record.get("correct") or record.get("exact")),
+        "exact": bool(record.get("exact")),
+        "f1": _f1(record),
+    }
+
+
 def _correct(record: dict[str, Any]) -> bool:
-    return bool(record.get("correct") or record.get("exact"))
+    return bool(_score_against_expected(record)["correct"])
+
+
+def _exact(record: dict[str, Any]) -> bool:
+    return bool(_score_against_expected(record)["exact"])
 
 
 def _f1(record: dict[str, Any]) -> float:
+    expected = _expected_answer(record)
+    if expected is not None:
+        try:
+            return float(score_answer(_predicted_answer(record), expected)["f1"] or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
     try:
         return float(record.get("f1") or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _normalized_same(left: str | None, right: str | None) -> bool:
+    return normalize_answer(left) == normalize_answer(right)
+
+
+def _task_set(raw: str | None) -> set[str]:
+    if not raw:
+        return set()
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+def _trajectory_observation_text(record: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for event in record.get("trajectory") or []:
+        if event.get("role") == "tool":
+            parts.append(str(event.get("content") or ""))
+    return "\n".join(parts)
+
+
+def _answer_supported_by_trajectory(answer: str, record: dict[str, Any]) -> bool:
+    normalized_answer = normalize_answer(answer)
+    if not normalized_answer:
+        return False
+    normalized_text = normalize_answer(_trajectory_observation_text(record))
+    if not normalized_text:
+        return False
+    if normalized_answer in normalized_text:
+        return True
+    answer_tokens = normalized_answer.split()
+    if len(answer_tokens) <= 3:
+        return all(token in normalized_text.split() for token in answer_tokens)
+    return False
+
+
+def _can_use_canonical_answer(record: dict[str, Any], evidence_tasks: set[str]) -> bool:
+    task = str(record.get("task") or "").lower()
+    expected = _expected_answer(record)
+    if not expected:
+        return False
+    if task in evidence_tasks:
+        return _answer_supported_by_trajectory(expected, record)
+    return True
+
+
+def _with_predicted(record: dict[str, Any], answer: str, source_suffix: str) -> dict[str, Any]:
+    updated = dict(record)
+    updated["predicted"] = answer
+    updated["correct"] = True
+    updated["exact"] = True
+    updated["f1"] = 1.0
+    source = str(record.get("_source") or "")
+    updated["_source"] = f"{source}#{source_suffix}" if source else source_suffix
+    return updated
 
 
 def gold_preferences(
@@ -240,6 +331,102 @@ def gold_preferences(
     return pairs
 
 
+def gold_answer_preferences(
+    records: list[dict[str, Any]],
+    evidence_tasks: set[str],
+) -> list[dict[str, Any]]:
+    """Create exact-answer preference pairs from records with safe gold labels.
+
+    These pairs are deliberately answer-only: they correct verbose or wrong final
+    answers without trying to teach unsupported tool actions. For tasks listed in
+    evidence_tasks, the gold answer must appear in the recorded tool observations.
+    """
+    pairs: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for record in records:
+        expected = _expected_answer(record)
+        predicted = _predicted_answer(record)
+        if not expected or not predicted:
+            continue
+        if _normalized_same(expected, predicted):
+            continue
+        if not _can_use_canonical_answer(record, evidence_tasks):
+            continue
+        key = (str(record.get("id") or ""), normalize_answer(expected), normalize_answer(predicted))
+        if key in seen:
+            continue
+        seen.add(key)
+        winner = _with_predicted(record, expected, "canonical_gold")
+        pairs.append(_pair_record(str(record.get("id") or len(pairs)), winner, record, "gold_answer", "canonical_short_answer"))
+    return pairs
+
+
+def _final_answer_event_index(record: dict[str, Any]) -> int | None:
+    trajectory = record.get("trajectory") or []
+    for index, event in enumerate(trajectory):
+        if event.get("role") != "assistant":
+            continue
+        for tool_call in event.get("tool_calls") or []:
+            fn = (tool_call or {}).get("function") or {}
+            if fn.get("name") == "final_answer":
+                return index
+    return None
+
+
+def _record_with_final_answer(record: dict[str, Any], answer: str, source_suffix: str) -> dict[str, Any] | None:
+    index = _final_answer_event_index(record)
+    if index is None:
+        return None
+    updated = _with_predicted(record, answer, source_suffix)
+    trajectory = [dict(event) for event in (record.get("trajectory") or [])]
+    event = dict(trajectory[index])
+    tool_calls = []
+    replaced = False
+    for tool_call in event.get("tool_calls") or []:
+        copied = dict(tool_call)
+        fn = dict(copied.get("function") or {})
+        if fn.get("name") == "final_answer":
+            args = _parse_tool_arguments(fn.get("arguments")) or {}
+            args["answer"] = answer
+            args.setdefault("rationale", "Canonical final answer from held-out-safe training label.")
+            fn["arguments"] = json.dumps(args, ensure_ascii=False)
+            replaced = True
+        copied["function"] = fn
+        tool_calls.append(copied)
+    if not replaced:
+        return None
+    event["tool_calls"] = tool_calls
+    trajectory[index] = event
+    updated["trajectory"] = trajectory
+    return updated
+
+
+def final_step_preferences(
+    records: list[dict[str, Any]],
+    evidence_tasks: set[str],
+) -> list[dict[str, Any]]:
+    pairs: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for record in records:
+        expected = _expected_answer(record)
+        predicted = _predicted_answer(record)
+        if not expected or not predicted:
+            continue
+        if _normalized_same(expected, predicted):
+            continue
+        if not _can_use_canonical_answer(record, evidence_tasks):
+            continue
+        winner = _record_with_final_answer(record, expected, "canonical_final_step")
+        if winner is None:
+            continue
+        key = (str(record.get("id") or ""), normalize_answer(expected), normalize_answer(predicted))
+        if key in seen:
+            continue
+        seen.add(key)
+        pairs.append(_pair_record(str(record.get("id") or len(pairs)), winner, record, "gold_final_step", "canonical_final_answer_step"))
+    return pairs
+
+
 def _pair_record(example_id: str, winner: dict[str, Any], loser: dict[str, Any], expert: str, reason: str) -> dict[str, Any]:
     return {
         "id": example_id,
@@ -252,6 +439,90 @@ def _pair_record(example_id: str, winner: dict[str, Any], loser: dict[str, Any],
         "winner": winner,
         "loser": loser,
     }
+
+
+def _swap_pair(pair: dict[str, Any], reason: str) -> dict[str, Any]:
+    swapped = dict(pair)
+    swapped["winner"], swapped["loser"] = pair["loser"], pair["winner"]
+    swapped["winner_source"], swapped["loser_source"] = pair.get("loser_source"), pair.get("winner_source")
+    swapped["reason"] = f"{reason}:{pair.get('reason')}"
+    swapped.pop("chosen_answer", None)
+    swapped.pop("rejected_answer", None)
+    return swapped
+
+
+def clean_preference_pairs(
+    pairs: list[dict[str, Any]],
+    *,
+    invert_wrong_over_right: bool,
+    reject_wrong_over_right: bool,
+    require_winner_correct: bool,
+    drop_both_wrong: bool,
+    canonicalize_chosen_answer: bool,
+    canonical_evidence_tasks: set[str],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    cleaned: list[dict[str, Any]] = []
+    stats: Counter[str] = Counter()
+    for original in pairs:
+        stats["input"] += 1
+        pair = dict(original)
+        winner = pair["winner"]
+        loser = pair["loser"]
+        winner_correct = _correct(winner)
+        loser_correct = _correct(loser)
+
+        if not winner_correct and loser_correct:
+            if invert_wrong_over_right:
+                pair = _swap_pair(pair, "inverted_gold_correctness")
+                winner = pair["winner"]
+                loser = pair["loser"]
+                winner_correct = True
+                loser_correct = False
+                stats["inverted_wrong_over_right"] += 1
+            elif reject_wrong_over_right:
+                stats["dropped_wrong_over_right"] += 1
+                continue
+
+        if drop_both_wrong and not winner_correct and not loser_correct:
+            stats["dropped_both_wrong"] += 1
+            continue
+        if require_winner_correct and not winner_correct:
+            stats["dropped_winner_not_correct"] += 1
+            continue
+
+        if canonicalize_chosen_answer and _can_use_canonical_answer(winner, canonical_evidence_tasks):
+            expected = _expected_answer(winner)
+            if expected:
+                pair["chosen_answer"] = expected
+                stats["canonicalized_chosen"] += 1
+
+        chosen_answer = str(pair.get("chosen_answer") or _predicted_answer(winner)).strip()
+        rejected_answer = str(pair.get("rejected_answer") or _predicted_answer(loser)).strip()
+        if not chosen_answer or not rejected_answer:
+            stats["dropped_empty_answer"] += 1
+            continue
+        if _normalized_same(chosen_answer, rejected_answer):
+            stats["dropped_same_normalized_answer"] += 1
+            continue
+
+        pair["winner"] = winner
+        pair["loser"] = loser
+        cleaned.append(pair)
+        stats["kept"] += 1
+    return cleaned, dict(stats)
+
+
+def keep_action_pairs_only(pairs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    kept: list[dict[str, Any]] = []
+    stats: Counter[str] = Counter()
+    for pair in pairs:
+        stats["input"] += 1
+        if _action_pair_messages(pair) is None:
+            stats["dropped_no_divergent_action"] += 1
+            continue
+        kept.append(pair)
+        stats["kept_action_pairs"] += 1
+    return kept, dict(stats)
 
 
 def _candidate_digest(question: str, expected: str | None, candidates: list[dict[str, Any]], model: str, reference_mode: str) -> str:
@@ -646,9 +917,12 @@ def _llamafactory_pair(pair: dict[str, Any], export_mode: str) -> dict[str, Any]
         "winner_source": pair.get("winner_source"),
         "loser_source": pair.get("loser_source"),
         "export_mode": export_mode,
+        "chosen_answer_source": "canonical" if pair.get("chosen_answer") else "winner",
     }
 
     if export_mode == "answer":
+        chosen_answer = str(pair.get("chosen_answer") or winner.get("predicted") or "").strip()
+        rejected_answer = str(pair.get("rejected_answer") or loser.get("predicted") or "").strip()
         return {
             "conversations": [
                 {
@@ -658,11 +932,11 @@ def _llamafactory_pair(pair: dict[str, Any], export_mode: str) -> dict[str, Any]
             ],
             "chosen": {
                 "from": "gpt",
-                "value": str(winner.get("predicted") or "").strip(),
+                "value": chosen_answer,
             },
             "rejected": {
                 "from": "gpt",
-                "value": str(loser.get("predicted") or "").strip(),
+                "value": rejected_answer,
             },
             "tools": "[]",
             "metadata": metadata,
@@ -697,6 +971,7 @@ def _write_llamafactory_artifacts(
     lora_rank: int,
     learning_rate: str,
     num_train_epochs: float,
+    per_device_train_batch_size: int,
     gradient_accumulation_steps: int,
     cutoff_len: int,
     export_mode: str,
@@ -754,7 +1029,7 @@ def _write_llamafactory_artifacts(
         "overwrite_output_dir": True,
         "save_only_model": False,
         "report_to": "none",
-        "per_device_train_batch_size": 1,
+        "per_device_train_batch_size": per_device_train_batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "learning_rate": float(learning_rate),
         "num_train_epochs": num_train_epochs,
@@ -835,6 +1110,33 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         pairs = gold_preferences(grouped, args.min_f1_margin, args.min_cost_margin)
         expert_name = "gold"
 
+    raw_pair_count = len(pairs)
+    gold_answer_pair_count = 0
+    if args.add_gold_answer_pairs:
+        gold_answer_pairs = gold_answer_preferences(records, _task_set(args.gold_answer_evidence_tasks))
+        gold_answer_pair_count = len(gold_answer_pairs)
+        pairs.extend(gold_answer_pairs)
+    final_step_pair_count = 0
+    if args.add_final_step_pairs:
+        final_step_pairs = final_step_preferences(records, _task_set(args.final_step_evidence_tasks))
+        final_step_pair_count = len(final_step_pairs)
+        pairs.extend(final_step_pairs)
+
+    pairs, pair_filter_stats = clean_preference_pairs(
+        pairs,
+        invert_wrong_over_right=args.invert_wrong_over_right,
+        reject_wrong_over_right=args.reject_wrong_over_right,
+        require_winner_correct=args.require_winner_correct,
+        drop_both_wrong=args.drop_both_wrong,
+        canonicalize_chosen_answer=args.canonicalize_chosen_answer,
+        canonical_evidence_tasks=_task_set(args.canonical_evidence_tasks),
+    )
+    if args.require_action_pairs:
+        pairs, action_filter_stats = keep_action_pairs_only(pairs)
+        pair_filter_stats = {**pair_filter_stats, **{f"action_{key}": value for key, value in action_filter_stats.items()}}
+    if len(pairs) < args.min_pairs:
+        raise ValueError(f"Only {len(pairs)} preference pairs remain after filtering; need at least {args.min_pairs}.")
+
     preferences_path = Path(args.preferences_out) if args.preferences_out else out / "preferences.jsonl"
     _write_jsonl(preferences_path, pairs)
     model, metrics = train_ranker(pairs, args.epochs, args.lr, args.l2, args.val_fraction, args.seed)
@@ -845,7 +1147,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "train_task_splits": train_task_splits(records),
         "num_records": len(records),
         "num_candidate_groups": len(grouped),
+        "raw_preference_pairs": raw_pair_count,
+        "gold_answer_pairs_added": gold_answer_pair_count,
+        "final_step_pairs_added": final_step_pair_count,
         "num_preference_pairs": len(pairs),
+        "pair_filter_stats": pair_filter_stats,
         "metrics": metrics,
     }
     model_path = out / "opd_policy.json"
@@ -863,6 +1169,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         args.lf_lora_rank,
         args.lf_learning_rate,
         args.lf_num_train_epochs,
+        args.lf_per_device_train_batch_size,
         args.lf_gradient_accumulation_steps,
         args.lf_cutoff_len,
         args.lf_export_mode,
@@ -893,6 +1200,18 @@ def main() -> None:
     parser.add_argument("--max-candidates", type=int, default=8)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--cache", default=None)
+    parser.add_argument("--invert-wrong-over-right", action="store_true", help="If gold scoring says the rejected answer is correct and the chosen answer is wrong, swap the pair.")
+    parser.add_argument("--reject-wrong-over-right", action="store_true", help="Drop GPT-labeled pairs where gold scoring says the chosen answer is wrong and the rejected answer is correct.")
+    parser.add_argument("--require-winner-correct", action="store_true", help="Keep only pairs whose chosen side is correct under gold scoring.")
+    parser.add_argument("--drop-both-wrong", action="store_true", help="Drop pairs where both chosen and rejected answers are wrong under gold scoring.")
+    parser.add_argument("--canonicalize-chosen-answer", action="store_true", help="Use the short reference answer as the chosen answer when it is safe for the task.")
+    parser.add_argument("--canonical-evidence-tasks", default="browsecomp-plus", help="Comma-separated tasks that require the reference answer to appear in tool observations before canonicalization.")
+    parser.add_argument("--add-gold-answer-pairs", action="store_true", help="Add synthetic chosen=reference, rejected=model-answer pairs from run records.")
+    parser.add_argument("--gold-answer-evidence-tasks", default="browsecomp-plus", help="Comma-separated tasks that require evidence support before adding synthetic gold-answer pairs.")
+    parser.add_argument("--add-final-step-pairs", action="store_true", help="Add step-level final_answer pairs with the same trajectory prefix and a canonical short answer.")
+    parser.add_argument("--final-step-evidence-tasks", default="browsecomp-plus", help="Comma-separated tasks that require evidence support before adding canonical final-step pairs.")
+    parser.add_argument("--min-pairs", type=int, default=1, help="Fail if filtering leaves fewer than this many pairs.")
+    parser.add_argument("--require-action-pairs", action="store_true", help="Keep only pairs with a divergent next action for step-level agent DPO.")
     parser.add_argument("--preferences-out", default=None)
     parser.add_argument("--sft-out", default=None)
     parser.add_argument("--llamafactory-out", default=None, help="Directory for LlamaFactory ranking dataset/config/script.")
@@ -904,6 +1223,7 @@ def main() -> None:
     parser.add_argument("--lf-lora-rank", type=int, default=16)
     parser.add_argument("--lf-learning-rate", default="5.0e-6")
     parser.add_argument("--lf-num-train-epochs", type=float, default=1.0)
+    parser.add_argument("--lf-per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--lf-gradient-accumulation-steps", type=int, default=16)
     parser.add_argument("--lf-cutoff-len", type=int, default=4096)
     parser.add_argument(
