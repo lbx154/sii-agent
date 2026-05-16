@@ -1,4 +1,6 @@
 """Quick smoke test — does the LLM client work + does ReAct produce a final answer?"""
+import sys
+
 from agent.runner import run_baseline
 from harness.controller import HarnessConfig
 
@@ -12,3 +14,5 @@ if __name__ == "__main__":
     print("STEPS:", r.steps, "TOOL_CALLS:", r.tool_calls, f"ELAPSED:{r.elapsed:.1f}s")
     print("ANSWER:", r.final_answer)
     print("RATIONALE:", r.rationale)
+    if r.stop_reason != "final" or not r.final_answer:
+        sys.exit(1)

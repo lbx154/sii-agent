@@ -14,5 +14,9 @@ playwright>=1.47.0
 ddgs
 rank-bm25>=0.2.2
 datasets>=2.20.0
+huggingface-hub>=0.24.0
 tqdm>=4.66.0
 numpy>=1.26.0
+transformers>=4.51.0,<5
+pyserini>=1.2.0
+torchvision>=0.27.0

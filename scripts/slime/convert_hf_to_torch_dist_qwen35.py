@@ -61,10 +61,7 @@ def _register_qwen35_configs() -> None:
         ("qwen3_5_text", Qwen35TextConfig),
         ("qwen3_5", Qwen35Config),
     ):
-        try:
-            AutoConfig.register(model_type, config_cls)
-        except ValueError:
-            pass
+        AutoConfig.register(model_type, config_cls, exist_ok=True)
 
 
 def main() -> None:

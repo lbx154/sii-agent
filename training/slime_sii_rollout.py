@@ -17,7 +17,8 @@ from tools import dispatch, tool_specs
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ALLOWED_TOOLS = ("wiki_search", "web_search", "final_answer")
+DEFAULT_ALLOWED_TOOLS = ("wiki_search", "web_search", "browse", "browse_many", "final_answer")
+BROWSECOMP_ALLOWED_TOOLS = ("search", "final_answer")
 
 SYSTEM_PROMPT = """You are a careful research agent.
 
@@ -26,10 +27,31 @@ Loop:
 2. Call exactly one available function, or call final_answer when ready.
 3. Read the tool result and decide the next step.
 
+Available tools for this run:
+{tool_list}
+
 Rules:
 - Prefer wiki_search for encyclopedic questions and web_search when wiki_search is insufficient.
+- Use browse for one source URL and browse_many for several independent source URLs.
 - Do not repeat the same tool arguments; refine the query instead.
 - Keep final_answer concise. Submit final_answer before the step budget is exhausted.
+"""
+
+BROWSECOMP_SYSTEM_PROMPT = """You are solving BrowseComp-Plus questions using a fixed local corpus.
+
+Loop:
+1. Search the fixed corpus with search.
+2. Call final_answer when the answer is supported.
+
+Available tools for this run:
+{tool_list}
+
+Rules:
+- search returns the top 5 documents with docid, score, and a 512-token snippet.
+- Build the answer only from BrowseComp-Plus corpus evidence.
+- Cite supporting document ids in square brackets, e.g. [12345].
+- Do not use open-web or Wikipedia tools for BrowseComp-Plus.
+- Keep final_answer concise and include citations in the answer text when possible.
 """
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
@@ -43,18 +65,46 @@ _XML_PARAM_RE = re.compile(
 )
 
 
-def _allowed_tools(sample: Any) -> tuple[str, ...]:
+def _metadata(sample: Any) -> dict[str, Any]:
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    return metadata
+
+
+def _task_name(sample: Any) -> str:
+    metadata = _metadata(sample)
+    return str(metadata.get("task") or metadata.get("dataset") or "").lower()
+
+
+def _default_allowed_tools(sample: Any) -> tuple[str, ...]:
+    task = _task_name(sample)
+    if task in {"browsecomp", "browsecomp-plus", "browsecomp_plus"}:
+        return BROWSECOMP_ALLOWED_TOOLS
+    return DEFAULT_ALLOWED_TOOLS
+
+
+def _allowed_tools(sample: Any) -> tuple[str, ...]:
+    metadata = _metadata(sample)
     configured = metadata.get("allowed_tools") or os.getenv("SII_SLIME_ALLOWED_TOOLS")
     if isinstance(configured, str):
         names = [name.strip() for name in configured.split(",") if name.strip()]
     elif isinstance(configured, list):
         names = [str(name).strip() for name in configured if str(name).strip()]
     else:
-        names = list(DEFAULT_ALLOWED_TOOLS)
+        names = list(_default_allowed_tools(sample))
     if "final_answer" not in names:
         names.append("final_answer")
     return tuple(dict.fromkeys(names))
+
+
+def _system_prompt(sample: Any, allowed_tools: tuple[str, ...]) -> str:
+    metadata = _metadata(sample)
+    if isinstance(metadata.get("system_prompt"), str) and metadata["system_prompt"].strip():
+        template = metadata["system_prompt"].strip()
+    elif "search" in allowed_tools or _task_name(sample) in {"browsecomp", "browsecomp-plus", "browsecomp_plus"}:
+        template = BROWSECOMP_SYSTEM_PROMPT
+    else:
+        template = SYSTEM_PROMPT
+    return template.format(tool_list=", ".join(f"`{name}`" for name in allowed_tools))
 
 
 def _chat_template(tokenizer: Any, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, add_generation_prompt: bool) -> str:
@@ -166,9 +216,9 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> str:
     return await asyncio.to_thread(dispatch, name, arguments)
 
 
-def _build_messages(question: str) -> list[dict[str, Any]]:
+def _build_messages(question: str, system_prompt: str) -> list[dict[str, Any]]:
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": question},
     ]
 
@@ -198,7 +248,7 @@ async def generate(args: Namespace, sample: Any, sampling_params: dict[str, Any]
     allowed = _allowed_tools(sample)
     tools = tool_specs(allowed)
     question = sample.prompt if isinstance(sample.prompt, str) else json.dumps(sample.prompt, ensure_ascii=False)
-    messages = _build_messages(question)
+    messages = _build_messages(question, _system_prompt(sample, allowed))
     prompt_text = _chat_template(tokenizer, messages, tools, add_generation_prompt=True)
     prompt_token_ids = _encode(tokenizer, prompt_text)
 

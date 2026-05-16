@@ -2,10 +2,14 @@ __pycache__/
 *.pyc
 .env
 logs/
+.hf-cache/
+Qwen3-32B/
+Qwen3.5-9B/
 data/raw/
 data/cache/
 data/wiki25/
 data/browsecomp-plus/
+indexes/
 .venv/
 *.egg-info/
 .playwright/

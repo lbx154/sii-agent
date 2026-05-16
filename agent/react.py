@@ -1,31 +1,93 @@
 """Minimal ReAct loop with OpenAI-style tool calling, governed by a Harness."""
 from __future__ import annotations
 import json
+import os
+import re
+from types import SimpleNamespace
 from typing import Any
 
 from .llm import chat
-from tools import tool_specs, dispatch
+from tools import TOOL_REGISTRY, tool_specs, dispatch
 from harness.controller import HarnessConfig, HarnessResult, StepGuard
+from memory.short_term import ShortTermMemory
 
-DEFAULT_TOOLS = ("web_search", "wiki_search", "browse", "final_answer")
+BENCHMARK_TOOLS = ("web_search", "wiki_search", "wiki_page", "browse", "browse_many", "final_answer")
+VISUAL_TOOLS = (
+    "visual_web_search",
+    "image_to_text",
+    "web_search",
+    "wiki_search",
+    "wiki_page",
+    "browse",
+    "browse_many",
+    "image_search",
+    "final_answer",
+)
+RICH_TOOLS = (
+    "web_search",
+    "wiki_search",
+    "wiki_page",
+    "browse",
+    "browse_many",
+    "image_search",
+    "visual_web_search",
+    "image_to_text",
+    "browser_open",
+    "browser_open_many",
+    "browser_text",
+    "browser_click",
+    "browser_type",
+    "browser_close",
+    "final_answer",
+)
+TOOL_PROFILES = {
+    "benchmark": BENCHMARK_TOOLS,
+    "default": BENCHMARK_TOOLS,
+    "visual": VISUAL_TOOLS,
+    "rich": RICH_TOOLS,
+    "full": RICH_TOOLS,
+}
+DEFAULT_TOOLS = BENCHMARK_TOOLS
 
 
 SYSTEM_PROMPT = """You are a careful research agent.
 
 Loop:
 1. Think briefly about what you still need.
-2. Call ONE tool (web_search / wiki_search / browse / final_answer).
+2. Call exactly ONE available tool.
 3. Read the tool result and decide next step.
+
+Available tools for this run:
+{tool_list}
 
 Rules:
 - Use `web_search` for live facts; use `wiki_search` for encyclopedic facts or when web search is slow.
-- Use `browse` to read a specific URL from search results.
-- Cross-check at least one source for non-trivial claims.
+- Use `browse` to read one URL and `browse_many` to read several independent URLs concurrently.
+- For visual factual questions with an image path or image URL, prefer `visual_web_search` first when available. It generates multiple visual/OCR hypotheses and verifies them against search evidence.
+- Do not treat the first visual entity guess as proven. Compare candidates, use OCR/visible clues, and reject candidates that do not answer the exact question.
+- Use `image_to_text` for focused OCR/caption follow-up; `image_search` is text-to-image search, not reverse image search.
+- Use `browser_open` / `browser_open_many` / `browser_click` / `browser_type` only when a page needs JavaScript rendering or interaction.
+- Cross-check at least one source for non-trivial claims. If the user provides a `Provided context` section, treat that context as the primary source and do not search only to cross-check facts already present there.
 - DO NOT repeat the same query / URL — refine instead.
+- Answer in the same language as the user question when possible; for Chinese questions, prefer the common Chinese name/phrase over an English alias.
 - Prefer 1-3 tool calls. When you have a plausible answer, call `final_answer` with a concise answer.
 - You MUST call `final_answer` before the step budget is exhausted.
 - If stuck, simplify the query or pivot to a related search term.
 """
+
+
+def _profile_tools() -> tuple[str, ...]:
+    profile = os.getenv("SII_AGENT_TOOL_PROFILE", "benchmark").strip().lower()
+    if profile == "all":
+        return tuple(TOOL_REGISTRY)
+    return TOOL_PROFILES.get(profile, BENCHMARK_TOOLS)
+
+
+def _system_prompt(allowed_tools: tuple[str, ...], extra_system: str | None) -> str:
+    sys = SYSTEM_PROMPT.format(tool_list=", ".join(f"`{name}`" for name in allowed_tools))
+    if extra_system:
+        sys += f"\n\n[Memory & Reflection]\n{extra_system}"
+    return sys
 
 
 def _safe_json(s: str) -> dict | None:
@@ -33,6 +95,44 @@ def _safe_json(s: str) -> dict | None:
         return json.loads(s)
     except Exception:
         return None
+
+
+def _parse_content_tool_calls(content: str) -> list[Any]:
+    calls: list[Any] = []
+    for i, match in enumerate(re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", content, re.DOTALL)):
+        payload = _safe_json(match.group(1))
+        if not payload:
+            continue
+        name = str(payload.get("name") or payload.get("function", {}).get("name") or "").strip()
+        arguments = payload.get("arguments")
+        if not name or arguments is None:
+            continue
+        if isinstance(arguments, str):
+            arguments_text = arguments
+        else:
+            arguments_text = json.dumps(arguments, ensure_ascii=False)
+        calls.append(
+            SimpleNamespace(
+                id=f"content-tool-call-{i}",
+                function=SimpleNamespace(name=name, arguments=arguments_text),
+                type="function",
+                _synthetic=True,
+            )
+        )
+    return calls
+
+
+def _dump_tool_call(tc: Any) -> dict:
+    if hasattr(tc, "model_dump"):
+        return tc.model_dump()
+    return {
+        "id": tc.id,
+        "type": "function",
+        "function": {
+            "name": tc.function.name,
+            "arguments": tc.function.arguments,
+        },
+    }
 
 
 def _forced_final_tool_choice() -> dict:
@@ -54,6 +154,22 @@ def _apply_final_tool_call(res: HarnessResult, tc: Any) -> bool:
     return True
 
 
+def _messages_with_short_memory(
+    messages: list[dict],
+    memory: ShortTermMemory | None,
+    active_tools: tuple[str, ...],
+) -> list[dict]:
+    if memory is None:
+        return messages
+    rendered = memory.render_for_prompt()
+    if not rendered:
+        return messages
+    memory_msg = {"role": "user", "content": rendered}
+    if active_tools == ("final_answer",) and messages:
+        return messages[:-1] + [memory_msg, messages[-1]]
+    return messages + [memory_msg]
+
+
 def run_react(
     question: str,
     cfg: HarnessConfig | None = None,
@@ -62,13 +178,14 @@ def run_react(
     cfg = cfg or HarnessConfig()
     guard = StepGuard(cfg)
     res = HarnessResult()
+    short_memory = ShortTermMemory(question, max_chars=cfg.short_memory_max_chars) if cfg.use_short_memory else None
 
-    sys = SYSTEM_PROMPT + (f"\n\n[Memory & Reflection]\n{extra_system}" if extra_system else "")
+    allowed_tools = cfg.allowed_tools or _profile_tools()
+    sys = _system_prompt(allowed_tools, extra_system)
     messages: list[dict] = [
         {"role": "system", "content": sys},
         {"role": "user", "content": question},
     ]
-    allowed_tools = cfg.allowed_tools or DEFAULT_TOOLS
 
     for step in range(cfg.max_steps):
         active_tools = allowed_tools
@@ -92,8 +209,9 @@ def run_react(
             tool_choice: str | dict = "auto"
             if active_tools == ("final_answer",):
                 tool_choice = _forced_final_tool_choice()
+            call_messages = _messages_with_short_memory(messages, short_memory, active_tools)
             resp = chat(
-                messages,
+                call_messages,
                 tools=specs,
                 max_tokens=cfg.max_llm_tokens,
                 timeout=min(cfg.max_llm_call_seconds, time_left),
@@ -107,25 +225,37 @@ def run_react(
         finish_reason = str(getattr(choice, "finish_reason", "") or "unknown")
         res.finish_reasons[finish_reason] = res.finish_reasons.get(finish_reason, 0) + 1
         msg = choice.message
-        messages.append(
-            {
-                "role": "assistant",
-                "content": msg.content or "",
-                "tool_calls": [tc.model_dump() for tc in (msg.tool_calls or [])],
-            }
-        )
+        parsed_content_tool_calls = [] if msg.tool_calls else _parse_content_tool_calls(msg.content or "")
+        effective_tool_calls = list(msg.tool_calls or []) or parsed_content_tool_calls
+        dumped_tool_calls = [_dump_tool_call(tc) for tc in effective_tool_calls]
+        assistant_content = "" if parsed_content_tool_calls else (msg.content or "")
+        assistant_message = {"role": "assistant", "content": assistant_content}
+        if effective_tool_calls:
+            assistant_message["tool_calls"] = dumped_tool_calls
+        messages.append(assistant_message)
         res.steps = step + 1
-        res.trajectory.append({"role": "assistant", "content": msg.content or "", "tool_calls": [tc.model_dump() for tc in (msg.tool_calls or [])]})
+        res.trajectory.append({"role": "assistant", "content": msg.content or "", "tool_calls": dumped_tool_calls})
 
-        if not msg.tool_calls:
+        if not effective_tool_calls:
+            content = (msg.content or "").strip()
+            if active_tools == ("final_answer",) and content:
+                res.final_answer = content
+                res.rationale = "text finalization on forced final step"
+                res.stop_reason = "final"
+                if short_memory is not None:
+                    res.short_memory_stats = short_memory.stats()
+                res.elapsed = guard.elapsed()
+                return res
             if guard.note_no_tool():
                 res.stop_reason = "loop:no_tool"
                 break
+            if short_memory is not None:
+                short_memory.observe_no_tool(content)
             messages.append({"role": "user", "content": "You did not call a tool. Either call a tool or call `final_answer`."})
             continue
         guard.reset_no_tool()
 
-        for tc in msg.tool_calls:
+        for tc in effective_tool_calls:
             name = tc.function.name
             args = _safe_json(tc.function.arguments or "{}")
             res.tool_calls += 1
@@ -174,6 +304,8 @@ def run_react(
                     res.trajectory.append({"role": "tool", "name": name, "args": args, "content": tool_result})
                     continue
                 res.elapsed = guard.elapsed()
+                if short_memory is not None:
+                    res.short_memory_stats = short_memory.stats()
                 return res
 
             if guard.note_tool(name, json.dumps(args, sort_keys=True)):
@@ -183,6 +315,8 @@ def run_react(
                 )
             else:
                 tool_result = dispatch(name, args)
+                if short_memory is not None:
+                    short_memory.observe_tool(name, args, tool_result)
 
             messages.append(
                 {
@@ -191,7 +325,7 @@ def run_react(
                     "content": tool_result[:8000],
                 }
             )
-            res.trajectory.append({"role": "tool", "name": name, "args": args, "content": tool_result[:1000]})
+            res.trajectory.append({"role": "tool", "name": name, "args": args, "content": tool_result[:3000]})
 
         if guard.time_left() <= 0:
             res.stop_reason = "timeout"
@@ -209,8 +343,9 @@ def run_react(
             }
         )
         try:
+            call_messages = _messages_with_short_memory(messages, short_memory, ("final_answer",))
             resp = chat(
-                messages,
+                call_messages,
                 tools=tool_specs(("final_answer",)),
                 tool_choice=_forced_final_tool_choice(),
                 max_tokens=cfg.max_llm_tokens,
@@ -222,11 +357,13 @@ def run_react(
                 res.finish_reasons.get(f"forced_{finish_reason}", 0) + 1
             )
             msg = choice.message
-            dumped_tool_calls = [tc.model_dump() for tc in (msg.tool_calls or [])]
+            parsed_content_tool_calls = [] if msg.tool_calls else _parse_content_tool_calls(msg.content or "")
+            effective_tool_calls = list(msg.tool_calls or []) or parsed_content_tool_calls
+            dumped_tool_calls = [_dump_tool_call(tc) for tc in effective_tool_calls]
             res.trajectory.append(
                 {"role": "assistant", "content": msg.content or "", "tool_calls": dumped_tool_calls}
             )
-            for tc in msg.tool_calls or []:
+            for tc in effective_tool_calls:
                 if _apply_final_tool_call(res, tc):
                     res.tool_calls += 1
                     res.tool_call_counts["final_answer"] = res.tool_call_counts.get("final_answer", 0) + 1
@@ -241,5 +378,7 @@ def run_react(
 
     if not res.stop_reason:
         res.stop_reason = "max_steps"
+    if short_memory is not None:
+        res.short_memory_stats = short_memory.stats()
     res.elapsed = guard.elapsed()
     return res

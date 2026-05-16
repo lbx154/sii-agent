@@ -6,11 +6,11 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 SLIME_DIR="${REPO_ROOT}/third_party/slime"
 source "${SCRIPT_DIR}/qwen3.5-9B.sh"
 
-: "${HF_CHECKPOINT:=/root/models/Qwen3.5-9B}"
-: "${SAVE_PATH:=/root/models/Qwen3.5-9B_torch_dist}"
+: "${HF_CHECKPOINT:=/root/sii-agent/Qwen3.5-9B}"
+: "${SAVE_PATH:=/root/sii-agent/Qwen3.5-9B_torch_dist}"
 : "${CONVERT_CUDA_VISIBLE_DEVICES:=0,1,2,3}"
 : "${CONVERT_GPUS:=4}"
-: "${MEGATRON_PATH:=/root/Megatron-LM}"
+: "${MEGATRON_PATH:=${REPO_ROOT}/third_party/Megatron-LM}"
 
 if [ ! -d "${HF_CHECKPOINT}" ]; then
   echo "Missing HF checkpoint: ${HF_CHECKPOINT}" >&2

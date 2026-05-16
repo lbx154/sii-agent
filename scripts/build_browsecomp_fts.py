@@ -1,4 +1,9 @@
-"""Build a SQLite FTS5 index for the BrowseComp-Plus fixed corpus."""
+"""Build a legacy SQLite FTS5 index for BrowseComp-Plus.
+
+The default BrowseComp path uses the official Pyserini/Lucene BM25 index from
+Tevatron/browsecomp-plus-indexes. Use scripts.download_browsecomp_index for
+official-compatible runs; this script is kept for lightweight local fallback.
+"""
 from __future__ import annotations
 
 import argparse

@@ -25,7 +25,13 @@ def _tokenize(text: str) -> list[str]:
 
 
 def _default_index_path() -> Path:
-    return Path(os.getenv("WIKI25_INDEX_PATH", "data/wiki25/wiki25_sample.jsonl"))
+    configured = os.getenv("WIKI25_INDEX_PATH")
+    if configured:
+        return Path(configured)
+    sqlite_path = Path("data/wiki25/wiki25_fts.sqlite")
+    if sqlite_path.exists():
+        return sqlite_path
+    return Path("data/wiki25/wiki25_sample.jsonl")
 
 
 def _is_sqlite_index(index_path: str) -> bool:
@@ -127,6 +133,49 @@ def _search_sqlite(index_path: str, query: str, k: int) -> str:
     return "\n".join(out) if out else "(no results)"
 
 
+def _get_page_sqlite(index_path: str, title_or_id: str, max_chars: int) -> str:
+    path = Path(index_path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found. Build it with: python -m scripts.build_wiki_fts"
+        )
+    needle = str(title_or_id).strip()
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, title, text
+            FROM wiki_fts
+            WHERE id = ? OR lower(title) = lower(?)
+            LIMIT 3
+            """,
+            (needle, needle),
+        ).fetchall()
+        if not rows:
+            rows = conn.execute(
+                """
+                SELECT id, title, text, bm25(wiki_fts, 2.0, 1.0) AS score
+                FROM wiki_fts
+                WHERE wiki_fts MATCH ?
+                ORDER BY score
+                LIMIT 3
+                """,
+                (_quoted(needle),),
+            ).fetchall()
+            rows = [(doc_id, title, text) for doc_id, title, text, _score in rows]
+        if not rows:
+            return "(no page found)"
+        out = []
+        for doc_id, title, text in rows:
+            content = str(text).strip()
+            if len(content) > max_chars:
+                content = content[:max_chars].rstrip() + " ..."
+            out.append(f"# {title} (wiki25 id={doc_id})\n{content}")
+        return "\n\n".join(out)
+    finally:
+        conn.close()
+
+
 def _split_title(contents: str) -> tuple[str, str]:
     if "\n" not in contents:
         return "", contents
@@ -175,3 +224,46 @@ def wiki_search(query: str, k: int = 5) -> str:
             f"    {snippet}"
         )
     return "\n".join(out) if out else "(no results)"
+
+
+@register(
+    "wiki_page",
+    "Read a local offline Wikipedia/wiki25 page by exact title or wiki25 id. Use after wiki_search finds a likely page and you need full page details.",
+    {
+        "type": "object",
+        "properties": {
+            "title_or_id": {"type": "string", "description": "Exact Wikipedia title or wiki25 id from wiki_search"},
+            "max_chars": {"type": "integer", "default": 4000, "minimum": 500, "maximum": 12000},
+        },
+        "required": ["title_or_id"],
+    },
+)
+def wiki_page(title_or_id: str, max_chars: int = 4000) -> str:
+    max_chars = max(500, min(int(max_chars), 12000))
+    index_path = str(_default_index_path())
+    if _is_sqlite_index(index_path):
+        try:
+            return _get_page_sqlite(index_path, title_or_id, max_chars)
+        except Exception as e:  # noqa: BLE001
+            return f"OFFLINE_WIKI_UNAVAILABLE: {e}"
+
+    try:
+        _bm25, docs = _load_index(index_path)
+    except Exception as e:  # noqa: BLE001
+        return f"OFFLINE_WIKI_UNAVAILABLE: {e}"
+    needle = str(title_or_id).strip().lower()
+    matches = [
+        doc for doc in docs
+        if str(doc.get("id", "")).lower() == needle or str(doc.get("title", "")).lower() == needle
+    ]
+    if not matches:
+        matches = [doc for doc in docs if needle in str(doc.get("title", "")).lower()][:3]
+    if not matches:
+        return "(no page found)"
+    out = []
+    for doc in matches[:3]:
+        content = str(doc.get("text", "")).strip()
+        if len(content) > max_chars:
+            content = content[:max_chars].rstrip() + " ..."
+        out.append(f"# {doc.get('title', '')} (wiki25 id={doc.get('id', '')})\n{content}")
+    return "\n\n".join(out)

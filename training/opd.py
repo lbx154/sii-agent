@@ -818,7 +818,7 @@ def _tool_specs_for_record(record: dict[str, Any]) -> str:
 
     task = str(record.get("task") or "").lower()
     if task == "browsecomp-plus":
-        names = ("browsecomp_search", "browsecomp_get_document", "final_answer")
+        names = ("search", "final_answer")
     else:
         names = ("web_search", "wiki_search", "browse", "final_answer")
     return json.dumps(tool_specs(names), ensure_ascii=False)

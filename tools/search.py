@@ -2,8 +2,31 @@
 from __future__ import annotations
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from .registry import register
 from .wiki import wiki_search
+
+_MAX_BACKEND_WORKERS = 3
+
+
+def _clamp_int(value: int, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(minimum, min(maximum, number))
+
+
+def _configured_backends() -> list[str]:
+    backends = [
+        b.strip().lower()
+        for b in os.getenv("SEARCH_BACKENDS", "ddg,wiki").split(",")
+        if b.strip()
+    ]
+    if os.getenv("TAVILY_API_KEY"):
+        backends = ["tavily" if b == "ddg" else b for b in backends]
+    return list(dict.fromkeys(backends))
 
 
 @register(
@@ -20,25 +43,28 @@ from .wiki import wiki_search
     },
 )
 def web_search(query: str, k: int = 5) -> str:
-    backends = [
-        b.strip().lower()
-        for b in os.getenv("SEARCH_BACKENDS", "ddg,wiki").split(",")
-        if b.strip()
-    ]
+    k = _clamp_int(k, 5, 1, 10)
+    backends = _configured_backends()
     sections: list[str] = []
 
-    if os.getenv("TAVILY_API_KEY"):
-        backends = ["tavily" if b == "ddg" else b for b in backends]
+    if len(backends) <= 1:
+        results = {
+            backend: _cached_backend_search(backend, query, k)
+            for backend in backends
+        }
+    else:
+        results: dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=min(_MAX_BACKEND_WORKERS, len(backends))) as pool:
+            futures = {
+                pool.submit(_cached_backend_search, backend, query, k): backend
+                for backend in backends
+            }
+            for future in as_completed(futures):
+                backend = futures[future]
+                results[backend] = future.result()
 
     for backend in backends:
-        if backend == "tavily":
-            result = _guarded_search("Tavily", lambda: _tavily(query, k))
-        elif backend == "ddg":
-            result = _guarded_search("DuckDuckGo", lambda: _ddg(query, k))
-        elif backend == "wiki":
-            result = _guarded_search("Offline Wikipedia", lambda: wiki_search(query, k))
-        else:
-            result = f"ERROR: unknown search backend '{backend}'"
+        result = results.get(backend, "")
         if result and result != "(no results)":
             sections.append(f"## {backend}\n{result}")
 
@@ -59,8 +85,19 @@ def web_search(query: str, k: int = 5) -> str:
     },
 )
 def image_search(query: str, k: int = 5) -> str:
-    k = max(1, min(20, int(k)))
+    k = _clamp_int(k, 5, 1, 20)
     return _guarded_search("DuckDuckGo image", lambda: _ddg_images(query, k))
+
+
+@lru_cache(maxsize=256)
+def _cached_backend_search(backend: str, query: str, k: int) -> str:
+    if backend == "tavily":
+        return _guarded_search("Tavily", lambda: _tavily(query, k))
+    if backend == "ddg":
+        return _guarded_search("DuckDuckGo", lambda: _ddg(query, k))
+    if backend == "wiki":
+        return _guarded_search("Offline Wikipedia", lambda: wiki_search(query, k))
+    return f"ERROR: unknown search backend '{backend}'"
 
 
 def _guarded_search(label: str, fn) -> str:

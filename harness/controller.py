@@ -17,6 +17,8 @@ class HarnessConfig:
     finalize_on_stop: bool = True
     max_repeats: int = 2          # same tool+args within window → flagged
     max_consecutive_no_tool: int = 2  # LLM keeps "thinking" without acting
+    use_short_memory: bool = False
+    short_memory_max_chars: int = 2500
 
 
 @dataclass
@@ -30,6 +32,7 @@ class HarnessResult:
     tool_calls: int = 0
     tool_call_counts: dict[str, int] = field(default_factory=dict)
     finish_reasons: dict[str, int] = field(default_factory=dict)
+    short_memory_stats: dict[str, int] = field(default_factory=dict)
 
 
 class StepGuard:

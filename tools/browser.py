@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -35,6 +37,40 @@ def _is_http_url(url: str) -> bool:
 
 def _json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _aio_base_url() -> str | None:
+    base_url = os.getenv("AIO_SANDBOX_BASE_URL", "").strip().rstrip("/")
+    return base_url or None
+
+
+def _normalize_ws_url(cdp_url: str, base_url: str) -> str:
+    parsed = urlparse(cdp_url)
+    base = urlparse(base_url)
+    if parsed.hostname == "0.0.0.0" and base.hostname:
+        netloc = base.hostname
+        if parsed.port:
+            netloc += f":{parsed.port}"
+        return urlunparse(parsed._replace(netloc=netloc))
+    return cdp_url
+
+
+def _aio_browser_info(base_url: str) -> dict[str, Any]:
+    response = httpx.get(f"{base_url}/v1/browser/info", timeout=10)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"AIO browser info response must be an object: {payload}")
+    if payload.get("success") is False:
+        raise RuntimeError(payload.get("message") or "AIO browser info request failed")
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
+        raise RuntimeError(f"AIO browser info response missing data: {payload}")
+    cdp_url = data.get("cdp_url")
+    if not cdp_url:
+        raise RuntimeError(f"AIO browser info response missing cdp_url: {payload}")
+    data["cdp_url"] = _normalize_ws_url(str(cdp_url), base_url)
+    return data
 
 
 def _html_snapshot(html: str, url: str, max_chars: int) -> dict[str, str]:
@@ -97,6 +133,10 @@ def _looks_like_text_target(target: str) -> bool:
     return any(ch.isspace() for ch in target) or target.startswith(("text=", "label="))
 
 
+def _css_attr_equals(attr: str, value: str) -> str:
+    return f"[{attr}={json.dumps(value)}]"
+
+
 def _resolve_locator(page: Any, target: str, by: str = "auto") -> Any:
     mode = by.lower().strip()
     if target.startswith("css="):
@@ -122,6 +162,46 @@ def _resolve_locator(page: Any, target: str, by: str = "auto") -> Any:
     except Exception:  # noqa: BLE001
         pass
     return page.get_by_text(target, exact=False).first
+
+
+def _resolve_fill_locator(page: Any, target: str, by: str = "auto") -> Any:
+    mode = by.lower().strip()
+    if target.startswith("css="):
+        return page.locator(target[4:]).first
+    if target.startswith("label="):
+        return page.get_by_label(target.split("=", 1)[1], exact=False).first
+    if target.startswith("placeholder="):
+        return page.get_by_placeholder(target.split("=", 1)[1], exact=False).first
+    if target.startswith("name="):
+        return page.locator(_css_attr_equals("name", target.split("=", 1)[1])).first
+    if mode == "css":
+        return page.locator(target).first
+    if mode == "label":
+        return page.get_by_label(target, exact=False).first
+    if mode == "placeholder":
+        return page.get_by_placeholder(target, exact=False).first
+    if mode == "name":
+        return page.locator(_css_attr_equals("name", target)).first
+    if mode == "text":
+        return page.get_by_text(target, exact=False).first
+    if mode != "auto":
+        raise ValueError("by must be one of: auto, css, text, label, placeholder, name")
+
+    candidates = (
+        lambda: page.get_by_label(target, exact=False),
+        lambda: page.get_by_placeholder(target, exact=False),
+        lambda: page.locator(_css_attr_equals("name", target)),
+        lambda: page.locator(target),
+        lambda: page.get_by_text(target, exact=False),
+    )
+    for candidate in candidates:
+        try:
+            locator = candidate()
+            if locator.count() > 0:
+                return locator.first
+        except Exception:  # noqa: BLE001
+            continue
+    return page.get_by_label(target, exact=False).first
 
 
 class _BrowserSession:
@@ -175,19 +255,37 @@ class _BrowserSession:
         playwright = None
         browser = None
         context = None
+        page = None
+        using_aio = False
+        owns_context = True
         try:
             from playwright.sync_api import sync_playwright
 
             playwright = sync_playwright().start()
-            browser = playwright.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-            )
-            context = browser.new_context(
-                ignore_https_errors=True,
-                viewport={"width": 1366, "height": 768},
-                user_agent=_HEADERS["User-Agent"],
-            )
+            aio_url = _aio_base_url()
+            if aio_url:
+                using_aio = True
+                info = _aio_browser_info(aio_url)
+                browser = playwright.chromium.connect_over_cdp(info["cdp_url"])
+                if browser.contexts:
+                    context = browser.contexts[0]
+                    owns_context = False
+                else:
+                    context = browser.new_context(
+                        ignore_https_errors=True,
+                        viewport={"width": 1366, "height": 768},
+                        user_agent=str(info.get("user_agent") or _HEADERS["User-Agent"]),
+                    )
+            else:
+                browser = playwright.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage"],
+                )
+                context = browser.new_context(
+                    ignore_https_errors=True,
+                    viewport={"width": 1366, "height": 768},
+                    user_agent=_HEADERS["User-Agent"],
+                )
             page = context.new_page()
             self._ready.set()
             while True:
@@ -206,12 +304,21 @@ class _BrowserSession:
             self._init_error = _format_playwright_error(exc)
             self._ready.set()
         finally:
-            for resource in (context, browser):
-                if resource is not None:
-                    try:
-                        resource.close()
-                    except Exception:  # noqa: BLE001
-                        pass
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            if context is not None and owns_context:
+                try:
+                    context.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            if browser is not None and not using_aio:
+                try:
+                    browser.close()
+                except Exception:  # noqa: BLE001
+                    pass
             if playwright is not None:
                 try:
                     playwright.stop()
@@ -261,6 +368,47 @@ class _BrowserManager:
 
 
 _BROWSER_MANAGER = _BrowserManager()
+
+
+@register(
+    "aio_sandbox_status",
+    "Check whether an All-in-One Sandbox browser backend is configured and reachable.",
+    {
+        "type": "object",
+        "properties": {},
+    },
+)
+def aio_sandbox_status() -> str:
+    base_url = _aio_base_url()
+    if not base_url:
+        return _json(
+            {
+                "configured": False,
+                "message": "Set AIO_SANDBOX_BASE_URL=http://127.0.0.1:8080 to use All-in-One Sandbox.",
+            }
+        )
+    try:
+        info = _aio_browser_info(base_url)
+    except Exception as exc:  # noqa: BLE001
+        return _json(
+            {
+                "configured": True,
+                "base_url": base_url,
+                "reachable": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+    return _json(
+        {
+            "configured": True,
+            "base_url": base_url,
+            "reachable": True,
+            "cdp_url": info.get("cdp_url"),
+            "vnc_url": info.get("vnc_url"),
+            "viewport": info.get("viewport"),
+            "page_viewport": info.get("page_viewport"),
+        }
+    )
 
 
 @register(
@@ -379,6 +527,82 @@ def browser_open(
 
 
 @register(
+    "browser_open_many",
+    "Open up to four http(s) URLs concurrently in separate sandbox browser sessions and return JSON snapshots. "
+    "Use for JavaScript-rendered pages that cannot be handled by static browse_many.",
+    {
+        "type": "object",
+        "properties": {
+            "urls": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 4,
+            },
+            "session_prefix": {"type": "string", "default": "bulk"},
+            "wait_until": {
+                "type": "string",
+                "default": "domcontentloaded",
+                "enum": ["commit", "domcontentloaded", "load", "networkidle"],
+            },
+            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1000, "maximum": 120000},
+            "max_chars": {"type": "integer", "default": 3000, "minimum": 200, "maximum": 20000},
+            "concurrency": {"type": "integer", "default": 4, "minimum": 1, "maximum": 4},
+        },
+        "required": ["urls"],
+    },
+)
+def browser_open_many(
+    urls: list[str],
+    session_prefix: str = "bulk",
+    wait_until: str = "domcontentloaded",
+    timeout_ms: int = 30000,
+    max_chars: int = 3000,
+    concurrency: int = 4,
+) -> str:
+    if not urls:
+        return "ERROR: urls must contain at least one URL"
+    limited_urls = urls[:_BROWSER_MAX_SESSIONS]
+    timeout_ms = _clamp(timeout_ms, 1000, 120000)
+    max_chars = _clamp(max_chars, 200, 20000)
+    concurrency = _clamp(concurrency, 1, _BROWSER_MAX_SESSIONS)
+    prefix = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in session_prefix) or "bulk"
+    call_id = uuid.uuid4().hex[:8]
+    results: list[dict[str, Any] | None] = [None] * len(limited_urls)
+
+    def open_one(index: int, url: str) -> dict[str, Any]:
+        session_id = f"{prefix}_{call_id}_{index}"
+        raw = browser_open(
+            url,
+            session_id=session_id,
+            wait_until=wait_until,
+            timeout_ms=timeout_ms,
+            max_chars=max_chars,
+        )
+        try:
+            snapshot: Any = json.loads(raw)
+        except json.JSONDecodeError:
+            snapshot = raw
+        return {
+            "index": index,
+            "session_id": session_id,
+            "url": url,
+            "ok": not raw.startswith("ERROR:"),
+            "snapshot": snapshot,
+        }
+
+    with ThreadPoolExecutor(max_workers=min(concurrency, len(limited_urls))) as pool:
+        futures = {
+            pool.submit(open_one, index, url): index
+            for index, url in enumerate(limited_urls)
+        }
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+
+    return _json({"results": results, "truncated": len(urls) > len(limited_urls)})
+
+
+@register(
     "browser_text",
     "Return the current sandbox browser page as JSON with title, URL, visible text, links, and controls.",
     {
@@ -451,7 +675,8 @@ def browser_click(
 
 @register(
     "browser_type",
-    "Fill an input/textarea/contenteditable target in a sandbox browser session, optionally pressing Enter.",
+    "Fill an input/textarea/contenteditable target in a sandbox browser session, optionally pressing Enter. "
+    "Targets can be css=..., label=..., placeholder=..., name=..., visible text, or auto-resolved.",
     {
         "type": "object",
         "properties": {
@@ -461,7 +686,11 @@ def browser_click(
             },
             "text": {"type": "string"},
             "session_id": {"type": "string", "default": "default"},
-            "by": {"type": "string", "default": "auto", "enum": ["auto", "css", "text"]},
+            "by": {
+                "type": "string",
+                "default": "auto",
+                "enum": ["auto", "css", "text", "label", "placeholder", "name"],
+            },
             "submit": {"type": "boolean", "default": False},
             "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1000, "maximum": 120000},
             "max_chars": {"type": "integer", "default": 4000, "minimum": 200, "maximum": 20000},
@@ -482,7 +711,7 @@ def browser_type(
     max_chars = _clamp(max_chars, 200, 20000)
 
     def action(page: Any) -> str:
-        locator = _resolve_locator(page, target, by=by)
+        locator = _resolve_fill_locator(page, target, by=by)
         locator.fill(text, timeout=timeout_ms)
         if submit:
             page.keyboard.press("Enter")

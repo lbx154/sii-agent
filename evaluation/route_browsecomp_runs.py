@@ -45,8 +45,9 @@ def _should_route(primary: dict, answer_max_chars: int, search_threshold: int, r
         reasons.append("refusal")
     if answer_max_chars > 0 and len(answer) > answer_max_chars:
         reasons.append(f"answer_len>{answer_max_chars}")
-    if search_threshold > 0 and int(counts.get("browsecomp_search", 0)) >= search_threshold:
-        reasons.append(f"browsecomp_search>={search_threshold}")
+    search_calls = int(counts.get("search", 0)) + int(counts.get("browsecomp_search", 0))
+    if search_threshold > 0 and search_calls >= search_threshold:
+        reasons.append(f"search>={search_threshold}")
     return bool(reasons), reasons
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import json
+import os
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,7 +26,12 @@ def _chunks(items: list[dict], size: int) -> Iterable[list[dict]]:
         yield items[start:start + size]
 
 
-def _record(ex: dict, outcome: RunOutcome, save_traces: bool = False) -> dict:
+def _record(
+    ex: dict,
+    outcome: RunOutcome,
+    save_traces: bool = False,
+    lesson_context: str | None = None,
+) -> dict:
     scores = score_answer(outcome.result.final_answer, ex["answer"])
     record = {
         "id": ex["id"],
@@ -42,11 +48,14 @@ def _record(ex: dict, outcome: RunOutcome, save_traces: bool = False) -> dict:
         "tool_call_counts": outcome.result.tool_call_counts,
         "stop_reason": outcome.result.stop_reason,
         "finish_reasons": outcome.result.finish_reasons,
+        "short_memory_stats": outcome.result.short_memory_stats,
         "elapsed": outcome.result.elapsed,
         "reflection": outcome.reflection,
     }
     if save_traces:
         record["trajectory"] = outcome.result.trajectory
+        if lesson_context:
+            record["lesson_context"] = lesson_context
     return record
 
 
@@ -72,7 +81,7 @@ def _run_one(
             allow_reflection=allow_reflection,
             use_gold_for_reflection=use_gold_for_reflection,
         )
-    return _record(ex, outcome, save_traces=save_traces)
+    return _record(ex, outcome, save_traces=save_traces, lesson_context=lesson_context)
 
 
 def _run_parallel_batch(
@@ -145,14 +154,21 @@ def run(
     allow_reflection: bool,
     use_gold_for_reflection: bool,
     save_traces: bool,
+    tool_profile: str | None = None,
+    short_memory: bool = False,
+    short_memory_max_chars: int = 2500,
 ):
     assert mode in {"baseline", "evolved"}
+    if tool_profile:
+        os.environ["SII_AGENT_TOOL_PROFILE"] = tool_profile
     cfg = HarnessConfig(
         max_steps=max_steps,
         max_wall_seconds=max_wall_seconds,
         max_llm_tokens=max_llm_tokens,
         max_llm_call_seconds=max_llm_call_seconds,
         min_llm_call_seconds=min_llm_call_seconds,
+        use_short_memory=short_memory,
+        short_memory_max_chars=short_memory_max_chars,
     )
     out = Path(out_dir) / f"{task}_{mode}_{int(time.time())}"
     out.mkdir(parents=True, exist_ok=True)
@@ -190,7 +206,12 @@ def run(
             for i, batch in enumerate(_chunks(examples, batch_size), 1):
                 assert memory is not None
                 lesson_contexts = {
-                    ex["id"]: memory.render_for_prompt(ex["question"])
+                    ex["id"]: memory.render_for_prompt(
+                        ex["question"],
+                        k=3,
+                        task=task,
+                        include_successes=(task != "2wiki"),
+                    )
                     for ex in batch
                 }
                 yield from _run_parallel_batch(
@@ -243,6 +264,9 @@ def run(
         "allow_reflection": allow_reflection if mode == "evolved" else None,
         "use_gold_for_reflection": use_gold_for_reflection if mode == "evolved" else None,
         "save_traces": save_traces,
+        "tool_profile": tool_profile or os.getenv("SII_AGENT_TOOL_PROFILE", "benchmark"),
+        "short_memory": short_memory,
+        "short_memory_max_chars": short_memory_max_chars if short_memory else None,
         "wall_seconds": time.time() - t0,
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -281,6 +305,14 @@ def main():
         help="Pass gold answers into reflection. Off by default to avoid answer leakage in memory.",
     )
     p.add_argument("--save-traces", action="store_true")
+    p.add_argument("--short-memory", action="store_true", help="Enable per-attempt compact working memory.")
+    p.add_argument("--short-memory-max-chars", type=int, default=2500)
+    p.add_argument(
+        "--tool-profile",
+        choices=["benchmark", "default", "visual", "rich", "full", "all"],
+        default=None,
+        help="Tool set exposed to the agent. 'visual' is tuned for image QA; 'all' exposes every registered tool.",
+    )
     p.add_argument(
         "--evolve-batch-size",
         type=int,
@@ -308,6 +340,9 @@ def main():
         not args.no_reflection,
         args.gold_reflection,
         args.save_traces,
+        args.tool_profile,
+        args.short_memory,
+        args.short_memory_max_chars,
     )
 
 

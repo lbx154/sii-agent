@@ -33,7 +33,7 @@ DEFAULT_CANARY = (
 BROWSECOMP_SYSTEM = """You are solving BrowseComp-Plus questions using a fixed local corpus.
 
 Rules:
-- Use `browsecomp_search` to search the fixed corpus; use `browsecomp_get_document` only for promising docids.
+- Use `search` to search the fixed corpus. It returns the top 5 documents with docid, score, and a 512-token snippet.
 - Build the answer only from retrieved corpus evidence.
 - Cite supporting document ids in square brackets, e.g. [12345].
 - When confident, call `final_answer` with a concise answer and include citations in the answer text.
@@ -205,6 +205,7 @@ def _local_record(ex: dict, outcome: RunOutcome, retrieved_docids: list[str], sa
         "tool_call_counts": outcome.result.tool_call_counts,
         "stop_reason": outcome.result.stop_reason,
         "finish_reasons": outcome.result.finish_reasons,
+        "short_memory_stats": outcome.result.short_memory_stats,
         "elapsed": outcome.result.elapsed,
         "retrieved_docids": retrieved_docids,
         "evidence_recall": recall,
@@ -268,6 +269,8 @@ def run(
     resume_dir: str | None = None,
     memory_k: int = 3,
     save_traces: bool = False,
+    short_memory: bool = False,
+    short_memory_max_chars: int = 2500,
 ) -> dict:
     assert mode in {"baseline", "evolved"}
     cfg = HarnessConfig(
@@ -276,7 +279,9 @@ def run(
         max_llm_tokens=max_llm_tokens,
         max_llm_call_seconds=max_llm_call_seconds,
         min_llm_call_seconds=min_llm_call_seconds,
-        allowed_tools=("browsecomp_search", "browsecomp_get_document", "final_answer"),
+        allowed_tools=("search", "final_answer"),
+        use_short_memory=short_memory,
+        short_memory_max_chars=short_memory_max_chars,
     )
 
     out = Path(resume_dir) if resume_dir else Path(out_dir) / f"browsecomp_{mode}_{int(time.time())}"
@@ -370,6 +375,8 @@ def run(
         "memory_mode": memory_mode if mode == "evolved" else None,
         "memory_k": memory_k if mode == "evolved" else None,
         "save_traces": save_traces,
+        "short_memory": short_memory,
+        "short_memory_max_chars": short_memory_max_chars if short_memory else None,
         "resume_dir": str(out) if resume_dir else None,
         "resumed_skipped": len(all_examples) - len(examples) if resume_dir else 0,
         "wall_seconds": time.time() - t0,
@@ -403,6 +410,8 @@ def main() -> None:
     parser.add_argument("--out", default="logs/browsecomp")
     parser.add_argument("--memory-k", type=int, default=3)
     parser.add_argument("--save-traces", action="store_true")
+    parser.add_argument("--short-memory", action="store_true", help="Enable per-attempt compact working memory.")
+    parser.add_argument("--short-memory-max-chars", type=int, default=2500)
     parser.add_argument(
         "--resume-dir",
         default=None,
@@ -429,6 +438,8 @@ def main() -> None:
         args.resume_dir,
         args.memory_k,
         args.save_traces,
+        args.short_memory,
+        args.short_memory_max_chars,
     )
 
 
