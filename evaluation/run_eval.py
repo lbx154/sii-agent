@@ -40,6 +40,7 @@ def _record(
         "question": ex["question"],
         "expected": ex["answer"],
         "predicted": outcome.result.final_answer,
+        "rationale": outcome.result.rationale,
         "correct": outcome.correct,
         "exact": scores["exact"],
         "f1": scores["f1"],

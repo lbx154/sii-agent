@@ -14,6 +14,9 @@ or "do not answer" behavior unless the user explicitly asked for that.
 
 Decide whether a short retry is useful. A retry is useful only if the answer is missing,
 is a refusal/uncertainty response, or is visibly unsupported/contradicted by retrieved evidence.
+If the final_answer tool arguments/rationale contain self-correction such as "wait", "misread",
+"maternal/paternal relation is different", or "I need to search/find", treat that as a visible
+self-contradiction and set needs_retry to true with failure_mode "self_contradictory_final".
 If the answer is concise and well supported, set needs_retry to false.
 
 Output STRICT JSON with keys:
@@ -99,7 +102,11 @@ def _summarize_traj(
                 call_bits.append(f"{fn.get('name', '?')}({fn.get('arguments', '')})")
             calls = "; ".join(call_bits) or "(no tool)"
             content = _clip(ev.get("content", ""), per_assistant_chars)
-            parts.append(f"#{i} ASSISTANT calls: {calls}\ncontent: {content}")
+            reasoning = _clip(ev.get("reasoning_content", ""), per_assistant_chars)
+            if reasoning:
+                parts.append(f"#{i} ASSISTANT calls: {calls}\nreasoning: {reasoning}\ncontent: {content}")
+            else:
+                parts.append(f"#{i} ASSISTANT calls: {calls}\ncontent: {content}")
         else:
             name = str(ev.get("name") or "?")
             args = ev.get("args")
@@ -153,6 +160,7 @@ def reflect(
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         raw = resp.choices[0].message.content or "{}"
+        finish_reason = str(getattr(resp.choices[0], "finish_reason", "") or "")
     except Exception as exc:  # noqa: BLE001
         return {
             "failure_mode": "reflection_error",
@@ -161,7 +169,17 @@ def reflect(
             "reusable_lesson": "If reflection is unavailable, vary the search/tool path instead of repeating the failed trajectory.",
         }
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            parsed["_reflection_finish_reason"] = finish_reason
+            parsed["_reflection_raw_length"] = len(raw)
+        return parsed
     except Exception:
-        return {"failure_mode": "parse_error", "root_cause": raw[:200],
-                "corrective_strategy": "", "reusable_lesson": ""}
+        return {
+            "failure_mode": "parse_error",
+            "root_cause": raw[:4000],
+            "corrective_strategy": "",
+            "reusable_lesson": "",
+            "_reflection_finish_reason": finish_reason,
+            "_reflection_raw_length": len(raw),
+        }

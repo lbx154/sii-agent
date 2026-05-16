@@ -135,6 +135,30 @@ def _dump_tool_call(tc: Any) -> dict:
     }
 
 
+def _message_reasoning(msg: Any) -> str:
+    for name in ("reasoning_content", "reasoning"):
+        value = getattr(msg, name, None)
+        if value:
+            return str(value)
+    extra = getattr(msg, "model_extra", None)
+    if isinstance(extra, dict):
+        for name in ("reasoning_content", "reasoning"):
+            value = extra.get(name)
+            if value:
+                return str(value)
+    if hasattr(msg, "model_dump"):
+        try:
+            data = msg.model_dump()
+        except Exception:  # noqa: BLE001
+            data = {}
+        if isinstance(data, dict):
+            for name in ("reasoning_content", "reasoning"):
+                value = data.get(name)
+                if value:
+                    return str(value)
+    return ""
+
+
 def _forced_final_tool_choice() -> dict:
     return {"type": "function", "function": {"name": "final_answer"}}
 
@@ -229,12 +253,16 @@ def run_react(
         effective_tool_calls = list(msg.tool_calls or []) or parsed_content_tool_calls
         dumped_tool_calls = [_dump_tool_call(tc) for tc in effective_tool_calls]
         assistant_content = "" if parsed_content_tool_calls else (msg.content or "")
+        reasoning_content = _message_reasoning(msg)
         assistant_message = {"role": "assistant", "content": assistant_content}
         if effective_tool_calls:
             assistant_message["tool_calls"] = dumped_tool_calls
         messages.append(assistant_message)
         res.steps = step + 1
-        res.trajectory.append({"role": "assistant", "content": msg.content or "", "tool_calls": dumped_tool_calls})
+        assistant_event = {"role": "assistant", "content": msg.content or "", "tool_calls": dumped_tool_calls}
+        if reasoning_content:
+            assistant_event["reasoning_content"] = reasoning_content
+        res.trajectory.append(assistant_event)
 
         if not effective_tool_calls:
             content = (msg.content or "").strip()

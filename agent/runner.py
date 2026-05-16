@@ -143,6 +143,25 @@ def _verbose_uncertain_answer(answer: str | None) -> bool:
     return len(answer) > 450 and any(phrase in lower for phrase in uncertainty)
 
 
+def _self_contradictory_rationale(rationale: str | None) -> bool:
+    if not rationale:
+        return False
+    lower = rationale.lower()
+    return any(
+        phrase in lower
+        for phrase in (
+            "wait,",
+            "wait.",
+            "i misread",
+            "misread the question",
+            "need to search",
+            "i need to find",
+            "maternal grandfather would be the father",
+            "paternal grandfather would be the father",
+        )
+    )
+
+
 def _postprocess_2wiki_answer(answer: str | None) -> str | None:
     if not answer:
         return answer
@@ -153,10 +172,18 @@ def _postprocess_2wiki_answer(answer: str | None) -> str | None:
 
     # Conservative local-scoring cleanup: keep only a substring already present
     # in the model answer; never invent a new entity.
-    text = re.sub(r"\s*\((?:now|also known as|formerly|born|died|née|aka)\b[^)]*\)\s*$", "", text, flags=re.IGNORECASE).strip()
-    text = re.sub(r"^the honourable\s+", "", text, flags=re.IGNORECASE).strip()
-    text = re.sub(r",\s*(?:Cal\.|U\.S\.|U\.S\.A\.)$", "", text).strip()
+    text = re.sub(r"\s*\((?:now|also known as|formerly|aka)\b[^)]*\)\s*$", "", text, flags=re.IGNORECASE).strip()
+    parts = [part.strip() for part in text.split(",")]
+    if len(parts) >= 2:
+        first = parts[0]
+        tail = ", ".join(parts[1:]).lower()
+        if tail == first.lower() or re.search(r"\b(prefecture|province|region midtjylland|cal\.|u\.s\.|u\.s\.a\.)\b", tail):
+            text = first
     return text.rstrip(" .;:") or answer
+
+
+def _allow_2wiki_postprocess() -> bool:
+    return os.getenv("SII_2WIKI_DISABLE_POSTPROCESS", "").strip().lower() not in {"1", "true", "yes"}
 
 
 def _needs_self_reflection(result: HarnessResult, cfg: HarnessConfig) -> bool:
@@ -165,6 +192,8 @@ def _needs_self_reflection(result: HarnessResult, cfg: HarnessConfig) -> bool:
     if _low_confidence_answer(result.final_answer):
         return True
     if _verbose_uncertain_answer(result.final_answer):
+        return True
+    if _self_contradictory_rationale(result.rationale):
         return True
     if result.steps >= max(5, int(cfg.max_steps * 0.75)):
         return True
@@ -217,6 +246,13 @@ def _choose_without_gold(
     if _verbose_uncertain_answer(first.final_answer) and len(retry.final_answer) < len(first.final_answer):
         return retry
     if reflection and reflection.get("needs_retry") is True:
+        failure_mode = str(reflection.get("failure_mode", "")).strip().lower()
+        if (
+            failure_mode == "self_contradictory_final"
+            and not _low_confidence_answer(retry.final_answer)
+            and retry.final_answer != first.final_answer
+        ):
+            return retry
         first_len = len(first.final_answer or "")
         retry_len = len(retry.final_answer or "")
         if (
@@ -246,7 +282,7 @@ def run_evolved(question: str, expected: str | None = None,
     memory = memory or MemoryStore()
     extra = lesson_context if lesson_context is not None else memory.render_for_prompt(question, task=task)
     res = run_react(question, cfg=cfg, extra_system=extra or None)
-    if task == "2wiki" and os.getenv("SII_2WIKI_ENABLE_POSTPROCESS", "").strip().lower() in {"1", "true", "yes"}:
+    if task == "2wiki" and _allow_2wiki_postprocess():
         res.final_answer = _postprocess_2wiki_answer(res.final_answer)
     reflection = None
 
@@ -288,7 +324,7 @@ def run_evolved(question: str, expected: str | None = None,
                 "Do not refuse or withhold merely because evidence is incomplete; provide the best-supported answer."
             )
             retry_res = run_react(question, cfg=_retry_config(cfg), extra_system=retry_hint)
-            if task == "2wiki" and os.getenv("SII_2WIKI_ENABLE_POSTPROCESS", "").strip().lower() in {"1", "true", "yes"}:
+            if task == "2wiki" and _allow_2wiki_postprocess():
                 retry_res.final_answer = _postprocess_2wiki_answer(retry_res.final_answer)
             res = _choose_without_gold(res, retry_res, reflection)
 
