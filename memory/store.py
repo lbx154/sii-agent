@@ -389,6 +389,13 @@ def _stable_skill_id(task: str, target: str, trigger: str, step: str) -> str:
     return f"{task}_reflection_{digest}"
 
 
+def _enabled_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes"}
+
+
 class MemoryStore:
     def __init__(self, root: str | os.PathLike = "logs/memory", read_only: bool = False):
         self.root = Path(root)
@@ -480,9 +487,9 @@ class MemoryStore:
     def retrieve_skills(self, question: str, k: int = 2, task: str | None = None) -> list[dict]:
         if task != "2wiki":
             return []
-        if os.getenv("SII_2WIKI_ENABLE_SKILLS", "").strip().lower() not in {"1", "true", "yes"}:
+        if not _enabled_env("SII_2WIKI_ENABLE_SKILLS"):
             return []
-        enable_granularity_skills = os.getenv("SII_2WIKI_ENABLE_GRANULARITY_SKILLS", "").strip().lower() in {"1", "true", "yes"}
+        enable_granularity_skills = _enabled_env("SII_2WIKI_ENABLE_GRANULARITY_SKILLS")
         q = _original_question(question)
         qtok = _tokens(q)
         qfeatures = _question_features(question)
@@ -531,8 +538,17 @@ class MemoryStore:
         qtok = _tokens(question)
         qfeatures = _question_features(question)
         scored = []
-        # Seeded 2Wiki behavior now lives in retrieved skills; lessons are only
-        # runtime reflections so task prompts do not receive duplicate policies.
+        if task == "2wiki" and not _enabled_env("SII_2WIKI_ENABLE_SKILLS"):
+            for l in _2WIKI_SEED_LESSONS:
+                tags = set(l.get("tags") or [])
+                specific_overlap = len((qfeatures - {"2wiki"}) & (tags - {"2wiki"}))
+                failure_mode = str(l.get("failure_mode", ""))
+                if failure_mode == "two_hop_context_policy":
+                    scored.append((30 + specific_overlap, 1.0, l))
+                elif failure_mode == "format_violation":
+                    scored.append((18 + specific_overlap, 1.0, l))
+                elif specific_overlap:
+                    scored.append((24 + 5 * specific_overlap, 1.0, l))
         for l in self.all_lessons():
             failure_mode = _clean_value(l.get("failure_mode")).lower()
             if task == "2wiki" and failure_mode in {"", "none", "n/a", "na", "supported_answer", "correct", "already_correct"}:
@@ -582,7 +598,7 @@ class MemoryStore:
         skill_k: int = 1,
     ) -> str:
         skills = self.retrieve_skills(question, k=skill_k, task=task) if include_skills else []
-        lesson_k = min(k, 1) if task == "2wiki" else k
+        lesson_k = min(k, 1) if task == "2wiki" and _enabled_env("SII_2WIKI_ENABLE_SKILLS") else k
         lessons = self.retrieve_lessons(question, k=lesson_k, task=task)
         successes = self.retrieve_successes(question, k=max(1, min(2, k))) if include_successes else []
         if not skills and not lessons and not successes:

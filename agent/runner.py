@@ -174,7 +174,14 @@ def _needs_self_reflection(result: HarnessResult, cfg: HarnessConfig) -> bool:
 def _allow_task_reflection(task: str | None) -> bool:
     if task != "2wiki":
         return True
-    return os.getenv("SII_2WIKI_ENABLE_REFLECTION", "").strip().lower() in {"1", "true", "yes"}
+    value = os.getenv("SII_2WIKI_ENABLE_REFLECTION")
+    if value is None:
+        return True
+    return value.strip().lower() in {"1", "true", "yes"}
+
+
+def _use_skill_updates(task: str | None) -> bool:
+    return task == "2wiki" and os.getenv("SII_2WIKI_ENABLE_SKILLS", "").strip().lower() in {"1", "true", "yes"}
 
 
 def _reflection_requests_retry(reflection: dict | None, result: HarnessResult) -> bool:
@@ -239,7 +246,7 @@ def run_evolved(question: str, expected: str | None = None,
     memory = memory or MemoryStore()
     extra = lesson_context if lesson_context is not None else memory.render_for_prompt(question, task=task)
     res = run_react(question, cfg=cfg, extra_system=extra or None)
-    if task == "2wiki":
+    if task == "2wiki" and os.getenv("SII_2WIKI_ENABLE_POSTPROCESS", "").strip().lower() in {"1", "true", "yes"}:
         res.final_answer = _postprocess_2wiki_answer(res.final_answer)
     reflection = None
 
@@ -256,7 +263,7 @@ def run_evolved(question: str, expected: str | None = None,
         )
         safe_reflection = _redact_expected_obj(reflection or {}, expected)
         if _useful_reflection(reflection):
-            if task == "2wiki" and not use_gold_for_reflection:
+            if _use_skill_updates(task) and not use_gold_for_reflection:
                 memory.add_reflection_skill(task, question, safe_reflection if isinstance(safe_reflection, dict) else None)
             else:
                 memory.add_lesson(Lesson(
@@ -281,7 +288,7 @@ def run_evolved(question: str, expected: str | None = None,
                 "Do not refuse or withhold merely because evidence is incomplete; provide the best-supported answer."
             )
             retry_res = run_react(question, cfg=_retry_config(cfg), extra_system=retry_hint)
-            if task == "2wiki":
+            if task == "2wiki" and os.getenv("SII_2WIKI_ENABLE_POSTPROCESS", "").strip().lower() in {"1", "true", "yes"}:
                 retry_res.final_answer = _postprocess_2wiki_answer(retry_res.final_answer)
             res = _choose_without_gold(res, retry_res, reflection)
 
