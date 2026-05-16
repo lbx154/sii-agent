@@ -32,6 +32,16 @@ def _redact_expected(text: str, expected: str | None) -> str:
     return re.sub(re.escape(expected.strip()), "[answer redacted]", text, flags=re.IGNORECASE)
 
 
+def _redact_expected_obj(value: object, expected: str | None) -> object:
+    if isinstance(value, dict):
+        return {str(k): _redact_expected_obj(v, expected) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_expected_obj(item, expected) for item in value]
+    if value is None or isinstance(value, bool):
+        return value
+    return _redact_expected(str(value), expected)
+
+
 def _useful_reflection(reflection: dict | None) -> bool:
     if not reflection:
         return False
@@ -200,10 +210,11 @@ def run_evolved(question: str, expected: str | None = None,
                 allow_retry: bool = True,
                 allow_reflection: bool = True,
                 lesson_context: str | None = None,
-                use_gold_for_reflection: bool = False) -> RunOutcome:
+                use_gold_for_reflection: bool = False,
+                task: str | None = None) -> RunOutcome:
     cfg = cfg or HarnessConfig()
     memory = memory or MemoryStore()
-    extra = lesson_context if lesson_context is not None else memory.render_for_prompt(question)
+    extra = lesson_context if lesson_context is not None else memory.render_for_prompt(question, task=task)
     res = run_react(question, cfg=cfg, extra_system=extra or None)
     reflection = None
 
@@ -218,22 +229,22 @@ def run_evolved(question: str, expected: str | None = None,
             correct=None,
             include_expected=use_gold_for_reflection,
         )
-        safe_reflection = {
-            key: _redact_expected("" if value is None else str(value), expected)
-            for key, value in (reflection or {}).items()
-        }
+        safe_reflection = _redact_expected_obj(reflection or {}, expected)
         if _useful_reflection(reflection):
-            memory.add_lesson(Lesson(
-                ts=memory.now(),
-                question=question,
-                failure_mode=safe_reflection.get("failure_mode", ""),
-                root_cause=safe_reflection.get("root_cause", ""),
-                corrective_strategy=safe_reflection.get("corrective_strategy", ""),
-                reusable_lesson=safe_reflection.get("reusable_lesson", ""),
-                outcome="failure",
-            ))
+            if task == "2wiki" and not use_gold_for_reflection:
+                memory.add_reflection_skill(task, question, safe_reflection if isinstance(safe_reflection, dict) else None)
+            else:
+                memory.add_lesson(Lesson(
+                    ts=memory.now(),
+                    question=question,
+                    failure_mode=str(safe_reflection.get("failure_mode", "")),
+                    root_cause=str(safe_reflection.get("root_cause", "")),
+                    corrective_strategy=str(safe_reflection.get("corrective_strategy", "")),
+                    reusable_lesson=str(safe_reflection.get("reusable_lesson", "")),
+                    outcome="failure",
+                ))
         if allow_retry and _reflection_requests_retry(reflection, res):
-            extra2 = lesson_context if lesson_context is not None else memory.render_for_prompt(question)
+            extra2 = lesson_context if lesson_context is not None else memory.render_for_prompt(question, task=task)
             retry_hint = (
                 (extra2 + "\n\n" if extra2 else "") +
                 f"[Self-review of previous attempt]\n"

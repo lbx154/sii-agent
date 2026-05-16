@@ -80,6 +80,7 @@ def _run_one(
             lesson_context=lesson_context,
             allow_reflection=allow_reflection,
             use_gold_for_reflection=use_gold_for_reflection,
+            task=ex.get("task"),
         )
     return _record(ex, outcome, save_traces=save_traces, lesson_context=lesson_context)
 

@@ -23,8 +23,17 @@ Output STRICT JSON with keys:
   "failure_mode": "...",          // e.g., "wrong_tool", "bad_query", "hallucinated_answer", "loop", "timeout"
   "root_cause": "...",            // 1-2 sentences
   "corrective_strategy": "...",   // concrete next-time action, optimized for few searches
-  "reusable_lesson": "..."        // <=200 chars, generic enough to help similar future tasks
+  "reusable_lesson": "...",       // <=200 chars, generic enough to help similar future tasks
+  "skill_update": null | {
+    "target_skill_id": "...",     // one of: 2wiki_context_first, 2wiki_answer_span, 2wiki_family_chain, 2wiki_birthplace_granularity, 2wiki_worked_at_publication, 2wiki_comparison, 2wiki_demonym_country
+    "trigger": "...",             // narrow question phrase where the update applies
+    "step": "...",                // one concrete imperative step to add for future similar cases
+    "verifier": "...",            // one check that would catch this failure without gold
+    "bad_pattern": "..."          // one answer/tool pattern to avoid
+  }
 }
+Set skill_update to null unless you can propose a narrow, procedural update to one listed skill.
+Never create a skill from hidden gold; use only visible trajectory evidence.
 No markdown, no prose outside the JSON.
 """
 
