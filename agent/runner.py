@@ -6,6 +6,7 @@ Two modes:
 """
 from __future__ import annotations
 from dataclasses import dataclass, replace
+import os
 import re
 
 from .react import run_react
@@ -142,6 +143,22 @@ def _verbose_uncertain_answer(answer: str | None) -> bool:
     return len(answer) > 450 and any(phrase in lower for phrase in uncertainty)
 
 
+def _postprocess_2wiki_answer(answer: str | None) -> str | None:
+    if not answer:
+        return answer
+    text = answer.strip()
+    text = re.sub(r"^(?:the answer is|answer:)\s*", "", text, flags=re.IGNORECASE).strip()
+    text = text.strip(" \t\r\n\"'`")
+    text = re.sub(r"\s+", " ", text)
+
+    # Conservative local-scoring cleanup: keep only a substring already present
+    # in the model answer; never invent a new entity.
+    text = re.sub(r"\s*\((?:now|also known as|formerly|born|died|née|aka)\b[^)]*\)\s*$", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^the honourable\s+", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r",\s*(?:Cal\.|U\.S\.|U\.S\.A\.)$", "", text).strip()
+    return text.rstrip(" .;:") or answer
+
+
 def _needs_self_reflection(result: HarnessResult, cfg: HarnessConfig) -> bool:
     if result.stop_reason != "final":
         return True
@@ -152,6 +169,12 @@ def _needs_self_reflection(result: HarnessResult, cfg: HarnessConfig) -> bool:
     if result.steps >= max(5, int(cfg.max_steps * 0.75)):
         return True
     return False
+
+
+def _allow_task_reflection(task: str | None) -> bool:
+    if task != "2wiki":
+        return True
+    return os.getenv("SII_2WIKI_ENABLE_REFLECTION", "").strip().lower() in {"1", "true", "yes"}
 
 
 def _reflection_requests_retry(reflection: dict | None, result: HarnessResult) -> bool:
@@ -216,9 +239,11 @@ def run_evolved(question: str, expected: str | None = None,
     memory = memory or MemoryStore()
     extra = lesson_context if lesson_context is not None else memory.render_for_prompt(question, task=task)
     res = run_react(question, cfg=cfg, extra_system=extra or None)
+    if task == "2wiki":
+        res.final_answer = _postprocess_2wiki_answer(res.final_answer)
     reflection = None
 
-    should_reflect = allow_reflection and (
+    should_reflect = allow_reflection and _allow_task_reflection(task) and (
         _needs_self_reflection(res, cfg) or use_gold_for_reflection
     )
     if should_reflect:
@@ -256,6 +281,8 @@ def run_evolved(question: str, expected: str | None = None,
                 "Do not refuse or withhold merely because evidence is incomplete; provide the best-supported answer."
             )
             retry_res = run_react(question, cfg=_retry_config(cfg), extra_system=retry_hint)
+            if task == "2wiki":
+                retry_res.final_answer = _postprocess_2wiki_answer(retry_res.final_answer)
             res = _choose_without_gold(res, retry_res, reflection)
 
     correct = _judge(res.final_answer, expected)

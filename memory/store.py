@@ -251,17 +251,18 @@ _2WIKI_SEED_SKILLS: tuple[dict, ...] = (
         "tags": ["2wiki", "country", "nationality", "demonym"],
         "triggers": ["country", "nationality", "national", "citizen", "demonym"],
         "steps": [
-            "If asked for a country, return the country name; if asked for nationality, keep the nationality/demonym wording.",
-            "Prefer the wording supported by context over a guessed alias.",
+            "Copy the country/nationality wording from the supporting context instead of converting between demonym and country name.",
+            "If context says a person is German/Dutch/French, do not rewrite it to Germany/Netherlands/France unless that exact country span is the answer evidence.",
         ],
-        "verifier": ["The answer type matches country vs nationality wording in the question."],
-        "bad_patterns": ["Converting nationality wording when the question asks to preserve it, or vice versa."],
+        "verifier": ["The final answer wording is directly supported by the relevant context span."],
+        "bad_patterns": ["Changing German to Germany or Dutch to Netherlands when the context answer uses the demonym."],
         "source": "seeded",
         "score": 1.0,
     },
 )
-_2WIKI_DEFAULT_SKILL_IDS = ("2wiki_context_first", "2wiki_answer_span")
+_2WIKI_DEFAULT_SKILL_IDS: tuple[str, ...] = ()
 _2WIKI_SEED_SKILL_IDS = {str(skill["id"]) for skill in _2WIKI_SEED_SKILLS}
+_2WIKI_GRANULARITY_SKILL_IDS = {"2wiki_birthplace_granularity", "2wiki_demonym_country"}
 
 
 def _tokens(s: str) -> set[str]:
@@ -479,6 +480,9 @@ class MemoryStore:
     def retrieve_skills(self, question: str, k: int = 2, task: str | None = None) -> list[dict]:
         if task != "2wiki":
             return []
+        if os.getenv("SII_2WIKI_ENABLE_SKILLS", "").strip().lower() not in {"1", "true", "yes"}:
+            return []
+        enable_granularity_skills = os.getenv("SII_2WIKI_ENABLE_GRANULARITY_SKILLS", "").strip().lower() in {"1", "true", "yes"}
         q = _original_question(question)
         qtok = _tokens(q)
         qfeatures = _question_features(question)
@@ -491,6 +495,8 @@ class MemoryStore:
         candidates.extend(skill for skill in self.all_skills() if skill.get("task") == task)
         for skill in candidates:
             sid = str(skill.get("id"))
+            if sid in _2WIKI_GRANULARITY_SKILL_IDS and not enable_granularity_skills:
+                continue
             tags = set(_clean_list(skill.get("tags")))
             tag_overlap = len((qfeatures - {"2wiki"}) & (tags - {"2wiki"}))
             phrase_overlap = _phrase_hits(q, skill.get("triggers"))
@@ -573,7 +579,7 @@ class MemoryStore:
         include_successes: bool = True,
         task: str | None = None,
         include_skills: bool = True,
-        skill_k: int = 2,
+        skill_k: int = 1,
     ) -> str:
         skills = self.retrieve_skills(question, k=skill_k, task=task) if include_skills else []
         lesson_k = min(k, 1) if task == "2wiki" else k
