@@ -32,6 +32,54 @@ python -m evaluation.run_browsecomp --mode evolved --n 20 --concurrency 32
 
 切换只需改 `.env` 的 `LLM_BACKEND`。
 
+## 本地 Qwen3.5-9B SGLang
+赛题环境只允许 SGLang 时，使用 OpenAI-compatible `/v1` 接口：
+
+```bash
+python -m venv --system-site-packages /root/sglang-venv
+/root/sglang-venv/bin/python -m pip install -U pip setuptools wheel
+/root/sglang-venv/bin/python -m pip install 'sglang[all]==0.5.11'
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+SGLANG_PYTHON=/root/sglang-venv/bin/python \
+SGLANG_MODEL=/root/sii-agent/Qwen3.5-9B \
+SGLANG_PORT=8004 \
+SGLANG_SERVED_MODEL_NAME=Qwen3.5-9B \
+bash scripts/start_qwen_sglang.sh
+
+export LLM_BACKEND=vllm
+export VLLM_BASE_URL=http://127.0.0.1:8004/v1
+export VLLM_MODEL=Qwen3.5-9B
+export VLLM_ENABLE_THINKING=0
+```
+
+注意：SGLang 的 Qwen3.5 thinking 输出需要显式关闭，否则短 `max_tokens` 下可能只返回 `reasoning_content`。`start_qwen_sglang.sh` 默认用 `--mm-attention-backend sdpa` 避开本机 `flash_attn` ABI 不兼容问题。
+
+### SGLang + OPD LoRA
+完整 v13 LoRA 包含 SGLang 0.5.11 当前不支持的 Qwen3.5 linear-attention target（`in_proj_a/b/qkv/z`、`out_proj`），直接加载会失败。可先生成只保留 SGLang 支持模块的 adapter 做运行时实验：
+
+```bash
+/root/sglang-venv/bin/python scripts/create_sglang_supported_lora.py \
+  --src saves/qwen35-9b/lora/v13_step_final_opd_32k_rank8_beta03_lr2e6_epoch2_sigmoid \
+  --dst saves/qwen35-9b/lora/v13_step_final_opd_32k_sglang_supported \
+  --base-model /root/sii-agent/Qwen3.5-9B
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+SGLANG_PYTHON=/root/sglang-venv/bin/python \
+SGLANG_MODEL=/root/sii-agent/Qwen3.5-9B \
+SGLANG_PORT=8004 \
+SGLANG_SERVED_MODEL_NAME=sii-opd-v13-sglang \
+SGLANG_LORA_NAME=sii-opd-v13-sglang \
+SGLANG_LORA_PATH=/root/sii-agent/saves/qwen35-9b/lora/v13_step_final_opd_32k_sglang_supported \
+bash scripts/start_qwen_sglang.sh
+
+export VLLM_BASE_URL=http://127.0.0.1:8004/v1
+export VLLM_MODEL=sii-opd-v13-sglang
+export VLLM_ENABLE_THINKING=0
+```
+
+这个 pruned adapter 不是完整 v13 LoRA 等价物；若赛题要求完整 LoRA 效果，需要后续尝试离线 merge 成完整 HF 权重或等待/修改 SGLang 对 Qwen3.5 linear-attention LoRA target 的支持。
+
 ## 本地 Qwen3.5-9B vLLM
 ```bash
 bash scripts/start_qwen_vllm.sh

@@ -263,6 +263,69 @@ _2WIKI_SEED_SKILLS: tuple[dict, ...] = (
 _2WIKI_DEFAULT_SKILL_IDS: tuple[str, ...] = ()
 _2WIKI_SEED_SKILL_IDS = {str(skill["id"]) for skill in _2WIKI_SEED_SKILLS}
 _2WIKI_GRANULARITY_SKILL_IDS = {"2wiki_birthplace_granularity", "2wiki_demonym_country"}
+_2WIKI_POLICY_CARDS: tuple[dict, ...] = (
+    {
+        "id": "2wiki_policy_context_first",
+        "title": "Context-first evidence",
+        "tags": ["2wiki", "context", "bridge", "search"],
+        "triggers": ["context", "provided context", "two-hop"],
+        "rules": [
+            "Resolve the two-hop chain from Provided context first.",
+            "Use search only to fill a missing fact; never let current/external snippets replace a clear context entity or relation.",
+            "Never submit unknown/not-specified; if the requested attribute is absent, do one focused lookup for the fixed entity and attribute.",
+        ],
+    },
+    {
+        "id": "2wiki_policy_keep_hop_anchor",
+        "title": "Keep hop entity fixed",
+        "tags": ["2wiki", "bridge", "director", "performer", "film", "song"],
+        "triggers": ["director", "performer", "film", "song", "author", "composer", "presenter"],
+        "rules": [
+            "After identifying the intermediate entity, keep that exact entity fixed.",
+            "Any search query must include the intermediate entity plus the requested attribute.",
+        ],
+    },
+    {
+        "id": "2wiki_policy_work_at_context_role",
+        "title": "Work-at means context-supported role",
+        "tags": ["2wiki", "work", "publication", "organization", "magazine", "newspaper"],
+        "triggers": ["work at", "worked at", "works at", "wrote for", "editor of", "publication", "magazine", "newspaper"],
+        "rules": [
+            "For works/worked/wrote/edited questions, extract the employer, publication, or organization from context career sentences.",
+            "Do not answer with a current web job unless context lacks the role and the question explicitly asks current work.",
+        ],
+    },
+    {
+        "id": "2wiki_policy_historical_granularity",
+        "title": "Historical country/nationality wording",
+        "tags": ["2wiki", "country", "nationality", "historical", "kingdom", "empire"],
+        "triggers": ["country", "nationality", "kingdom", "empire", "from"],
+        "rules": [
+            "For historical figures, preserve context wording such as empire, kingdom, polity, or demonym.",
+            "Do not modernize Byzantine/Ostrogothic Kingdom/German-style spans unless the evidence uses the modern country name.",
+        ],
+    },
+    {
+        "id": "2wiki_policy_family_chain",
+        "title": "Family-chain verification",
+        "tags": ["2wiki", "family", "father", "mother", "husband", "wife", "grandfather", "grandmother"],
+        "triggers": ["father", "mother", "husband", "wife", "grandfather", "grandmother", "paternal", "maternal", "in-law"],
+        "rules": [
+            "Name hop 1 before answering hop 2.",
+            "Do not swap spouse, parent, child, or grandparent roles.",
+        ],
+    },
+    {
+        "id": "2wiki_policy_comparison_yesno",
+        "title": "Comparison and yes/no",
+        "tags": ["2wiki", "comparison", "yesno"],
+        "triggers": ["same", "different", "older", "younger", "earlier", "first", "both", "are both", "were both"],
+        "rules": [
+            "Extract one comparable value for each candidate before comparing.",
+            "For same-country/same-nationality questions, answer only yes or no.",
+        ],
+    },
+)
 
 
 def _tokens(s: str) -> set[str]:
@@ -377,6 +440,36 @@ def _phrase_hits(question: str, triggers: object) -> int:
         else:
             hits += int(re.search(rf"\b{re.escape(trig)}\b", q) is not None)
     return hits
+
+
+def _render_2wiki_policy_cards(question: str, max_cards: int = 5) -> str:
+    q = _original_question(question)
+    qfeatures = _question_features(question)
+    always_ids = {"2wiki_policy_context_first", "2wiki_policy_keep_hop_anchor"}
+    selected = [card for card in _2WIKI_POLICY_CARDS if card["id"] in always_ids]
+    selected_ids = {card["id"] for card in selected}
+    scored: list[tuple[int, dict]] = []
+    for card in _2WIKI_POLICY_CARDS:
+        if card["id"] in selected_ids:
+            continue
+        tags = set(card.get("tags") or [])
+        score = 8 * _phrase_hits(q, card.get("triggers")) + 5 * len((qfeatures - {"2wiki"}) & (tags - {"2wiki"}))
+        if score > 0:
+            scored.append((score, card))
+    scored.sort(key=lambda item: (-item[0], str(item[1]["id"])))
+    for _, card in scored:
+        selected.append(card)
+        selected_ids.add(card["id"])
+        if len(selected) >= max_cards:
+            break
+    lines = []
+    for card in selected:
+        rules = " ".join(str(rule).strip() for rule in card.get("rules", []) if str(rule).strip())
+        if rules:
+            lines.append(f"- [{card['id']}] {card['title']}: {rules}")
+    if not lines:
+        return ""
+    return "2Wiki typed policies (highest priority; apply when relevant):\n" + "\n".join(lines)
 
 
 def _has_bad_skill_phrase(*values: object) -> bool:
@@ -538,7 +631,11 @@ class MemoryStore:
         qtok = _tokens(question)
         qfeatures = _question_features(question)
         scored = []
-        if task == "2wiki" and not _enabled_env("SII_2WIKI_ENABLE_SKILLS"):
+        if (
+            task == "2wiki"
+            and not _enabled_env("SII_2WIKI_ENABLE_SKILLS")
+            and _enabled_env("SII_2WIKI_ENABLE_LESSONS")
+        ):
             for l in _2WIKI_SEED_LESSONS:
                 tags = set(l.get("tags") or [])
                 specific_overlap = len((qfeatures - {"2wiki"}) & (tags - {"2wiki"}))
@@ -550,6 +647,8 @@ class MemoryStore:
                 elif specific_overlap:
                     scored.append((24 + 5 * specific_overlap, 1.0, l))
         for l in self.all_lessons():
+            if task == "2wiki" and not _enabled_env("SII_2WIKI_ENABLE_LESSONS"):
+                break
             failure_mode = _clean_value(l.get("failure_mode")).lower()
             if task == "2wiki" and failure_mode in {"", "none", "n/a", "na", "supported_answer", "correct", "already_correct"}:
                 continue
@@ -602,8 +701,13 @@ class MemoryStore:
         lessons = self.retrieve_lessons(question, k=lesson_k, task=task)
         successes = self.retrieve_successes(question, k=max(1, min(2, k))) if include_successes else []
         if not skills and not lessons and not successes:
-            return ""
+            if task != "2wiki":
+                return ""
         sections: list[str] = []
+        if task == "2wiki" and _enabled_env("SII_2WIKI_ENABLE_TYPED_POLICIES"):
+            policy_block = _render_2wiki_policy_cards(question)
+            if policy_block:
+                sections.append(policy_block)
         if skills:
             bullets = []
             for skill in skills:

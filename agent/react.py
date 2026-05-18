@@ -97,24 +97,89 @@ def _safe_json(s: str) -> dict | None:
         return None
 
 
+def _coerce_parameter_value(value: str) -> Any:
+    text = value.strip()
+    if not text:
+        return ""
+    parsed = _safe_json(text)
+    if parsed is not None:
+        return parsed
+    if re.fullmatch(r"-?\d+", text):
+        try:
+            return int(text)
+        except ValueError:
+            return text
+    if re.fullmatch(r"-?\d+\.\d+", text):
+        try:
+            return float(text)
+        except ValueError:
+            return text
+    if text.lower() in {"true", "false"}:
+        return text.lower() == "true"
+    return text
+
+
+def _payload_to_tool_call(payload: Any, call_id: str) -> Any | None:
+    if not isinstance(payload, dict):
+        return None
+    function = payload.get("function") if isinstance(payload.get("function"), dict) else {}
+    name = str(payload.get("name") or function.get("name") or "").strip()
+    arguments = payload.get("arguments")
+    if arguments is None:
+        arguments = payload.get("parameters")
+    if arguments is None:
+        arguments = function.get("arguments")
+    if not name or arguments is None:
+        return None
+    if isinstance(arguments, str):
+        arguments_text = arguments
+    else:
+        arguments_text = json.dumps(arguments, ensure_ascii=False)
+    return SimpleNamespace(
+        id=call_id,
+        function=SimpleNamespace(name=name, arguments=arguments_text),
+        type="function",
+        _synthetic=True,
+    )
+
+
 def _parse_content_tool_calls(content: str) -> list[Any]:
     calls: list[Any] = []
+    seen_spans: list[tuple[int, int]] = []
+    parsed_content = _safe_json((content or "").strip())
+    if isinstance(parsed_content, dict):
+        parsed_items = parsed_content.get("tool_calls") if isinstance(parsed_content.get("tool_calls"), list) else [parsed_content]
+    elif isinstance(parsed_content, list):
+        parsed_items = parsed_content
+    else:
+        parsed_items = []
+    for payload in parsed_items:
+        call = _payload_to_tool_call(payload, f"content-tool-call-{len(calls)}")
+        if call is not None:
+            calls.append(call)
     for i, match in enumerate(re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", content, re.DOTALL)):
         payload = _safe_json(match.group(1))
-        if not payload:
+        call = _payload_to_tool_call(payload, f"content-tool-call-{len(calls)}")
+        if call is None:
             continue
-        name = str(payload.get("name") or payload.get("function", {}).get("name") or "").strip()
-        arguments = payload.get("arguments")
-        if not name or arguments is None:
+        calls.append(call)
+        seen_spans.append(match.span())
+    qwen_pattern = re.compile(
+        r"<tool_call>\s*<function=([A-Za-z_][A-Za-z0-9_-]*)>\s*(.*?)</function>\s*</tool_call>",
+        re.DOTALL,
+    )
+    for match in qwen_pattern.finditer(content or ""):
+        if any(start <= match.start() < end for start, end in seen_spans):
             continue
-        if isinstance(arguments, str):
-            arguments_text = arguments
-        else:
-            arguments_text = json.dumps(arguments, ensure_ascii=False)
+        name = match.group(1).strip()
+        body = match.group(2)
+        args: dict[str, Any] = {}
+        for param in re.finditer(r"<parameter=([A-Za-z_][A-Za-z0-9_-]*)>\s*(.*?)\s*</parameter>", body, re.DOTALL):
+            args[param.group(1).strip()] = _coerce_parameter_value(param.group(2))
         calls.append(
             SimpleNamespace(
-                id=f"content-tool-call-{i}",
-                function=SimpleNamespace(name=name, arguments=arguments_text),
+                id=f"content-tool-call-{len(calls)}",
+                function=SimpleNamespace(name=name, arguments=json.dumps(args, ensure_ascii=False)),
                 type="function",
                 _synthetic=True,
             )

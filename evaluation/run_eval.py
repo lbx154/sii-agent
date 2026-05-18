@@ -21,6 +21,36 @@ from .datasets import DEFAULT_SPLITS, LOADERS, load_examples
 console = Console()
 
 
+def _attempt_summary(result) -> dict | None:
+    if result is None:
+        return None
+    return {
+        "final_answer": result.final_answer,
+        "rationale": result.rationale,
+        "steps": result.steps,
+        "tool_calls": result.tool_calls,
+        "tool_call_counts": result.tool_call_counts,
+        "stop_reason": result.stop_reason,
+        "finish_reasons": result.finish_reasons,
+        "elapsed": result.elapsed,
+    }
+
+
+def _memory_context_refs(context: str | None) -> list[str]:
+    if not context:
+        return []
+    refs = set()
+    import re
+
+    for match in re.finditer(r"\[([A-Za-z0-9_:-]+)\]", context):
+        refs.add(match.group(1))
+    for match in re.finditer(r"\(past\s+([^:()]+):\s*([^()]+)\)", context):
+        outcome = match.group(1).strip().replace(" ", "_")
+        mode = match.group(2).strip().replace(" ", "_")
+        refs.add(f"lesson:{outcome}:{mode}")
+    return sorted(refs)
+
+
 def _chunks(items: list[dict], size: int) -> Iterable[list[dict]]:
     for start in range(0, len(items), size):
         yield items[start:start + size]
@@ -52,11 +82,21 @@ def _record(
         "short_memory_stats": outcome.result.short_memory_stats,
         "elapsed": outcome.result.elapsed,
         "reflection": outcome.reflection,
+        "final_refinement": outcome.final_refinement,
     }
+    if outcome.first_result is not None:
+        record["first_attempt"] = _attempt_summary(outcome.first_result)
+        if outcome.retry_result is not None:
+            record["retry_attempt"] = _attempt_summary(outcome.retry_result)
+        record["selected_attempt"] = outcome.selected_attempt
+        record["retry_selected"] = outcome.retry_selected
+        record["retry_reason"] = outcome.retry_reason
+        record["reflection_useful"] = outcome.reflection_useful
     if save_traces:
         record["trajectory"] = outcome.result.trajectory
         if lesson_context:
             record["lesson_context"] = lesson_context
+            record["memory_context_refs"] = _memory_context_refs(lesson_context)
     return record
 
 
@@ -71,7 +111,7 @@ def _run_one(
     save_traces: bool = False,
 ) -> dict:
     if mode == "baseline":
-        outcome = run_baseline(ex["question"], expected=ex["answer"], cfg=cfg)
+        outcome = run_baseline(ex["question"], expected=ex["answer"], cfg=cfg, task=ex.get("task"))
     else:
         outcome = run_evolved(
             ex["question"],

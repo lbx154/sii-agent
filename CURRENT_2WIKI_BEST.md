@@ -25,7 +25,37 @@ Latest restored-mechanism reproduction after the skill experiment:
 
 Conclusion: evolved can beat baseline, but the gain is still small and unstable. The useful part is the legacy reflection-to-lesson loop, not the current skill prompt injection.
 
-## Required configuration for reflection experience to actually be used
+## Current default after trace/evolution diagnosis
+
+The latest diagnosis found one implementation issue and one mechanism issue:
+
+- Qwen-style textual tool calls (`<function=...><parameter=...>`) were not parsed, so some apparent searches in traces were not executed. This is now fixed in `agent/react.py`.
+- 2Wiki reflection/lesson injection and the experimental typed policy cards are not consistently positive under Qwen3-32B semantic judging. They are now opt-in for ablation rather than default behavior.
+
+Safe default:
+
+```bash
+unset SII_2WIKI_ENABLE_REFLECTION
+unset SII_2WIKI_ENABLE_LESSONS
+unset SII_2WIKI_ENABLE_SKILLS
+unset SII_2WIKI_ENABLE_TYPED_POLICIES
+```
+
+Opt-in ablations:
+
+```bash
+# Legacy lesson/reflection path.
+export SII_2WIKI_ENABLE_REFLECTION=1
+export SII_2WIKI_ENABLE_LESSONS=1
+
+# Experimental typed policies.
+export SII_2WIKI_ENABLE_TYPED_POLICIES=1
+
+# Experimental skill path.
+export SII_2WIKI_ENABLE_SKILLS=1
+```
+
+## Required configuration for legacy reflection experience ablation
 
 Use evolved mode with the legacy lesson mechanism enabled:
 
@@ -40,16 +70,18 @@ export VLLM_ENABLE_THINKING=1
 export SEARCH_BACKENDS=ddg,wiki
 export WIKI25_INDEX_PATH=data/wiki25/wiki25_fts.sqlite
 
+export SII_2WIKI_ENABLE_REFLECTION=1
+export SII_2WIKI_ENABLE_LESSONS=1
 unset SII_2WIKI_ENABLE_SKILLS
-unset SII_2WIKI_ENABLE_POSTPROCESS
-unset SII_2WIKI_ENABLE_REFLECTION
+unset SII_2WIKI_ENABLE_TYPED_POLICIES
 ```
 
 Important behavior:
 
-- `SII_2WIKI_ENABLE_REFLECTION` unset or `1` enables reflection.
+- `SII_2WIKI_ENABLE_REFLECTION=1` enables 2Wiki reflection; it is disabled by default after the latest diagnosis.
+- `SII_2WIKI_ENABLE_LESSONS=1` enables seeded and dynamic lesson injection for 2Wiki; it is disabled by default after the latest diagnosis.
 - `SII_2WIKI_ENABLE_SKILLS` must stay unset for best current performance. If set to `1`, reflection writes dynamic skills instead of legacy lessons, and the tested skill prompt path currently underperforms.
-- `SII_2WIKI_ENABLE_POSTPROCESS` should stay unset unless explicitly testing conservative answer cleanup.
+- `SII_2WIKI_ENABLE_TYPED_POLICIES=1` enables experimental typed policy cards; latest 500-run was judge-neutral but not positive.
 - In evolved mode, reflection writes reusable items to `memory/lessons.jsonl`; later batches retrieve those lessons through `memory.render_for_prompt(..., task="2wiki")`.
 - For 2Wiki, success memories are disabled by default; only seeded lessons plus useful failure reflections are injected.
 
@@ -77,3 +109,4 @@ python -m evaluation.run_eval \
 - The skill mechanism is implemented but should be treated as experimental/opt-in for now.
 - Reflection itself is noisy; it helps only when its filtered reusable lessons are passed to later batches.
 - High token limits reduce truncation noise. The best historical run used `--max-llm-tokens 12000` and `--max-llm-call-seconds 600`.
+- Trace attribution now records first/retry attempts and retry selection fields, so future runs can measure whether reflection/retry caused each win or loss.
