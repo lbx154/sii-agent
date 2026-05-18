@@ -17,7 +17,7 @@ from tools import dispatch, tool_specs
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ALLOWED_TOOLS = ("wiki_search", "web_search", "browse", "browse_many", "final_answer")
+DEFAULT_ALLOWED_TOOLS = ("wiki_search", "web_search", "browser_open", "browser_open_many", "final_answer")
 BROWSECOMP_ALLOWED_TOOLS = ("search", "final_answer")
 
 SYSTEM_PROMPT = """You are a careful research agent.
@@ -32,7 +32,7 @@ Available tools for this run:
 
 Rules:
 - Prefer wiki_search for encyclopedic questions and web_search when wiki_search is insufficient.
-- Use browse for one source URL and browse_many for several independent source URLs.
+- Use browser_open for one source URL and browser_open_many for several independent source URLs.
 - Do not repeat the same tool arguments; refine the query instead.
 - Keep final_answer concise. Submit final_answer before the step budget is exhausted.
 """

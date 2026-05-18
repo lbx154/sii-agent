@@ -67,7 +67,9 @@ export VLLM_BASE_URL=http://127.0.0.1:8002/v1
 export VLLM_MODEL=sii-opd-v13
 export VLLM_API_KEY=EMPTY
 export VLLM_ENABLE_THINKING=1
-export SEARCH_BACKENDS=ddg,wiki
+export SEARCH_PROXY_URL=http://127.0.0.1:1227
+export SEARCH_PROXY_FETCH=0
+export SEARCH_PROXY_MAX_CHARS=0
 export WIKI25_INDEX_PATH=data/wiki25/wiki25_fts.sqlite
 
 export SII_2WIKI_ENABLE_REFLECTION=1

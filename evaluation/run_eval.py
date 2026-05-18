@@ -15,10 +15,17 @@ from rich.progress import track
 from agent.runner import RunOutcome, run_baseline, run_evolved
 from agent.scoring import score_answer
 from harness.controller import HarnessConfig
+from memory.maintenance import maintain_memory
 from memory.store import MemoryStore
 from .datasets import DEFAULT_SPLITS, LOADERS, load_examples
 
 console = Console()
+DEFAULT_GLOBAL_MEMORY_ROOT = "logs/memory"
+
+
+def _normalize_runtime_mode(runtime_mode: str | None) -> str:
+    mode = str(runtime_mode or "train").strip().lower()
+    return mode if mode in {"train", "test"} else "train"
 
 
 def _attempt_summary(result) -> dict | None:
@@ -83,6 +90,9 @@ def _record(
         "elapsed": outcome.result.elapsed,
         "reflection": outcome.reflection,
         "final_refinement": outcome.final_refinement,
+        "gold_verification": outcome.gold_verification,
+        "verified_reflection_memory": outcome.verified_reflection_memory,
+        "internal_verify_results": outcome.result.internal_verify_results,
     }
     if outcome.first_result is not None:
         record["first_attempt"] = _attempt_summary(outcome.first_result)
@@ -171,9 +181,10 @@ def _prepare_memory(
     if mode != "evolved":
         return None
 
-    root = Path(memory_root) if memory_root else out / "memory"
+    root = Path(memory_root or os.getenv("SII_AGENT_MEMORY_ROOT", DEFAULT_GLOBAL_MEMORY_ROOT))
     if memory_mode == "fresh" and root.exists():
         shutil.rmtree(root)
+    os.environ["SII_AGENT_MEMORY_ROOT"] = str(root)
     return MemoryStore(root=root, read_only=(memory_mode == "read_only"))
 
 
@@ -199,10 +210,30 @@ def run(
     tool_profile: str | None = None,
     short_memory: bool = False,
     short_memory_max_chars: int = 2500,
+    self_retrieval_memory: bool = False,
+    runtime_mode: str = "train",
+    shuffle: bool = False,
+    seed: int = 0,
+    memory_maintenance_interval: int = 0,
+    memory_maintenance_llm: bool = False,
+    memory_maintenance_batch_size: int = 30,
 ):
     assert mode in {"baseline", "evolved"}
+    runtime_mode = _normalize_runtime_mode(runtime_mode)
+    os.environ["SII_AGENT_RUNTIME_MODE"] = runtime_mode
+    requested_memory_mode = memory_mode
+    effective_memory_mode = "read_only" if runtime_mode == "test" else memory_mode
+    requested_gold_reflection = use_gold_for_reflection
+    if runtime_mode == "test":
+        use_gold_for_reflection = False
     if tool_profile:
         os.environ["SII_AGENT_TOOL_PROFILE"] = tool_profile
+    elif self_retrieval_memory:
+        os.environ["SII_AGENT_TOOL_PROFILE"] = "self_retrieval"
+    if memory_root:
+        os.environ["SII_AGENT_MEMORY_ROOT"] = str(Path(memory_root))
+    else:
+        os.environ.setdefault("SII_AGENT_MEMORY_ROOT", DEFAULT_GLOBAL_MEMORY_ROOT)
     cfg = HarnessConfig(
         max_steps=max_steps,
         max_wall_seconds=max_wall_seconds,
@@ -216,7 +247,12 @@ def run(
     out.mkdir(parents=True, exist_ok=True)
     f_jsonl = (out / "runs.jsonl").open("w", encoding="utf-8")
 
-    memory = _prepare_memory(mode, out, memory_root, memory_mode)
+    memory = _prepare_memory(mode, out, memory_root, effective_memory_mode)
+    if self_retrieval_memory:
+        root = Path(memory.root) if memory else Path(os.getenv("SII_AGENT_MEMORY_ROOT", DEFAULT_GLOBAL_MEMORY_ROOT))
+        if runtime_mode == "train":
+            root.mkdir(parents=True, exist_ok=True)
+        os.environ["SII_AGENT_MEMORY_ROOT"] = str(root)
     n_correct = 0
     n_total = 0
     sum_steps = sum_tools = 0
@@ -224,8 +260,9 @@ def run(
     sum_f1 = 0.0
     n_f1 = 0
     split = split or DEFAULT_SPLITS[task]
-    examples = load_examples(task, n, offset, split=split)
+    examples = load_examples(task, n, offset, split=split, shuffle=shuffle, seed=seed)
     t0 = time.time()
+    maintenance_reports: list[dict] = []
 
     if mode == "baseline":
         result_iter = _run_parallel_batch(
@@ -245,18 +282,24 @@ def run(
 
         def evolved_records() -> Iterable[dict]:
             total_batches = (len(examples) + batch_size - 1) // batch_size
+            processed = 0
+            next_maintenance = max(1, memory_maintenance_interval) if memory_maintenance_interval > 0 else None
             for i, batch in enumerate(_chunks(examples, batch_size), 1):
                 assert memory is not None
                 lesson_contexts = {
-                    ex["id"]: memory.render_for_prompt(
-                        ex["question"],
-                        k=3,
-                        task=task,
-                        include_successes=(task != "2wiki"),
+                    ex["id"]: (
+                        ""
+                        if self_retrieval_memory
+                        else memory.render_for_prompt(
+                            ex["question"],
+                            k=3,
+                            task=task,
+                            include_successes=(task != "2wiki"),
+                        )
                     )
                     for ex in batch
                 }
-                yield from _run_parallel_batch(
+                batch_records = list(_run_parallel_batch(
                     batch,
                     mode,
                     cfg,
@@ -268,7 +311,30 @@ def run(
                     use_gold_for_reflection=use_gold_for_reflection,
                     save_traces=save_traces,
                     batch_index=i,
-                )
+                ))
+                for record in batch_records:
+                    yield record
+                processed += len(batch_records)
+                while (
+                    next_maintenance is not None
+                    and processed >= next_maintenance
+                    and runtime_mode == "train"
+                    and effective_memory_mode == "read_write"
+                ):
+                    report = maintain_memory(
+                        memory.root,
+                        report_path=out / "memory_maintenance.jsonl",
+                        trigger={
+                            "processed": processed,
+                            "target_interval": memory_maintenance_interval,
+                            "target_count": next_maintenance,
+                            "batch_index": i,
+                        },
+                        llm_review=memory_maintenance_llm,
+                        llm_batch_size=memory_maintenance_batch_size,
+                    )
+                    maintenance_reports.append(report)
+                    next_maintenance += memory_maintenance_interval
 
         result_iter = evolved_records()
 
@@ -290,6 +356,8 @@ def run(
     summary = {
         "task": task, "split": split, "mode": mode, "n": n_total,
         "offset": offset,
+        "shuffle": shuffle,
+        "seed": seed if shuffle else None,
         "accuracy": n_correct / n_total if n_total else 0.0,
         "exact_match": exact_correct / n_total if n_total else 0.0,
         "avg_f1": sum_f1 / n_f1 if n_f1 else 0.0,
@@ -302,13 +370,23 @@ def run(
         "max_llm_call_seconds": max_llm_call_seconds,
         "min_llm_call_seconds": min_llm_call_seconds,
         "memory_root": str(memory.root) if memory else None,
-        "memory_mode": memory_mode if mode == "evolved" else None,
+        "runtime_mode": runtime_mode,
+        "memory_mode": effective_memory_mode if mode == "evolved" else None,
+        "requested_memory_mode": requested_memory_mode if mode == "evolved" else None,
         "allow_reflection": allow_reflection if mode == "evolved" else None,
         "use_gold_for_reflection": use_gold_for_reflection if mode == "evolved" else None,
+        "requested_use_gold_for_reflection": requested_gold_reflection if mode == "evolved" else None,
         "save_traces": save_traces,
         "tool_profile": tool_profile or os.getenv("SII_AGENT_TOOL_PROFILE", "benchmark"),
         "short_memory": short_memory,
         "short_memory_max_chars": short_memory_max_chars if short_memory else None,
+        "self_retrieval_memory": self_retrieval_memory,
+        "memory_maintenance_interval": memory_maintenance_interval if mode == "evolved" else None,
+        "memory_maintenance_llm": memory_maintenance_llm if mode == "evolved" else None,
+        "memory_maintenance_batch_size": memory_maintenance_batch_size if memory_maintenance_llm else None,
+        "memory_maintenance_runs": len(maintenance_reports),
+        "last_memory_maintenance": maintenance_reports[-1] if maintenance_reports else None,
+        "agent_memory_root": os.getenv("SII_AGENT_MEMORY_ROOT"),
         "wall_seconds": time.time() - t0,
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -321,24 +399,36 @@ def main():
     p.add_argument("--task", choices=list(LOADERS), required=True)
     p.add_argument("--mode", choices=["baseline", "evolved"], required=True)
     p.add_argument(
+        "--runtime-mode",
+        choices=["train", "test"],
+        default="test" if os.getenv("SII_AGENT_RUNTIME_MODE", "").strip().lower() == "test" else "train",
+        help="train writes global memory/reflections; test freezes memory read-only and disables gold reflection.",
+    )
+    p.add_argument(
         "--split",
         default=None,
         help="Dataset split. Defaults to test for SimpleQA and validation for 2Wiki. 2Wiki also supports train/test; SimpleQA has no public train split.",
     )
     p.add_argument("--n", type=int, default=20)
     p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--shuffle", action="store_true", help="Shuffle examples before applying --offset/--n.")
+    p.add_argument("--seed", type=int, default=0, help="Seed used with --shuffle.")
     p.add_argument("--max-steps", type=int, default=8)
     p.add_argument("--max-wall-seconds", type=float, default=120.0)
     p.add_argument("--max-llm-tokens", type=int, default=1536)
     p.add_argument("--max-llm-call-seconds", type=float, default=60.0)
     p.add_argument("--min-llm-call-seconds", type=float, default=20.0)
     p.add_argument("--concurrency", type=int, default=40)
-    p.add_argument("--memory-root", default=None)
+    p.add_argument(
+        "--memory-root",
+        default=None,
+        help="Global memory folder. Defaults to SII_AGENT_MEMORY_ROOT or logs/memory; evolved runs append here by default.",
+    )
     p.add_argument(
         "--memory-mode",
         choices=["fresh", "read_write", "read_only"],
-        default="fresh",
-        help="Evolved mode only. fresh clears the memory root before running; read_write reuses and appends; read_only reuses without writing.",
+        default="read_write",
+        help="Evolved mode only. read_write reuses/appends global memory by default; fresh explicitly clears it; read_only reuses without writing.",
     )
     p.add_argument("--no-reflection", action="store_true")
     p.add_argument(
@@ -351,7 +441,7 @@ def main():
     p.add_argument("--short-memory-max-chars", type=int, default=2500)
     p.add_argument(
         "--tool-profile",
-        choices=["benchmark", "default", "visual", "rich", "full", "all"],
+        choices=["benchmark", "default", "visual", "rich", "full", "memory", "self_retrieval", "all"],
         default=None,
         help="Tool set exposed to the agent. 'visual' is tuned for image QA; 'all' exposes every registered tool.",
     )
@@ -362,6 +452,28 @@ def main():
         help="Evolved mode only: freeze memory per batch, then make new lessons visible to the next batch. Defaults to --concurrency.",
     )
     p.add_argument("--out", default="logs/eval")
+    p.add_argument(
+        "--self-retrieval-memory",
+        action="store_true",
+        help="Expose memory_search/memory_stats and stop pre-injecting lessons; the agent must retrieve memory itself.",
+    )
+    p.add_argument(
+        "--memory-maintenance-interval",
+        type=int,
+        default=0,
+        help="Evolved train mode only: full-scan memory cleanup every N completed examples. 0 disables it.",
+    )
+    p.add_argument(
+        "--memory-maintenance-llm",
+        action="store_true",
+        help="Use the configured LLM to review every memory record during maintenance.",
+    )
+    p.add_argument(
+        "--memory-maintenance-batch-size",
+        type=int,
+        default=30,
+        help="Records per LLM maintenance review batch.",
+    )
     args = p.parse_args()
     run(
         args.task,
@@ -385,6 +497,13 @@ def main():
         args.tool_profile,
         args.short_memory,
         args.short_memory_max_chars,
+        args.self_retrieval_memory,
+        args.runtime_mode,
+        args.shuffle,
+        args.seed,
+        args.memory_maintenance_interval,
+        args.memory_maintenance_llm,
+        args.memory_maintenance_batch_size,
     )
 
 

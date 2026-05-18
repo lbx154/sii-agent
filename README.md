@@ -13,7 +13,7 @@ SII-Agent 是一个面向问答评测和工具调用研究的 Agent 框架。它
   -> evaluation/run_eval.py 读取数据集样本
   -> agent/runner.py 选择 baseline 或 evolved
   -> agent/react.py 让模型循环调用工具
-  -> tools/registry.py 分发 web_search / wiki_search / browse / final_answer 等工具
+  -> tools/registry.py 分发 web_search / wiki_search / browser_open / final_answer 等工具
   -> agent/scoring.py 评分
   -> memory/store.py 在 evolved 模式下记录经验或 lessons
 ```
@@ -156,10 +156,18 @@ python -m scripts.build_wiki_fts \
   --out data/wiki25/wiki25_fts.sqlite
 
 export WIKI25_INDEX_PATH=data/wiki25/wiki25_fts.sqlite
-export SEARCH_BACKENDS=ddg,wiki
 ```
 
-`web_search` 默认会并发调用配置的后端，例如在线 DuckDuckGo 和离线 Wiki。
+`web_search` 只调用课题提供的 search-proxy；离线 Wiki 仍通过单独的 `wiki_search` / `wiki_page` 工具使用。代理端负责 Serper + Jina，API key 留在代理端：
+
+```bash
+export SEARCH_PROXY_URL=http://127.0.0.1:1227
+export SEARCH_PROXY_FETCH=0
+export SEARCH_PROXY_MAX_CHARS=0
+export SEARCH_PROXY_IMAGE_UPLOAD_BACKENDS=tmpfiles,catbox,proxy
+```
+
+`reverse_image_search` 也会调用 search-proxy 的 image/lens 搜索。
 
 ### BrowseComp-Plus
 
@@ -325,9 +333,10 @@ ReAct 默认不会暴露所有工具，而是按 profile 控制工具集合：
 
 | Profile | 工具集合 | 用途 |
 |---|---|---|
-| `benchmark` / `default` | `web_search`, `wiki_search`, `wiki_page`, `browse`, `browse_many`, `final_answer` | 2Wiki、SimpleQA 等文本任务默认路径 |
-| `visual` | 文本工具 + `visual_web_search`, `image_to_text`, `image_search` | SimpleVQA / 图片问答 |
+| `benchmark` / `default` | `web_search`, `wiki_search`, `wiki_page`, `browser_open`, `browser_open_many`, `final_answer` | 2Wiki、SimpleQA 等文本任务默认路径 |
+| `visual` | 文本工具 + `visual_web_search`, `image_to_text`, `image_to_search_queries`, `reverse_image_search` | SimpleVQA / 图片问答 |
 | `rich` / `full` | 文本、视觉、浏览器交互工具 | 需要 JS 页面或点击输入时 |
+| `memory` / `self_retrieval` | benchmark 工具 + `memory_search`, `memory_stats`, `memory_list`, `memory_get`，训练态还会暴露 `memory_create/update/delete` | 让 agent 自己按需检索和维护 lessons/episodes/skills |
 | `all` | 注册表里所有工具 | 调试或展示能力，不建议大规模评测默认使用 |
 
 命令行用 `--tool-profile visual`，或通过环境变量设置：
@@ -335,6 +344,48 @@ ReAct 默认不会暴露所有工具，而是按 profile 控制工具集合：
 ```bash
 export SII_AGENT_TOOL_PROFILE=visual
 ```
+
+记忆默认是全局的：evolved run 会复用并追加到 `SII_AGENT_MEMORY_ROOT`（默认 `logs/memory`），不再默认写到每个 run 目录下。该目录统一保存 `episodes.jsonl`、`lessons.jsonl`、`skills.jsonl`。自检索记忆模式会把 `memory_search` 和 `memory_list` / `memory_get` / `memory_create` / `memory_update` / `memory_delete` 暴露给 agent，让它自己按需检索和维护记忆：
+
+```bash
+python -m evaluation.run_eval \
+  --task 2wiki --split validation --mode evolved \
+  --tool-profile self_retrieval \
+  --self-retrieval-memory
+```
+
+如需临时隔离实验，可显式传 `--memory-root <dir>`；如需清空全局记忆再跑，才使用 `--memory-mode fresh`。
+
+### 运行时态：train / test
+
+Agent 现在有两个长期记忆运行时态：
+
+| 运行态 | 行为 |
+|---|---|
+| `train` | 默认态。evolved run 复用并写入全局 memory；反思产生的有效 lesson/skill 会持久化；自检索 profile 可使用 memory 增删改查。 |
+| `test` | 测试态。强制 memory read-only，不清空、不追加、不写反思结果；`memory_create/update/delete` 不会暴露给 ReAct，直接调用也会返回只读错误；`--gold-reflection` 会被忽略。 |
+
+```bash
+# 积累经验
+python -m evaluation.run_eval --task 2wiki --split train --mode evolved --runtime-mode train
+
+# 使用冻结的全局记忆做评测
+python -m evaluation.run_eval \
+  --task 2wiki --split validation --mode evolved \
+  --runtime-mode test \
+  --tool-profile self_retrieval \
+  --self-retrieval-memory
+```
+
+`bash_exec` 是高风险实验工具，默认不暴露；只有设置 `SII_AGENT_ENABLE_SHELL_TOOL=1` 且使用 `memory`/`self_retrieval`/`rich`/`full`/`all` profile 时才会出现在工具集中。
+
+如果需要使用 `/root/harness-sii-browser-service` 里的 browser-service，先启动服务，再设置：
+
+```bash
+export SANDBOX_BASE_URL=http://127.0.0.1:8080
+```
+
+此时 `browser_open`、`browser_open_many`、`browser_text`、`browser_click`、`browser_type` 会通过 browser-service 暴露的 CDP 浏览器执行；未设置时仍使用本地 Playwright 或原 All-in-One Sandbox 路径。
 
 也可以把工具以 HTTP 服务暴露：
 

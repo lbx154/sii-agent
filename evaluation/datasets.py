@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import random
 import re
 from pathlib import Path
 from typing import Iterator
@@ -206,33 +207,39 @@ def _format_2wiki_context(context: object, question: str = "", max_chars: int = 
     return rendered[:max_chars].rstrip() + " ..."
 
 
-def load_2wiki(n: int | None = None, split: str = "validation") -> Iterator[dict]:
+def load_2wiki(
+    n: int | None = None,
+    split: str = "validation",
+    offset: int = 0,
+    shuffle: bool = False,
+    seed: int = 0,
+) -> Iterator[dict]:
     from datasets import load_dataset
     if split not in AVAILABLE_SPLITS["2wiki"]:
         raise ValueError(f"Unsupported 2Wiki split '{split}'. Available: {AVAILABLE_SPLITS['2wiki']}")
     ds = load_dataset("framolfese/2WikiMultihopQA", split=split)
+    if shuffle:
+        ds = ds.shuffle(seed=seed)
+    if offset or n is not None:
+        end = len(ds) if n is None else min(len(ds), offset + n)
+        ds = ds.select(range(min(offset, len(ds)), end))
+    id_prefix = f"2wiki-{split}-seed{seed}" if shuffle else f"2wiki-{split}"
     for i, ex in enumerate(ds):
-        if n is not None and i >= n:
-            break
         ans = ex.get("answer") or (ex.get("answers", {}) or {}).get("text", [None])[0]
         context = _format_2wiki_context(ex.get("context"), question=str(ex["question"]))
         question = (
-            "You are answering a 2WikiMultihopQA question.\n"
+            "You are answering a factual question using provided context and tools.\n"
             f"Question: {ex['question']}\n\n"
-            "Use the relevance-ranked provided context first; it contains candidate Wikipedia paragraphs for the question. "
-            "Perform the two-hop reasoning over the context and call `final_answer` immediately if the answer is present. "
-            "Only use `wiki_search`, `wiki_page`, or `web_search` if the provided context is insufficient or ambiguous. "
-            "Do not over-search: once both hops are verified, call `final_answer` with only the concise answer phrase.\n"
-            "Answer-format rules for scoring:\n"
-            "- Return only the final answer span, never a sentence or explanation.\n"
+            "Use the provided context as primary evidence when it is sufficient. "
+            "If the context is insufficient or ambiguous, use available retrieval tools to fill the missing fact. "
+            "Do not over-search: once the answer is supported, call `final_answer` with a concise answer phrase.\n"
+            "General answer-format rules:\n"
+            "- Return only the final answer span, not a sentence or explanation.\n"
             "- For yes/no questions, answer exactly `yes` or `no` in lowercase.\n"
-            "- For cause-of-death/why questions, answer only the cause phrase, e.g. `stroke`, not a full sentence.\n"
-            "- For country/nationality questions, copy the exact country or demonym phrase supported by the relevant context; do not convert `Dutch` to `Netherlands` or `German` to `Germany` unless that converted form is the context answer.\n"
-            "- For places, copy the shortest place phrase that is explicitly supported by the relevant context; omit extra country/parenthetical aliases unless the context answer uses them.\n"
-            "- For dates, use the same granularity stated in the supporting context for the target fact; do not add extra date parts if the fact is only a year."
+            "- Preserve the granularity supported by evidence for names, places, dates, causes, countries, and nationalities."
             f"\n\nProvided context:\n{context}"
         )
-        yield {"id": f"2wiki-{split}-{i}", "task": "2wiki", "split": split, "question": question, "answer": ans}
+        yield {"id": f"{id_prefix}-{offset + i}", "task": "2wiki", "split": split, "question": question, "answer": ans}
 
 
 def load_browsecomp_plus(n: int | None = None, split: str = "test") -> Iterator[dict]:
@@ -267,7 +274,20 @@ LOADERS = {
 }
 
 
-def load_examples(task: str, n: int | None = None, offset: int = 0, split: str | None = None) -> list[dict]:
+def load_examples(
+    task: str,
+    n: int | None = None,
+    offset: int = 0,
+    split: str | None = None,
+    shuffle: bool = False,
+    seed: int = 0,
+) -> list[dict]:
     split = split or DEFAULT_SPLITS[task]
+    if task == "2wiki":
+        return list(load_2wiki(n, split=split, offset=offset, shuffle=shuffle, seed=seed))
+    if shuffle:
+        rows = list(LOADERS[task](None, split=split))
+        random.Random(seed).shuffle(rows)
+        return rows[offset:] if n is None else rows[offset:offset + n]
     limit = n + offset if n is not None else None
     return list(LOADERS[task](limit, split=split))[offset:]

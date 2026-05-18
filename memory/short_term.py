@@ -72,11 +72,11 @@ class ShortTermMemory:
             self.dead_ends.append(f"{name}({ _squash(query, 120) if query else '?' }) -> {_squash(result_text, 260)}")
             return
 
-        if name in {"search", "browsecomp_search", "get_document", "browsecomp_get_document"}:
+        if name in {"search", "get_document"}:
             self._observe_json_or_doc_evidence(name, result_text)
-        elif name in {"wiki_search", "web_search", "image_search"}:
+        elif name in {"wiki_search", "web_search"}:
             self._observe_ranked_evidence(name, result_text)
-        elif name in {"browse", "browser_text", "browse_many", "browser_open", "browser_open_many"}:
+        elif name in {"browser_text", "browser_open", "browser_open_many"}:
             self._observe_page_evidence(name, result_text)
         else:
             self.notices.append(f"{name}: {_squash(result_text, 320)}")
