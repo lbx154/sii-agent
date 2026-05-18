@@ -1,39 +1,75 @@
-# SII-Agent · 自进化任务求解智能体
+# SII-Agent
 
-最小但完整的 "尝试 → 反思 → 进化" 闭环 Agent，用于 SimpleQA / SimpleVQA / 2Wiki / BrowseComp-Plus。
+SII-Agent 是一个面向问答评测和工具调用研究的 Agent 框架。它把 **ReAct 多步推理**、**搜索/浏览/Wiki/视觉工具**、**长期记忆与反思进化**、**批量评测** 和 **OPD 偏好蒸馏** 放在同一个最小可运行工程里。
 
-## 模块
+当前项目主线是：用 Qwen3.5-9B / OPD v13 在 2WikiMultihopQA 上比较 `baseline` 和 `evolved`，同时保留 SimpleQA、SimpleVQA、BrowseComp-Plus 和训练数据导出的实验入口。
+
+## 先理解这个项目在做什么
+
+一次普通运行大致是：
+
+```text
+问题
+  -> evaluation/run_eval.py 读取数据集样本
+  -> agent/runner.py 选择 baseline 或 evolved
+  -> agent/react.py 让模型循环调用工具
+  -> tools/registry.py 分发 web_search / wiki_search / browse / final_answer 等工具
+  -> agent/scoring.py 评分
+  -> memory/store.py 在 evolved 模式下记录经验或 lessons
 ```
-agent/        ReAct 主循环 + Reflection
-tools/        search / browser / wiki  (FastAPI 沙盒可独立部署)
-harness/      运行控制：超时 / 步数 / 死循环检测 / 并发
-memory/       短期 (trajectory) + 长期 (episodic + lessons) 记忆
-evaluation/   SimpleQA / SimpleVQA / 2Wiki / BrowseComp-Plus 评测脚本
-configs/      模型 / 工具 / 评测配置 (yaml)
-scripts/      一键跑基线 / 进化版 / 打榜
-```
 
-## 快速开始
+两种核心模式：
+
+| 模式 | 含义 | 适合做什么 |
+|---|---|---|
+| `baseline` | 只跑 ReAct，不读写长期记忆，不做反思 | 作为对照组、排查模型/工具是否正常 |
+| `evolved` | 可注入历史 lessons，失败后可反思、重试并写入记忆 | 研究“经验积累是否提升后续样本” |
+
+## 目录速览
+
+| 路径 | 作用 |
+|---|---|
+| `agent/` | ReAct 循环、LLM 客户端、baseline/evolved runner、评分与反思逻辑 |
+| `tools/` | 工具注册与实现：搜索、Wiki、网页浏览、视觉工具、BrowseComp 检索、`final_answer` |
+| `evaluation/` | SimpleQA / SimpleVQA / 2Wiki / BrowseComp-Plus 的评测脚本和结果合并脚本 |
+| `memory/` | 文件型长期记忆：`episodes.jsonl`、`lessons.jsonl`、`skills.jsonl`；短期工作记忆 |
+| `training/` | OPD / DPO 数据导出、LlamaFactory 配置生成、slime rollout 接入 |
+| `scripts/` | 索引构建、模型服务启动、smoke test、辅助数据转换 |
+| `configs/` | `.env` 示例配置 |
+| `logs/`, `data/`, `indexes/`, `saves/` | 运行产物、数据、索引和模型权重；默认不应提交到 Git |
+
+## 环境准备
+
+建议使用 Python 3.10+。先安装依赖并复制环境变量模板：
+
 ```bash
 pip install -r requirements.txt
 cp configs/.env.example .env
-python -m scripts.build_wiki_index --max-docs 1000000
-python -m scripts.build_wiki_fts --source data/wiki25/wiki25_sample.jsonl --out data/wiki25/wiki25_fts.sqlite
-python -m scripts.download_browsecomp_index --out indexes
-python -m scripts.smoke
-python -m evaluation.run_eval --task simpleqa --mode baseline --n 50 --concurrency 32 --max-llm-tokens 1536
-python -m evaluation.run_eval --task simpleqa --mode evolved --n 50 --concurrency 32 --evolve-batch-size 8 --max-llm-tokens 1536
-python -m evaluation.run_browsecomp --mode evolved --n 20 --concurrency 32
 ```
 
-## 模型 Backend
-- `vllm`   :  本地 vLLM/SGLang 部署的 Qwen3.5-9B（默认/最终打榜）
-- `azure`  :  Azure OpenAI (gpt-5.2 / gpt-5.4)，AAD 鉴权（开发期备用）
+`.env` 里最重要的是 LLM 后端：
 
-切换只需改 `.env` 的 `LLM_BACKEND`。
+```bash
+# 本地 vLLM / SGLang，二者都走 OpenAI-compatible /v1 接口
+LLM_BACKEND=vllm
+VLLM_BASE_URL=http://127.0.0.1:8004/v1
+VLLM_API_KEY=EMPTY
+VLLM_MODEL=Qwen3.5-9B
+VLLM_ENABLE_THINKING=0
 
-## 本地 Qwen3.5-9B SGLang
-赛题环境只允许 SGLang 时，使用 OpenAI-compatible `/v1` 接口：
+# 或者 Azure OpenAI
+# LLM_BACKEND=azure
+# AZURE_OPENAI_ENDPOINT=...
+# AZURE_OPENAI_DEPLOYMENT=gpt-5.4
+```
+
+> `python -m scripts.smoke` 会真实调用模型服务；如果本地没有启动 vLLM/SGLang 或 Azure 凭据不可用，它会连接失败，这是环境问题而不是代码问题。
+
+## 启动本地模型服务
+
+### SGLang（当前推荐的比赛兼容路径）
+
+如果机器上已经有 Qwen3.5-9B 或手动合并后的 OPD 权重，可以用仓库脚本启动 SGLang：
 
 ```bash
 python -m venv --system-site-packages /root/sglang-venv
@@ -44,110 +80,334 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
 SGLANG_PYTHON=/root/sglang-venv/bin/python \
 SGLANG_MODEL=/root/sii-agent/Qwen3.5-9B \
 SGLANG_PORT=8004 \
+SGLANG_TP=4 \
+SGLANG_CONTEXT_LENGTH=32768 \
 SGLANG_SERVED_MODEL_NAME=Qwen3.5-9B \
+SGLANG_TOOL_CALL_PARSER=qwen3_coder \
 bash scripts/start_qwen_sglang.sh
+```
 
+另开一个 shell 设置客户端环境：
+
+```bash
 export LLM_BACKEND=vllm
 export VLLM_BASE_URL=http://127.0.0.1:8004/v1
 export VLLM_MODEL=Qwen3.5-9B
+export VLLM_API_KEY=EMPTY
 export VLLM_ENABLE_THINKING=0
 ```
 
-注意：SGLang 的 Qwen3.5 thinking 输出需要显式关闭，否则短 `max_tokens` 下可能只返回 `reasoning_content`。`start_qwen_sglang.sh` 默认用 `--mm-attention-backend sdpa` 避开本机 `flash_attn` ABI 不兼容问题。
-
-### SGLang + OPD LoRA
-完整 v13 LoRA 包含 SGLang 0.5.11 当前不支持的 Qwen3.5 linear-attention target（`in_proj_a/b/qkv/z`、`out_proj`），直接加载会失败。可先生成只保留 SGLang 支持模块的 adapter 做运行时实验：
+如果要跑当前 OPD v13 完整效果，优先服务手动 merge 后的 HF checkpoint，而不是 SGLang runtime LoRA：
 
 ```bash
-/root/sglang-venv/bin/python scripts/create_sglang_supported_lora.py \
-  --src saves/qwen35-9b/lora/v13_step_final_opd_32k_rank8_beta03_lr2e6_epoch2_sigmoid \
-  --dst saves/qwen35-9b/lora/v13_step_final_opd_32k_sglang_supported \
-  --base-model /root/sii-agent/Qwen3.5-9B
-
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 SGLANG_PYTHON=/root/sglang-venv/bin/python \
-SGLANG_MODEL=/root/sii-agent/Qwen3.5-9B \
+SGLANG_MODEL=/root/sii-agent/saves/qwen35-9b/merged/v13_step_final_opd_32k_full_lora_manual_merged \
 SGLANG_PORT=8004 \
-SGLANG_SERVED_MODEL_NAME=sii-opd-v13-sglang \
-SGLANG_LORA_NAME=sii-opd-v13-sglang \
-SGLANG_LORA_PATH=/root/sii-agent/saves/qwen35-9b/lora/v13_step_final_opd_32k_sglang_supported \
+SGLANG_TP=4 \
+SGLANG_CONTEXT_LENGTH=262144 \
+SGLANG_SERVED_MODEL_NAME=sii-opd-v13-merged-sglang \
+SGLANG_TOOL_CALL_PARSER=qwen3_coder \
 bash scripts/start_qwen_sglang.sh
 
-export VLLM_BASE_URL=http://127.0.0.1:8004/v1
-export VLLM_MODEL=sii-opd-v13-sglang
+export VLLM_MODEL=sii-opd-v13-merged-sglang
 export VLLM_ENABLE_THINKING=0
 ```
 
-这个 pruned adapter 不是完整 v13 LoRA 等价物；若赛题要求完整 LoRA 效果，需要后续尝试离线 merge 成完整 HF 权重或等待/修改 SGLang 对 Qwen3.5 linear-attention LoRA target 的支持。
+注意：
 
-## 本地 Qwen3.5-9B vLLM
+- Qwen3.5/SGLang 跑评测时保持 `VLLM_ENABLE_THINKING=0`，否则模型可能把 token 花在 `reasoning_content`，影响工具调用和最终答案解析。
+- `qwen3_coder` tool-call parser 比 `hermes` 更适合当前 Qwen3.5 textual tool-call 输出。
+- `scripts/create_sglang_supported_lora.py` 可以生成只保留 SGLang 支持 target 的 pruned LoRA，但它不等价于完整 OPD v13 LoRA，不能直接与完整 merge 权重的结果比较。
+
+### vLLM（开发备用）
+
 ```bash
 bash scripts/start_qwen_vllm.sh
+
+export LLM_BACKEND=vllm
+export VLLM_BASE_URL=http://127.0.0.1:18877/v1
+export VLLM_MODEL=Qwen/Qwen3.5-9B
+export VLLM_ENABLE_THINKING=0
 ```
-默认用 `--enforce-eager` 和 8k context，避免 Qwen3.5 的 compile/cudagraph 启动卡住；正式长上下文实验可设置 `VLLM_MAX_MODEL_LEN=32000` 后重启。
 
-## 搜索工具
-- `web_search`: 默认 `SEARCH_BACKENDS=ddg,wiki`，在线 DuckDuckGo 与离线 Wikipedia 等多个后端会并发执行并按配置顺序合并结果，降低搜索耗时。
-- `image_search`: DuckDuckGo Images 文本搜图，返回图片 URL、来源页和标题；它不是反向图搜图。
-- `wiki_search`: 离线 BM25/FTS，索引来自 `XLDDD/wiki25`。JSONL 数据保存在 `data/wiki25/wiki25_sample.jsonl`，推荐再构建 `data/wiki25/wiki25_fts.sqlite`，查询时走 SQLite FTS5 倒排索引。
-- `search`: 面向 BrowseComp-Plus 固定语料的官方兼容本地检索工具，默认使用官方 Pyserini/Lucene BM25 索引 `indexes/bm25`，固定返回 top-5 JSON 结果（docid、score、512-token snippet），便于计算 retrieval recall 和提交打榜结果；`get_document` 和旧 `browsecomp_*` 名称仅作为兼容入口保留。
-- `browse`: 静态网页正文抽取；`browse_many`: 并发读取多 URL，适合一次性比对多个搜索结果页面。
-- Playwright 沙盒浏览器：`browser_open` / `browser_open_many` / `browser_text` / `browser_click` / `browser_type` / `browser_close` 支持真实页面访问、并发打开、点击、输入和会话状态；如机器未安装 Chromium，先运行 `python -m playwright install chromium`。
-- All-in-One 在线搜索沙盒可作为可选浏览器后端：先运行 `docker run --security-opt seccomp=unconfined --rm -it -p 8080:8080 ghcr.io/agent-infra/sandbox:latest`，再设置 `AIO_SANDBOX_BASE_URL=http://127.0.0.1:8080`。配置后 `browser_*` 工具会通过沙盒的 CDP 浏览器执行；未配置时自动使用本地 Playwright。
-- `image_to_text`: 使用 `.env` 中 OpenAI-compatible VLM endpoint 对图片 URL/本地图片做 OCR、视觉线索和候选实体描述。
-- `visual_web_search`: 面向 SimpleVQA 等视觉事实题的封装工具；先用 VLM 产出 OCR/视觉线索和多个候选，再对候选及非实体 OCR 线索做 web/wiki 检索，最后返回紧凑的答案建议、置信度和反证说明，减少“第一眼看错后搜索强化错误”的问题。
-- 默认 ReAct 工具集保持轻量：`web_search,wiki_search,browse,browse_many,final_answer`；视觉问答建议设置 `SII_AGENT_TOOL_PROFILE=visual` 或评测传 `--tool-profile visual`；需要展示完整图搜/浏览器能力时设置 `SII_AGENT_TOOL_PROFILE=rich`；需要暴露所有已注册工具时设置 `SII_AGENT_TOOL_PROFILE=all` 或评测时传 `--tool-profile all`。
-- 工具沙盒：`uvicorn tools.server:app --host 0.0.0.0 --port 8080` 可通过 HTTP 暴露 `/tools`、`/call` 和有界并发的 `/call_many`。
+### Azure OpenAI（开发备用）
 
-## 并发评测 / 批量进化
-- baseline 评测支持 `--concurrency N`，可直接并发调用本地 vLLM。
-- evolved 评测支持 `--evolve-batch-size N`：每个 batch 先固定上一轮 memory 快照，再并发执行解题、反思和重试，batch 完成后写入的新 lessons 会进入下一批检索。
-- 长短记忆：长期记忆由 evolved 模式写入 `episodes.jsonl` / `lessons.jsonl` 并在后续样本检索注入；短期工作记忆可用 `--short-memory` 开启，只在单次 ReAct 尝试内压缩已尝试查询、docid/证据片段和死路，不持久化、不读取 gold，默认关闭以保持基线可复现。
-- `--max-llm-tokens` / `--max-llm-call-seconds` 给每步 LLM 调用硬上限，避免单个样本无限生成拖住整批。
-- `--offset` 可切分 dev/eval；`--memory-root` + `--memory-mode fresh|read_write|read_only` 支持先在 dev 写长期记忆，再在 held-out eval 只读复用；`--no-reflection` 可隔离“只读记忆”效果；`--gold-reflection` 默认关闭，避免把 gold answer 泄漏进长期记忆；`--save-traces` 会把完整 trajectory 写入 `runs.jsonl`。
-
-## BrowseComp-Plus 打榜
-- `python -m scripts.download_browsecomp_index --out indexes` 会下载官方 `Tevatron/browsecomp-plus-indexes` BM25/Lucene 索引；旧的 `scripts.build_browsecomp_fts` 仅作为 SQLite FTS5 兼容路径保留。
-- `python -m evaluation.run_browsecomp --mode evolved --n 0 --concurrency 32` 会解密官方 query 集、本地运行 agent，并在 `logs/browsecomp/.../runs/` 生成官方兼容 JSON 文件。
-- 输出目录同时包含 `browsecomp_plus_decrypted.jsonl` 和 `qrel_evidence.txt`，可配合 BrowseComp-Plus 官方 `scripts_evaluation/evaluate_run.py --input_dir <runs> --ground_truth <...> --qrel_evidence <...>` 做 judge 评分。
-- `python -m evaluation.merge_browsecomp_runs --run-dirs <run-a> <run-b> ... --out <merged>` 可用无 gold 的 LLM selector 在多条 agent 轨迹答案中选择最终答案；`python -m evaluation.route_browsecomp_runs --primary-run <cheap-run> --fallback-run <selector-run> --out <routed>` 可只在廉价轨迹出现拒答、超长答案或搜索预算打满时切到更贵的 selector run。
-
-## GPT-5.4 OPD / 偏好蒸馏
-- 数据：2Wiki 有 `train/validation/test`，可用 `--split train` 做 OPD 训练；当前 SimpleQA loader 没有 public train split，只有 `test` 和很小的 `few_shot`，不要把 SimpleQA test 同时用于训练和评测。
-- 专家：`python -m training.opd` 默认读取 `.env` 中的 `OPD_EXPERT_MODEL` / `AZURE_OPENAI_DEPLOYMENT`，使用 GPT-5.4 给多条 agent 轨迹打 chosen/rejected 偏好。
-- 数学口径：这里的 OPD 不是自定义 loss，而是“离线偏好数据上的 KL-regularized policy distillation”。默认用 DPO/sigmoid：
-  `-log σ(β[(logπθ(y+)−logπref(y+)) − (logπθ(y−)−logπref(y−))])`，即用 reference model 的 reverse-KL 约束把 GPT-5.4 偏好蒸馏进 Qwen student。LlamaFactory 的 DPO trainer 内部也设置 `f_divergence_type="reverse_kl"`。
-- 训练：脚本会导出 LlamaFactory ranking 数据、`dataset_info.json`、DPO 配置和 `train_llamafactory_opd.sh`；默认 `pref_loss: sigmoid`。默认 `--lf-export-mode answer` 只优化最终答案文本，最稳；`final_tool` / `action` 可导出 Qwen3.5 tool-call 格式用于实验，但会更强地改变 ReAct 工具策略。ORPO/SimPO 是 reference-free ablation，不作为 OPD 默认。
-- 两卡训练：生成的 `train_llamafactory_opd.sh` 默认 `CUDA_VISIBLE_DEVICES=4,5 FORCE_TORCHRUN=1`，会在缺少 `llamafactory-cli` 时 clone/install `hiyouga/LLaMA-Factory` 到 `third_party/`。
-
-示例：
 ```bash
-python -m evaluation.run_eval --task 2wiki --split train --mode baseline --n 200 --concurrency 32 --save-traces --out logs/opd_traces
-python -m evaluation.run_eval --task 2wiki --split train --mode evolved --n 200 --concurrency 32 --evolve-batch-size 8 --save-traces --out logs/opd_traces
-python -m training.opd --runs logs/opd_traces/<baseline-run> logs/opd_traces/<evolved-run> --out logs/opd/gpt54_2wiki --expert llm --pref-loss sigmoid --model-name-or-path Qwen/Qwen3.5-9B --lf-export-mode answer --lf-template qwen3_5_nothink
-bash logs/opd/gpt54_2wiki/llamafactory/train_llamafactory_opd.sh
-python -m evaluation.apply_opd_policy --policy logs/opd/gpt54_2wiki/opd_policy.json --runs <heldout-run-a> <heldout-run-b> --out logs/opd_eval/heldout
+az login
+export LLM_BACKEND=azure
+export AZURE_OPENAI_ENDPOINT=<your-endpoint>
+export AZURE_OPENAI_DEPLOYMENT=gpt-5.4
 ```
 
-## slime 在线 Agent OPD
-- 目标：用 `Qwen3.5-9B` 作为 student，在 SII-Agent harness 里做 on-policy tool-use rollout；`Qwen3.5-27B` 作为 SGLang teacher，提供轨迹 token-level logprob，slime 用 `--use-opd --opd-type sglang` 蒸馏 student 的 agent 行为。
-- 训练集：默认从 2Wiki train 切片导出 prompt；评测集：BrowseComp-Plus test，工具白名单切换为 `search,final_answer`，避免把开放搜索带进固定语料评测。
-- 关键接入点：`training.slime_sii_rollout.generate` 实现多步 ReAct/tool rollout 并返回 slime `Sample`；`teacher_logprob_rm` / `post_process_rewards` 复用 slime OPD teacher logprob 路径。
+Azure 路径使用 AAD 鉴权，见 `agent/llm.py` 和 `configs/.env.example`。
 
-示例：
+## 准备检索索引
+
+不是所有任务都必须有全部索引。按需要准备：
+
+### 2Wiki / Wiki 搜索
+
+离线 Wiki 工具优先读取 SQLite FTS 索引：
+
 ```bash
-bash scripts/slime/prepare-sii-opd-data.sh
-bash scripts/slime/convert-qwen3.5-9B.sh
-PROMPT_DATA=data/slime/sii_2wiki_train_512.jsonl \
-EVAL_PROMPT_DATA=data/slime/sii_browsecomp_test_64.jsonl \
-bash scripts/slime/run-sii-qwen3.5-9B-opd.sh
+python -m scripts.build_wiki_fts \
+  --source data/wiki25/wiki25_sample.jsonl \
+  --out data/wiki25/wiki25_fts.sqlite
+
+export WIKI25_INDEX_PATH=data/wiki25/wiki25_fts.sqlite
+export SEARCH_BACKENDS=ddg,wiki
 ```
 
-## 评分项映射
-| 评分维度 | 代码位置 |
+`web_search` 默认会并发调用配置的后端，例如在线 DuckDuckGo 和离线 Wiki。
+
+### BrowseComp-Plus
+
+```bash
+python -m scripts.download_browsecomp_index --out indexes
+export BROWSECOMP_INDEX_PATH=indexes/bm25
+```
+
+BrowseComp-Plus 使用固定语料检索，主工具名是 `search`，默认返回 top-5 文档片段。
+
+## 第一次运行
+
+先确认模型和工具链能通：
+
+```bash
+python -m scripts.smoke
+```
+
+再跑一个最小 2Wiki 样本：
+
+```bash
+python -m evaluation.run_eval \
+  --task 2wiki \
+  --split validation \
+  --mode baseline \
+  --n 1 \
+  --offset 0 \
+  --max-llm-tokens 12000 \
+  --out logs/eval_smoke
+```
+
+输出会写到 `logs/...`，其中 `summary.json` 是最常看的汇总文件；加 `--save-traces` 会写完整轨迹 `runs.jsonl`，适合调试工具调用和解析问题。
+
+## 常用评测命令
+
+### 2Wiki baseline / evolved 小样本对比
+
+```bash
+python -m evaluation.run_eval \
+  --task 2wiki \
+  --split validation \
+  --mode baseline \
+  --n 20 \
+  --offset 0 \
+  --concurrency 32 \
+  --max-llm-tokens 12000 \
+  --out logs/opd_eval
+
+python -m evaluation.run_eval \
+  --task 2wiki \
+  --split validation \
+  --mode evolved \
+  --n 20 \
+  --offset 0 \
+  --concurrency 32 \
+  --evolve-batch-size 32 \
+  --max-llm-tokens 12000 \
+  --out logs/opd_eval
+```
+
+### 2Wiki 500 样本主实验
+
+```bash
+python -m evaluation.run_eval \
+  --task 2wiki \
+  --split validation \
+  --mode baseline \
+  --n 500 \
+  --offset 0 \
+  --concurrency 128 \
+  --max-wall-seconds 600 \
+  --max-llm-tokens 12000 \
+  --max-llm-call-seconds 600 \
+  --out logs/opd_eval
+
+python -m evaluation.run_eval \
+  --task 2wiki \
+  --split validation \
+  --mode evolved \
+  --n 500 \
+  --offset 0 \
+  --concurrency 128 \
+  --evolve-batch-size 128 \
+  --max-wall-seconds 600 \
+  --max-llm-tokens 12000 \
+  --max-llm-call-seconds 600 \
+  --out logs/opd_eval
+```
+
+对比 baseline 和 evolved 时，除 `--mode` / `--evolve-batch-size` 外，保持模型端点、split、`n`、`offset`、concurrency、token 限制、工具 profile 和环境变量一致。
+
+### SimpleQA / SimpleVQA
+
+```bash
+python -m evaluation.run_eval --task simpleqa --mode baseline --n 50 --concurrency 32
+
+python -m evaluation.run_eval \
+  --task simplevqa \
+  --mode baseline \
+  --n 20 \
+  --tool-profile visual \
+  --concurrency 16
+```
+
+SimpleQA 当前 loader 没有 public train split；不要把 SimpleQA test 同时用于训练和评测。
+
+### BrowseComp-Plus
+
+```bash
+python -m evaluation.run_browsecomp \
+  --mode evolved \
+  --n 20 \
+  --concurrency 32 \
+  --out logs/browsecomp
+```
+
+`--n 0` 表示跑完整集合。输出目录会包含官方兼容的 `runs/` JSON、解密后的 ground truth 和 qrel evidence，可再用官方评测脚本打分。
+
+多个 BrowseComp run 可以无 gold 合并或路由：
+
+```bash
+python -m evaluation.merge_browsecomp_runs \
+  --run-dirs <run-a> <run-b> \
+  --out <merged>
+
+python -m evaluation.route_browsecomp_runs \
+  --primary-run <cheap-run> \
+  --fallback-run <selector-run> \
+  --out <routed>
+```
+
+## 2Wiki 当前安全默认值
+
+最近的实验结论是：2Wiki 的 evolved 机制能提升，但收益小且不稳定；反思、lesson、skill 和 typed policy 都应该按 ablation 显式开启，不要默认混在主实验里。
+
+安全默认：
+
+```bash
+unset SII_2WIKI_ENABLE_REFLECTION
+unset SII_2WIKI_ENABLE_LESSONS
+unset SII_2WIKI_ENABLE_SKILLS
+unset SII_2WIKI_ENABLE_TYPED_POLICIES
+```
+
+如果要复现实验中的 legacy lesson/reflection 路径：
+
+```bash
+export SII_2WIKI_ENABLE_REFLECTION=1
+export SII_2WIKI_ENABLE_LESSONS=1
+unset SII_2WIKI_ENABLE_SKILLS
+unset SII_2WIKI_ENABLE_TYPED_POLICIES
+```
+
+重要边界：
+
+- 普通 evolved 运行不要用 `--gold-reflection`；它只适合受控实验，否则会把 gold answer 泄漏进记忆。
+- `--save-traces` 能帮助确认 `lesson_context`、`memory_context_refs`、`first_attempt`、`retry_attempt`、`selected_attempt`、`retry_selected` 和 `reflection_useful` 是否真的触发。
+- 本地 2Wiki `summary.json` 是 exact/F1 评分；如果另跑 Qwen3-32B 语义 judge，结果要单独标注，不能和本地 accuracy 混为一谈。
+
+## 工具 profile
+
+ReAct 默认不会暴露所有工具，而是按 profile 控制工具集合：
+
+| Profile | 工具集合 | 用途 |
+|---|---|---|
+| `benchmark` / `default` | `web_search`, `wiki_search`, `wiki_page`, `browse`, `browse_many`, `final_answer` | 2Wiki、SimpleQA 等文本任务默认路径 |
+| `visual` | 文本工具 + `visual_web_search`, `image_to_text`, `image_search` | SimpleVQA / 图片问答 |
+| `rich` / `full` | 文本、视觉、浏览器交互工具 | 需要 JS 页面或点击输入时 |
+| `all` | 注册表里所有工具 | 调试或展示能力，不建议大规模评测默认使用 |
+
+命令行用 `--tool-profile visual`，或通过环境变量设置：
+
+```bash
+export SII_AGENT_TOOL_PROFILE=visual
+```
+
+也可以把工具以 HTTP 服务暴露：
+
+```bash
+uvicorn tools.server:app --host 0.0.0.0 --port 8080
+```
+
+## 语义 Judge
+
+2Wiki 本地评分偏 exact/F1，容易受答案粒度影响。若有 Qwen3-32B judge 服务，可以对已完成 run 做语义判断：
+
+```bash
+python -m evaluation.judge_semantic \
+  --run-dirs logs/opd_eval/<run-root>/2wiki_baseline_<ts> logs/opd_eval/<run-root>/2wiki_evolved_<ts> \
+  --base-url http://127.0.0.1:8005/v1 \
+  --model Qwen3-32B \
+  --concurrency 64 \
+  --out-prefix semantic_judge_qwen32
+```
+
+报告结果时同时写清楚：
+
+- local exact/F1 accuracy
+- semantic judge accuracy
+- baseline 与 evolved 的绝对分数和净差值
+
+## OPD / 偏好蒸馏
+
+高级入口在 `training/opd.py`。典型流程是先保存 baseline/evolved 轨迹，再用专家模型构造偏好数据，导出 LlamaFactory DPO 配置：
+
+```bash
+python -m evaluation.run_eval \
+  --task 2wiki \
+  --split train \
+  --mode baseline \
+  --n 200 \
+  --concurrency 32 \
+  --save-traces \
+  --out logs/opd_traces
+
+python -m evaluation.run_eval \
+  --task 2wiki \
+  --split train \
+  --mode evolved \
+  --n 200 \
+  --concurrency 32 \
+  --evolve-batch-size 32 \
+  --save-traces \
+  --out logs/opd_traces
+
+python -m training.opd \
+  --runs logs/opd_traces/<baseline-run> logs/opd_traces/<evolved-run> \
+  --out logs/opd/gpt54_2wiki \
+  --expert llm \
+  --pref-loss sigmoid \
+  --model-name-or-path Qwen/Qwen3.5-9B \
+  --lf-export-mode answer \
+  --lf-template qwen3_5_nothink
+```
+
+默认导出模式 `--lf-export-mode answer` 只优化最终答案文本，通常最稳；`final_tool` / `action` 会更强地改变工具策略，适合单独 ablation。
+
+slime 在线 Agent OPD 的接入点是 `training/slime_sii_rollout.py`，脚本在 `scripts/slime/` 下。
+
+## 常见坑
+
+| 现象 | 常见原因 / 处理 |
 |---|---|
-| 工具：search / browser | `tools/` |
-| ReAct + Harness | `agent/react.py`, `harness/` |
-| Reflection | `agent/reflection.py` |
-| Memory | `memory/` |
-| 评测 / 进化对比 | `evaluation/` |
+| `scripts.smoke` 报 `APIConnectionError` | 模型服务没启动、端口不对，或 `.env` 的 `VLLM_BASE_URL` / Azure 配置不可用 |
+| 模型一直输出 reasoning，没有工具调用 | Qwen3.5/SGLang 没关 thinking；设置 `VLLM_ENABLE_THINKING=0` |
+| SGLang tool-call 解析偶发 400 | 启动时设置 `SGLANG_TOOL_CALL_PARSER=qwen3_coder` |
+| 2Wiki evolved 比 baseline 差 | 这是可能的；先用安全默认关闭 reflection/lesson/skill，再逐项 ablation |
+| 大量运行很慢 | 先跑 `--n 10` 或 `--n 20` smoke slice，再扩大到 500；确认 concurrency 与服务吞吐匹配 |
+| 想提交代码但有大文件 | `logs/`, `data/`, `indexes/`, `saves/`, `Qwen*`, `third_party/` 默认在 `.gitignore` 中，不要手动 add |
+
+更多 2Wiki 当前最佳配置和历史结果见 `CURRENT_2WIKI_BEST.md`。
