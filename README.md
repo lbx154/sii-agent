@@ -255,6 +255,8 @@ export SEARCH_PROXY_MAX_CHARS=0
 export SEARCH_PROXY_IMAGE_UPLOAD_BACKENDS=tmpfiles,catbox,proxy
 ```
 
+当前机器上 `127.0.0.1:1227` 不一定有 search-proxy 监听；如果 `curl http://127.0.0.1:1227/health` 不通，不要设置 `SEARCH_PROXY_URL`，改用下面的直接 Serper/Jina 路径。
+
 如果没有 `SEARCH_PROXY_URL`，`web_search` 会直接调用 Serper Search，`reverse_image_search` 会直接调用 Serper Lens；此时需要在本机配置 key：
 
 ```bash
@@ -431,11 +433,13 @@ export VLLM_BASE_URL=http://127.0.0.1:8000/v1
 export VLLM_MODEL=qwen35-9b-base-sglang
 export VLLM_API_KEY=EMPTY
 export VLLM_ENABLE_THINKING=0
-export SEARCH_BACKENDS=ddg,wiki
+unset SEARCH_PROXY_URL  # 当前机器 1227 search-proxy 未必监听；无代理时走 SERPER_API_KEY/JINA_API_KEY
+export SERPER_API_KEY=...
+export JINA_API_KEY=...
 export WIKI25_INDEX_PATH=/root/sii-agent/data/wiki25/wiki25_fts.sqlite
 ```
 
-当前 AIO browser 是 `http://127.0.0.1:8080`；`13141` 在历史脚本里是 teacher 端口默认值，`18080` 当前没有监听，不是本仓库 `tools.browser` 期望的 AIO endpoint。用 `rich` profile 时会暴露 `web_search/wiki_search/wiki_page/browse/browse_many/image_search/visual_web_search/image_to_text/browser_open/browser_text/browser_click/browser_type/final_answer`。2Wiki 大多数样本是 provided-context/static-web 任务，模型实际常用 `final_answer`、`wiki_search`、`web_search`、`wiki_page`、`browse`；没有触发 `browser_open` 不代表浏览器工具不可用。
+当前 AIO browser 是 `http://127.0.0.1:8080`（`http://127.0.0.1:8091/v1/browser/info` 也可能可用）；`13141` 在历史脚本里是 teacher 端口默认值，`18080` 当前没有监听，不是本仓库 `tools.browser` 期望的 AIO endpoint。用 `rich` profile 时会暴露 `web_search/wiki_search/wiki_page/browse/browse_many/image_search/visual_web_search/image_to_text/browser_open/browser_text/browser_click/browser_type/final_answer`。2Wiki 大多数样本是 provided-context/static-web 任务，模型实际常用 `final_answer`、`wiki_search`、`web_search`、`wiki_page`、`browse`；没有触发 `browser_open` 不代表浏览器工具不可用。
 
 跑 500 条或 2000 条 baseline：
 
@@ -499,6 +503,154 @@ RUN_DIR=$(find "$RUN_ROOT" -maxdepth 2 -name summary.json -printf '%h\n' | head 
 - 9B Agent 调用必须保持 `VLLM_ENABLE_THINKING=0`；27B judge 的 OpenAI client 调用也要通过 `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` 关闭 thinking。
 - `--save-traces` 是后续 GRM/rubric、positive trajectory SFT 和错误分析的基础，不要在采样 baseline 时省略。
 - 对 2Wiki baseline，`rich` profile 可验证完整工具链，但正样本筛选时仍应惩罚 `search_before_context`、`context_ignored`、`over_search` 等坏模式；答案对但过程差的轨迹不适合直接进入 SFT pool。
+
+### `benchmark.csv` 完整工具链 baseline 记录
+
+`data/slime/benchmark.csv` 是无答案题面，`data/slime/benchmark_answered.csv` 是同顺序带答案版本。当前脚本用 answered CSV 只是为了本地打分和输出对比，prompt 构造只使用 `problem`、`image` 和自动检索上下文，不会把 `answer` 注入给 agent。
+
+确认走的是完整 ReAct/Harness 链路，而不是直接问模型：
+
+```text
+scripts.run_benchmark_answered_special
+  -> agent.react.run_react
+  -> harness.controller.HarnessConfig / StepGuard
+  -> tools.registry.dispatch
+  -> final_answer
+```
+
+baseline no-memory 模式暴露的工具集合：
+
+```text
+web_search, wiki_search, wiki_page,
+reverse_image_search, visual_web_search, image_to_text, image_to_search_queries,
+browser_open, browser_open_many, browser_text, browser_click, browser_type, browser_close,
+final_answer
+```
+
+运行注意：
+
+- `--mode baseline_no_memory` 不开放 memory 工具，不做 reflection/retry，适合作为 test-only baseline。
+- 无图样本会过滤 visual/image 工具；不加 `--enable-browser-tools` 会过滤 browser 工具。要测完整工具链必须加 `--enable-browser-tools`。
+- 脚本默认每题先做 2 次 `prefetch_web_search`，这些结果会写进 trajectory，统计里会出现 `prefetch_web_search`。
+- `web_search` 和 `reverse_image_search` 需要 `SEARCH_PROXY_URL` 或 `SERPER_API_KEY`；`JINA_API_KEY` 只用于抓取/阅读网页正文，不能替代 Serper 搜索。
+- 当前 AIO browser 只需设置 base 为 `http://127.0.0.1:8080`，不要写成 `/v1`；`tools.browser` 会通过 `/v1/browser/info` 发现 CDP，再用 Playwright/CDP 执行 `browser_open` 等工具。
+- 并发不要一开始开到 50。搜索、浏览器和模型 API 会被峰值压出 timeout；100 条 baseline 建议先用 `--concurrency 8` 或 `16`。
+
+跑前 smoke 工具链。`web_search` 应该返回真实 Serper 结果，而不是 `SERPER_API_KEY is not set`；`browser_open` 应该能打开 Example Domain；视觉工具至少要能 OCR/生成 query：
+
+```bash
+export AIO_SANDBOX_BASE_URL=http://127.0.0.1:8080
+export LLM_BACKEND=vllm
+export VLLM_BASE_URL=http://localhost:8000/v1
+export VLLM_MODEL=qwen35-9b-base-sglang
+export VLLM_API_KEY=EMPTY
+export VLLM_ENABLE_THINKING=0
+unset SEARCH_PROXY_URL
+export SERPER_API_KEY=<serper-key>
+export JINA_API_KEY=<jina-key>
+export SEARCH_BACKENDS=ddg,wiki
+export WIKI25_INDEX_PATH=/root/sii-agent/data/wiki25/wiki25_fts.sqlite
+
+/root/micromamba/envs/myslime/bin/python3.12 - <<'PY'
+from tools.registry import dispatch
+
+for name, args in [
+    ("web_search", {"query": "ECCV 2024 conference dates", "k": 3}),
+    ("wiki_search", {"query": "Albert Einstein", "k": 2}),
+    ("browser_open", {"url": "https://example.com", "max_chars": 300}),
+]:
+    print(f"\n## {name}")
+    print(dispatch(name, args)[:1000])
+PY
+```
+
+跑 100 条 9B baseline：
+
+```bash
+cd /root/cyl/sii-agent
+python_bin=/root/micromamba/envs/myslime/bin/python3.12
+RUN_NAME=benchmark_9b_base_full_tools_100_c8_search_ok_$(date +%Y%m%d_%H%M%S)
+
+AIO_SANDBOX_BASE_URL=http://127.0.0.1:8080 \
+LLM_BACKEND=vllm \
+VLLM_BASE_URL=http://localhost:8000/v1 \
+VLLM_MODEL=qwen35-9b-base-sglang \
+VLLM_API_KEY=EMPTY \
+VLLM_ENABLE_THINKING=0 \
+SEARCH_BACKENDS=ddg,wiki \
+WIKI25_INDEX_PATH=/root/sii-agent/data/wiki25/wiki25_fts.sqlite \
+SERPER_API_KEY="$SERPER_API_KEY" \
+JINA_API_KEY="$JINA_API_KEY" \
+"$python_bin" -m scripts.run_benchmark_answered_special \
+  --csv /root/cyl/sii-agent/data/slime/benchmark_answered.csv \
+  --out logs \
+  --run-name "$RUN_NAME" \
+  --mode baseline_no_memory \
+  --n 0 \
+  --offset 0 \
+  --concurrency 8 \
+  --max-steps 26 \
+  --max-llm-tokens 120000 \
+  --max-wall-seconds 180 \
+  --max-llm-call-seconds 600 \
+  --min-llm-call-seconds 30 \
+  --max-parallel-tool-calls 1 \
+  --max-web-search-calls 0 \
+  --max-research-tool-calls 12 \
+  --synthesize-after-tool-calls 6 \
+  --enable-browser-tools
+```
+
+`evaluation.judge_semantic` 期望字段名是 `question/predicted/expected`，而 benchmark JSONL 是 `problem/answer/expected`，所以先转一个 judge 输入：
+
+```bash
+RUN_ROOT=logs/<benchmark-run-name>
+
+python - <<'PY' "$RUN_ROOT/baseline_no_memory.jsonl" "$RUN_ROOT/judge_input.jsonl"
+import json
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, encoding="utf-8") as inp, open(dst, "w", encoding="utf-8") as out:
+    for line in inp:
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        out.write(json.dumps({
+            "id": r.get("id"),
+            "question": r.get("problem"),
+            "predicted": r.get("answer"),
+            "expected": r.get("expected"),
+            "correct": r.get("correct"),
+            "steps": r.get("steps"),
+            "tool_calls": r.get("tool_calls"),
+            "tool_call_counts": r.get("tool_call_counts"),
+            "stop_reason": r.get("stop_reason"),
+        }, ensure_ascii=False) + "\n")
+PY
+
+/root/micromamba/envs/myslime/bin/python3.12 -m evaluation.judge_semantic \
+  --run-dirs "$RUN_ROOT/judge_input.jsonl" \
+  --base-url http://127.0.0.1:8004/v1 \
+  --model qwen35-27b-sglang \
+  --api-key EMPTY \
+  --concurrency 32 \
+  --out-prefix semantic_judge_27b \
+  --max-retries 2
+```
+
+当前可复现基线结果：
+
+| Run | 设置 | 本地 correct | avg F1 | 27B judge | stop | 工具调用 |
+|---|---|---:|---:|---:|---|---|
+| `logs/benchmark_9b_base_full_tools_100_c8_search_ok_20260519_063417` | 9B agent, 27B judge, Serper+Jina, AIO browser, `concurrency=8`, no-memory | `28/100 = 28%` | `34.64%` | `37/100 = 37%` | `98 final, 2 APITimeout` | `web_search=642`, `prefetch_web_search=198`, `browser_open=65`, `visual_web_search=37`, `image_to_text=15`, `reverse_image_search=3` |
+
+诊断经验：
+
+- 之前在 search 未配置、browser 还走旧接口、`concurrency=50` 的情况下，本地只有 `12%`、27B judge `15%`，不能作为可信 baseline。
+- 配好 Serper/Jina 并修通 AIO/CDP browser 后，同一 100 条的 27B judge 到 `37%`，与约 `35%` 的外部结果基本一致。
+- 本地 exact/F1 会低估语义正确率，尤其日期格式、单位和别名；报告时同时给 local 和 LLM-as-judge。
+- 当前错误主要集中在文本 web 题：50 个文本题本地只对 7 个；50 个图像题本地对 21 个。图像题不少 wrong 的 gold 已经出现在工具证据里，说明后续优化重点是证据选择/答案格式，而不只是工具可用性。
 
 ### SimpleQA / SimpleVQA
 
