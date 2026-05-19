@@ -249,6 +249,52 @@ python -m evaluation.run_eval \
   --out logs/opd_eval
 ```
 
+如果要显式测试 2Wiki 的长期记忆注入，可以开启 lessons/reflection，并让 evolved 从前序 batch 的成功 episode 中检索策略记忆：
+
+```bash
+export SII_2WIKI_ENABLE_REFLECTION=1
+export SII_2WIKI_ENABLE_LESSONS=1
+unset SII_2WIKI_ENABLE_SKILLS
+unset SII_2WIKI_ENABLE_TYPED_POLICIES
+
+python -m evaluation.run_eval \
+  --task 2wiki \
+  --split validation \
+  --mode evolved \
+  --n 500 \
+  --offset 0 \
+  --concurrency 128 \
+  --evolve-batch-size 128 \
+  --include-success-memory \
+  --memory-k 3 \
+  --max-wall-seconds 600 \
+  --max-llm-tokens 12000 \
+  --max-llm-call-seconds 600 \
+  --out logs/opd_eval
+```
+
+更公平的 memory 评测流程不要在 validation/test 上用 gold 生成记忆。可以先从 2Wiki train 蒸馏 lessons，再把同一个 memory root 以 read-only 注入 validation/test：
+
+```bash
+python -m evaluation.run_2wiki_memory_eval \
+  --memory-n 500 \
+  --memory-offset 0 \
+  --eval-split validation \
+  --eval-n 500 \
+  --eval-offset 0 \
+  --concurrency 128 \
+  --evolve-batch-size 128 \
+  --memory-k 3 \
+  --max-wall-seconds 600 \
+  --max-llm-tokens 12000 \
+  --max-llm-call-seconds 600 \
+  --tool-profile benchmark \
+  --run-baseline \
+  --out logs/opd_eval
+```
+
+这个封装会在 distill 阶段设置 `SII_2WIKI_ENABLE_REFLECTION=1`、关闭 lesson 检索并用 train gold reflection 写入 `lessons.jsonl`；在 scored eval 阶段设置 `SII_2WIKI_ENABLE_LESSONS=1`、`memory_mode=read_only`、`use_gold_for_reflection=false`。如果手动传入已有 `--memory-root` 且使用 fresh 模式，必须加 `--force-fresh-memory` 才会删除旧记忆。
+
 对比 baseline 和 evolved 时，除 `--mode` / `--evolve-batch-size` 外，保持模型端点、split、`n`、`offset`、concurrency、token 限制、工具 profile 和环境变量一致。
 
 ### SimpleQA / SimpleVQA
