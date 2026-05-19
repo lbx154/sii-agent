@@ -18,7 +18,7 @@ from tools import dispatch, tool_specs
 logger = logging.getLogger(__name__)
 
 DEFAULT_ALLOWED_TOOLS = ("wiki_search", "web_search", "browse", "browse_many", "final_answer")
-BROWSECOMP_ALLOWED_TOOLS = ("search", "final_answer")
+BROWSECOMP_ALLOWED_TOOLS = ("browsecomp_search", "browsecomp_get_document", "final_answer")
 
 SYSTEM_PROMPT = """You are a careful research agent.
 
@@ -40,14 +40,14 @@ Rules:
 BROWSECOMP_SYSTEM_PROMPT = """You are solving BrowseComp-Plus questions using a fixed local corpus.
 
 Loop:
-1. Search the fixed corpus with search.
-2. Call final_answer when the answer is supported.
+1. Search the fixed corpus with browsecomp_search.
+2. Retrieve promising documents with browsecomp_get_document.
+3. Call final_answer when the answer is supported.
 
 Available tools for this run:
 {tool_list}
 
 Rules:
-- search returns the top 5 documents with docid, score, and a 512-token snippet.
 - Build the answer only from BrowseComp-Plus corpus evidence.
 - Cite supporting document ids in square brackets, e.g. [12345].
 - Do not use open-web or Wikipedia tools for BrowseComp-Plus.
@@ -100,7 +100,7 @@ def _system_prompt(sample: Any, allowed_tools: tuple[str, ...]) -> str:
     metadata = _metadata(sample)
     if isinstance(metadata.get("system_prompt"), str) and metadata["system_prompt"].strip():
         template = metadata["system_prompt"].strip()
-    elif "search" in allowed_tools or _task_name(sample) in {"browsecomp", "browsecomp-plus", "browsecomp_plus"}:
+    elif "browsecomp_search" in allowed_tools or _task_name(sample) in {"browsecomp", "browsecomp-plus", "browsecomp_plus"}:
         template = BROWSECOMP_SYSTEM_PROMPT
     else:
         template = SYSTEM_PROMPT
@@ -134,6 +134,11 @@ def _token_delta(
         prev = _chat_template(tokenizer, messages[:-1], tools, add_generation_prompt=False)
         mask_value = 0
     if not curr.startswith(prev):
+        prev_tokens = _encode(tokenizer, prev)
+        curr_tokens = _encode(tokenizer, curr)
+        if curr_tokens[: len(prev_tokens)] == prev_tokens:
+            new_tokens = curr_tokens[len(prev_tokens) :]
+            return new_tokens, [mask_value] * len(new_tokens)
         raise ValueError(
             f"chat template delta mismatch for role={messages[-1]['role']}: "
             f"prev_len={len(prev)} curr_len={len(curr)}"
@@ -223,6 +228,20 @@ def _build_messages(question: str, system_prompt: str) -> list[dict[str, Any]]:
     ]
 
 
+def _prompt_to_question(prompt: Any) -> str:
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(prompt, list):
+        for message in reversed(prompt):
+            if isinstance(message, dict) and message.get("role") == "user":
+                content = message.get("content")
+                if isinstance(content, str):
+                    return content
+        if prompt and isinstance(prompt[-1], dict) and isinstance(prompt[-1].get("content"), str):
+            return prompt[-1]["content"]
+    return json.dumps(prompt, ensure_ascii=False)
+
+
 def _strip_stop_text(text: str) -> str:
     return text.removesuffix("<|im_end|>").strip()
 
@@ -247,7 +266,7 @@ async def generate(args: Namespace, sample: Any, sampling_params: dict[str, Any]
     tokenizer = state.tokenizer
     allowed = _allowed_tools(sample)
     tools = tool_specs(allowed)
-    question = sample.prompt if isinstance(sample.prompt, str) else json.dumps(sample.prompt, ensure_ascii=False)
+    question = _prompt_to_question(sample.prompt)
     messages = _build_messages(question, _system_prompt(sample, allowed))
     prompt_text = _chat_template(tokenizer, messages, tools, add_generation_prompt=True)
     prompt_token_ids = _encode(tokenizer, prompt_text)
@@ -270,7 +289,7 @@ async def generate(args: Namespace, sample: Any, sampling_params: dict[str, Any]
 
     try:
         for step in range(max_steps):
-            if step == max_steps - 1:
+            if step == max_steps - 1 and os.getenv("SII_SLIME_FORCE_FINAL_STEP", "1").lower() in {"1", "true", "yes"}:
                 messages.append(
                     {
                         "role": "user",
@@ -402,13 +421,23 @@ async def teacher_logprob_rm(args: Namespace, sample: Any, **kwargs):
 
     if isinstance(sample, list):
         return await asyncio.gather(*[teacher_logprob_rm(args, item, **kwargs) for item in sample])
-    return await teacher_reward_func(args, sample, **kwargs)
+    reward = await teacher_reward_func(args, sample, **kwargs)
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    if os.getenv("SII_SLIME_USE_TASK_REWARD", "1").lower() in {"1", "true", "yes"}:
+        scalar_reward = float(metadata.get("task_reward") or 0.0)
+    else:
+        scalar_reward = 0.0
+    return {"opd_raw": reward, "scalar_reward": scalar_reward}
 
 
 def post_process_rewards(args: Namespace, samples: list[Any], **kwargs):
     task_rewards: list[float] = []
     for sample in samples:
-        reward = sample.get_reward_value(args)
+        reward_payload = sample.reward
+        if isinstance(reward_payload, dict) and "opd_raw" in reward_payload:
+            reward = reward_payload["opd_raw"]
+        else:
+            reward = sample.get_reward_value(args)
         response_length = sample.response_length
         input_logprobs = reward["meta_info"]["input_token_logprobs"][1:]
         if len(input_logprobs) < response_length:

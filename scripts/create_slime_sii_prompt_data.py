@@ -48,6 +48,7 @@ def main() -> None:
                 "id": ex.get("id"),
                 "task": ex.get("task", args.task),
                 "split": ex.get("split", args.split),
+                "question": ex["question"],
                 "allowed_tools": allowed_tools,
             }
             if ex.get("query_id") is not None:
@@ -55,7 +56,7 @@ def main() -> None:
             if ex.get("evidence_docids"):
                 metadata["evidence_docids"] = ex.get("evidence_docids")
             record = {
-                "question": ex["question"],
+                "question": [{"role": "user", "content": ex["question"]}],
                 "answer": ex.get("answer"),
                 "metadata": metadata,
             }

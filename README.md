@@ -114,6 +114,94 @@ export VLLM_MODEL=sii-opd-v13-merged-sglang
 export VLLM_ENABLE_THINKING=0
 ```
 
+### 当前机器 SGLang 服务记录
+
+这台机器上可复用 `/root/micromamba/envs/myslime` 环境和仓库内 vendored SGLang：
+
+```bash
+export SGLANG_PYTHON=/root/micromamba/envs/myslime/bin/python3.12
+export PYTHONPATH=/root/sii-agent/third_party/sglang/python:/root/sii-agent/third_party/slime
+```
+
+启动原始未训练 Qwen3.5-9B（GPU 5，端口 8000）：
+
+```bash
+cd /root/cyl/sii-agent
+mkdir -p logs/services
+
+CUDA_VISIBLE_DEVICES=5 \
+PYTHONPATH=/root/sii-agent/third_party/sglang/python:/root/sii-agent/third_party/slime \
+/root/micromamba/envs/myslime/bin/python3.12 -m sglang.launch_server \
+  --model-path /root/sii-agent/Qwen3.5-9B \
+  --served-model-name qwen35-9b-base-sglang \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tp-size 1 \
+  --mem-fraction-static 0.80 \
+  --context-length 262144 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --trust-remote-code \
+  > logs/services/sglang_qwen35_9b_base_8000.log 2>&1
+```
+
+启动 Qwen3.5-27B teacher（GPU 0,1，端口 8004）：
+
+```bash
+cd /root/cyl/sii-agent
+mkdir -p logs/services
+
+CUDA_VISIBLE_DEVICES=0,1 \
+PYTHONPATH=/root/sii-agent/third_party/sglang/python:/root/sii-agent/third_party/slime \
+/root/micromamba/envs/myslime/bin/python3.12 -m sglang.launch_server \
+  --model-path /root/sii-agent/Qwen3.5-27B \
+  --served-model-name qwen35-27b-sglang \
+  --host 0.0.0.0 \
+  --port 8004 \
+  --tp-size 2 \
+  --mem-fraction-static 0.80 \
+  --context-length 262144 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --trust-remote-code \
+  > logs/services/sglang_qwen35_27b_8004.log 2>&1
+```
+
+调用地址和模型名：
+
+| 服务 | Base URL | Model |
+|---|---|---|
+| 原始 Qwen3.5-9B | `http://127.0.0.1:8000/v1` / `http://10.44.170.208:8000/v1` | `qwen35-9b-base-sglang` |
+| Qwen3.5-27B teacher | `http://127.0.0.1:8004/v1` / `http://10.44.170.208:8004/v1` | `qwen35-27b-sglang` |
+
+Raw HTTP 调用时用顶层 `chat_template_kwargs` 关闭 thinking：
+
+```bash
+curl http://127.0.0.1:8004/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen35-27b-sglang",
+    "messages": [{"role": "user", "content": "用中文简短回答：2+2等于几？"}],
+    "temperature": 0,
+    "max_tokens": 64,
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
+```
+
+OpenAI Python client 调用时把同一参数放进 `extra_body`：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8004/v1", api_key="EMPTY")
+resp = client.chat.completions.create(
+    model="qwen35-27b-sglang",
+    messages=[{"role": "user", "content": "hello"}],
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+print(resp.choices[0].message.content)
+```
+
 注意：
 
 - Qwen3.5/SGLang 跑评测时保持 `VLLM_ENABLE_THINKING=0`，否则模型可能把 token 花在 `reasoning_content`，影响工具调用和最终答案解析。
@@ -250,6 +338,103 @@ python -m evaluation.run_eval \
 ```
 
 对比 baseline 和 evolved 时，除 `--mode` / `--evolve-batch-size` 外，保持模型端点、split、`n`、`offset`、concurrency、token 限制、工具 profile 和环境变量一致。
+
+### 当前 baseline 全流程记录：9B Agent + 27B Judge
+
+这套命令用于记录赛题 baseline：9B 作为 Harness 基座 Agent，27B 只做 LLM-as-judge/GRM，不作为被评测 Agent。`N500` 在当前记录里不是单独数据文件，而是 `framolfese/2WikiMultihopQA` 的 `validation` split，`offset=0, n=500`；2000 条同理是 `offset=0, n=2000`。
+
+确认使用的是当前完整 Harness/ReAct 链路：
+
+```text
+evaluation.run_eval
+  -> agent.runner.run_baseline
+  -> agent.react.run_react
+  -> harness.controller.HarnessConfig / StepGuard
+  -> tools.registry dispatch
+  -> final_answer
+```
+
+完整工具链建议用 `rich` profile，并显式接上 AIO browser sandbox：
+
+```bash
+curl -s http://127.0.0.1:8000/v1/models   # qwen35-9b-base-sglang
+curl -s http://127.0.0.1:8004/v1/models   # qwen35-27b-sglang
+curl -s http://127.0.0.1:8080/v1/browser/info
+
+export AIO_SANDBOX_BASE_URL=http://127.0.0.1:8080
+export LLM_BACKEND=vllm
+export VLLM_BASE_URL=http://127.0.0.1:8000/v1
+export VLLM_MODEL=qwen35-9b-base-sglang
+export VLLM_API_KEY=EMPTY
+export VLLM_ENABLE_THINKING=0
+export SEARCH_BACKENDS=ddg,wiki
+export WIKI25_INDEX_PATH=/root/sii-agent/data/wiki25/wiki25_fts.sqlite
+```
+
+当前 AIO browser 是 `http://127.0.0.1:8080`；`13141` 在历史脚本里是 teacher 端口默认值，`18080` 当前没有监听，不是本仓库 `tools.browser` 期望的 AIO endpoint。用 `rich` profile 时会暴露 `web_search/wiki_search/wiki_page/browse/browse_many/image_search/visual_web_search/image_to_text/browser_open/browser_text/browser_click/browser_type/final_answer`。2Wiki 大多数样本是 provided-context/static-web 任务，模型实际常用 `final_answer`、`wiki_search`、`web_search`、`wiki_page`、`browse`；没有触发 `browser_open` 不代表浏览器工具不可用。
+
+跑 500 条或 2000 条 baseline：
+
+```bash
+cd /root/cyl/sii-agent
+python_bin=/root/micromamba/envs/myslime/bin/python3.12
+N=500   # 或 N=2000
+RUN_ROOT=logs/baseline_9b_2wiki_n${N}_$(date +%s)
+mkdir -p "$RUN_ROOT"
+
+AIO_SANDBOX_BASE_URL=http://127.0.0.1:8080 \
+LLM_BACKEND=vllm \
+VLLM_BASE_URL=http://127.0.0.1:8000/v1 \
+VLLM_MODEL=qwen35-9b-base-sglang \
+VLLM_API_KEY=EMPTY \
+VLLM_ENABLE_THINKING=0 \
+SEARCH_BACKENDS=ddg,wiki \
+WIKI25_INDEX_PATH=/root/sii-agent/data/wiki25/wiki25_fts.sqlite \
+"$python_bin" -m evaluation.run_eval \
+  --task 2wiki \
+  --split validation \
+  --mode baseline \
+  --n "$N" \
+  --offset 0 \
+  --max-steps 8 \
+  --concurrency 64 \
+  --max-wall-seconds 600 \
+  --max-llm-tokens 12000 \
+  --max-llm-call-seconds 600 \
+  --min-llm-call-seconds 5 \
+  --tool-profile rich \
+  --save-traces \
+  --out "$RUN_ROOT"
+```
+
+跑完后用 27B 做语义 judge。这个分数要和本地 exact/F1 分开报告：
+
+```bash
+RUN_DIR=$(find "$RUN_ROOT" -maxdepth 2 -name summary.json -printf '%h\n' | head -1)
+
+/root/micromamba/envs/myslime/bin/python3.12 -m evaluation.judge_semantic \
+  --run-dirs "$RUN_DIR" \
+  --base-url http://127.0.0.1:8004/v1 \
+  --model qwen35-27b-sglang \
+  --api-key EMPTY \
+  --concurrency 64 \
+  --out-prefix semantic_judge_27b \
+  --max-retries 2
+```
+
+当前已记录的 baseline 结果：
+
+| Run | 本地 correct | exact_match | avg_f1 | 27B judge | judge error | avg_steps | avg_tool_calls | wall time |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `logs/baseline_9b_2wiki_n500_1779166613/2wiki_baseline_1779166613` | `375/500 = 75.0%` | `74.6%` | `82.42%` | `447/495 = 90.30%` | `5` | `1.846` | `1.768` | `152.45s` |
+| `logs/baseline_9b_2wiki_n2000_1779167503/2wiki_baseline_1779167503` | `1498/2000 = 74.9%` | `74.8%` | `83.13%` | `1797/1994 = 90.12%` | `6` | `1.911` | `1.8305` | `604.67s` |
+
+经验：
+
+- 评测用 `/root/micromamba/envs/myslime/bin/python3.12`，系统 `/usr/bin/python` 可能缺少 `python-dotenv` 等依赖。
+- 9B Agent 调用必须保持 `VLLM_ENABLE_THINKING=0`；27B judge 的 OpenAI client 调用也要通过 `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` 关闭 thinking。
+- `--save-traces` 是后续 GRM/rubric、positive trajectory SFT 和错误分析的基础，不要在采样 baseline 时省略。
+- 对 2Wiki baseline，`rich` profile 可验证完整工具链，但正样本筛选时仍应惩罚 `search_before_context`、`context_ignored`、`over_search` 等坏模式；答案对但过程差的轨迹不适合直接进入 SFT pool。
 
 ### SimpleQA / SimpleVQA
 

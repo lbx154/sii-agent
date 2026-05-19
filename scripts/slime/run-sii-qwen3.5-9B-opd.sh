@@ -14,14 +14,17 @@ source "${SCRIPT_DIR}/qwen3.5-9B.sh"
 : "${TEACHER_CUDA_VISIBLE_DEVICES:=6,7}"
 : "${STUDENT_CUDA_VISIBLE_DEVICES:=0,1,2,3}"
 : "${TEACHER_PORT:=13141}"
+: "${TEACHER_TP:=2}"
+: "${TEACHER_MEM_FRACTION_STATIC:=0.72}"
 : "${MASTER_ADDR:=127.0.0.1}"
 : "${SII_SLIME_MAX_STEPS:=5}"
 : "${SII_SLIME_MAX_TURN_TOKENS:=1024}"
 : "${SII_SLIME_MAX_OBSERVATION_CHARS:=4000}"
 : "${SII_SLIME_USE_TASK_REWARD:=1}"
+: "${SII_SLIME_FORCE_FINAL_STEP:=1}"
 : "${SEARCH_BACKENDS:=wiki}"
 : "${WIKI25_INDEX_PATH:=/root/sii-agent/data/wiki25/wiki25_fts.sqlite}"
-: "${BROWSECOMP_INDEX_PATH:=/root/sii-agent/indexes/bm25}"
+: "${BROWSECOMP_INDEX_PATH:=/root/sii-agent/data/browsecomp-plus/browsecomp_fts.sqlite}"
 : "${MEGATRON_PATH:=${REPO_ROOT}/third_party/Megatron-LM}"
 : "${ACTOR_NUM_NODES:=1}"
 : "${ACTOR_NUM_GPUS_PER_NODE:=2}"
@@ -37,6 +40,7 @@ source "${SCRIPT_DIR}/qwen3.5-9B.sh"
 : "${TENSOR_MODEL_PARALLEL_SIZE:=2}"
 : "${MAX_TOKENS_PER_GPU:=8192}"
 : "${SGLANG_MEM_FRACTION_STATIC:=0.45}"
+: "${SAVE_INTERVAL:=1}"
 : "${EVAL_PROMPT_DATA:=}"
 : "${EVAL_INTERVAL:=}"
 : "${EVAL_MAX_PROMPT_LEN:=4096}"
@@ -82,8 +86,8 @@ cd "${SLIME_DIR}"
 export PYTHONBUFFERED=16
 export SEARCH_BACKENDS WIKI25_INDEX_PATH BROWSECOMP_INDEX_PATH
 export STUDENT_HF_CHECKPOINT TEACHER_PORT
-export SII_SLIME_MAX_STEPS SII_SLIME_MAX_TURN_TOKENS SII_SLIME_MAX_OBSERVATION_CHARS SII_SLIME_USE_TASK_REWARD
-export PYTHONPATH="${MEGATRON_PATH}:${REPO_ROOT}:${SLIME_DIR}:${PYTHONPATH:-}"
+export SII_SLIME_MAX_STEPS SII_SLIME_MAX_TURN_TOKENS SII_SLIME_MAX_OBSERVATION_CHARS SII_SLIME_USE_TASK_REWARD SII_SLIME_FORCE_FINAL_STEP
+export PYTHONPATH="${REPO_ROOT}:${MEGATRON_PATH}:${SLIME_DIR}:${PYTHONPATH:-}"
 
 (
   export CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES}"
@@ -91,9 +95,9 @@ export PYTHONPATH="${MEGATRON_PATH}:${REPO_ROOT}:${SLIME_DIR}:${PYTHONPATH:-}"
     --model-path "${TEACHER_HF_CHECKPOINT}" \
     --host 0.0.0.0 \
     --port "${TEACHER_PORT}" \
-    --tp 2 \
+    --tp "${TEACHER_TP}" \
     --chunked-prefill-size 4096 \
-    --mem-fraction-static 0.72 \
+    --mem-fraction-static "${TEACHER_MEM_FRACTION_STATIC}" \
     --trust-remote-code \
     > "${TEACHER_LOG}" 2>&1
 ) &
@@ -144,7 +148,7 @@ CKPT_ARGS=(
    --ref-load "${STUDENT_TORCH_DIST}"
    --load "${SLIME_SAVE}"
    --save "${SLIME_SAVE}"
-   --save-interval 1
+   --save-interval "${SAVE_INTERVAL}"
 )
 
 ROLLOUT_ARGS=(
@@ -168,6 +172,7 @@ ROLLOUT_ARGS=(
 RM_ARGS=(
    --custom-rm-path training.slime_sii_rollout.teacher_logprob_rm
    --custom-reward-post-process-path training.slime_sii_rollout.post_process_rewards
+   --reward-key scalar_reward
    --rm-url "http://${TEACHER_IP}:${TEACHER_PORT}/generate"
 )
 
@@ -234,15 +239,16 @@ MISC_ARGS=(
 RUNTIME_ENV_JSON=$(cat <<EOF_JSON
 {
   "env_vars": {
-     "PYTHONPATH": "${MEGATRON_PATH}:${REPO_ROOT}:${SLIME_DIR}",
+      "PYTHONPATH": "${REPO_ROOT}:${MEGATRON_PATH}:${SLIME_DIR}",
      "CUDA_DEVICE_MAX_CONNECTIONS": "1",
      "SEARCH_BACKENDS": "${SEARCH_BACKENDS}",
      "WIKI25_INDEX_PATH": "${WIKI25_INDEX_PATH}",
      "BROWSECOMP_INDEX_PATH": "${BROWSECOMP_INDEX_PATH}",
      "SII_SLIME_MAX_STEPS": "${SII_SLIME_MAX_STEPS}",
-     "SII_SLIME_MAX_TURN_TOKENS": "${SII_SLIME_MAX_TURN_TOKENS}",
-     "SII_SLIME_MAX_OBSERVATION_CHARS": "${SII_SLIME_MAX_OBSERVATION_CHARS}",
-    "SII_SLIME_USE_TASK_REWARD": "${SII_SLIME_USE_TASK_REWARD}"
+      "SII_SLIME_MAX_TURN_TOKENS": "${SII_SLIME_MAX_TURN_TOKENS}",
+      "SII_SLIME_MAX_OBSERVATION_CHARS": "${SII_SLIME_MAX_OBSERVATION_CHARS}",
+     "SII_SLIME_USE_TASK_REWARD": "${SII_SLIME_USE_TASK_REWARD}",
+     "SII_SLIME_FORCE_FINAL_STEP": "${SII_SLIME_FORCE_FINAL_STEP}"
   }
 }
 EOF_JSON

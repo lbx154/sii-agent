@@ -1,3 +1,4 @@
+
 """Compatibility launcher for slime Qwen3.5 HF -> Megatron conversion.
 
 slime has Qwen3.5 Megatron specs and mbridge mappings, but the current
@@ -33,6 +34,8 @@ class Qwen35Config(PretrainedConfig):
     def __init__(self, text_config: dict[str, Any] | Qwen35TextConfig | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         if isinstance(text_config, dict):
+            if "tie_word_embeddings" not in text_config and "tie_word_embeddings" in kwargs:
+                text_config = {**text_config, "tie_word_embeddings": kwargs["tie_word_embeddings"]}
             self.text_config = Qwen35TextConfig(**text_config)
         elif text_config is None:
             self.text_config = Qwen35TextConfig()
