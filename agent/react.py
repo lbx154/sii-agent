@@ -23,6 +23,7 @@ BENCHMARK_TOOLS = (
     "browsecomp_open",
     "browser_open",
     "browser_open_many",
+    "browser_read",
     "final_answer",
 )
 VISUAL_TOOLS = (
@@ -35,6 +36,7 @@ VISUAL_TOOLS = (
     "reverse_image_search",
     "browser_open",
     "browser_open_many",
+    "browser_read",
     "final_answer",
 )
 RICH_TOOLS = (
@@ -47,6 +49,7 @@ RICH_TOOLS = (
     "image_to_search_queries",
     "browser_open",
     "browser_open_many",
+    "browser_read",
     "browser_text",
     "browser_click",
     "browser_type",
@@ -61,6 +64,7 @@ MEMORY_TOOLS = (
     "browsecomp_open",
     "browser_open",
     "browser_open_many",
+    "browser_read",
     "memory_search",
     "memory_stats",
     "memory_list",
@@ -89,6 +93,7 @@ _RESEARCH_TOOLS = {
     "wiki_page",
     "browser_open",
     "browser_open_many",
+    "browser_read",
     "browser_text",
     "browser_click",
     "browser_type",
@@ -104,6 +109,7 @@ _COMPACT_CONTEXT_PREFIX = "COMPACT_CONTEXT_UPDATE:"
 _EVIDENCE_SUMMARY_IMMEDIATE_TOOLS = {
     "browser_open",
     "browser_open_many",
+    "browser_read",
     "browser_text",
     "visual_web_search",
     "image_to_text",
@@ -140,7 +146,8 @@ Rules:
 - For distinctive phrases or unusual clue wording, run an early exact quoted-phrase search instead of only broad paraphrases.
 - For hard web-research questions, do not stop at the first plausible candidate. Keep searching until the answer-specific constraint is verified or the tool budget is exhausted.
 - If a browser result is blocked, redirected to an unrelated domain, or lacks the requested answer field, prefer a targeted `web_search` for the exact entity plus answer-field phrase before switching entities.
-- Never put uncertainty, explanations, or "not found" narratives in `final_answer.answer`; it must be only the best concise answer span.
+- Never put uncertainty, explanations, or "not found" narratives in `final_answer.answer`; it must be only the best concise answer span plus any required citation.
+- Before `final_answer`, run a compact final gate: the proposed answer span must appear in current tool evidence, satisfy the requested answer type, and have no unresolved contradiction in your current constraint/candidate state.
 - For person names, copy the full source-backed name exactly, including all given names and particles/casing (e.g. do not shorten a multi-token first name).
 - Answer in the same language as the user question when possible; for Chinese questions, prefer the common Chinese name/phrase over an English alias.
 - Use only as many evidence tool calls as needed, but verify the final answer span. Training memory CRUD calls are allowed when the rules require them.
@@ -195,7 +202,7 @@ def _tool_rules(allowed_tools: tuple[str, ...]) -> str:
     rules: list[str] = []
     if "memory_search" in tools:
         rules.append(
-            "- Early in the task, generate 2-6 focused query phrases yourself (entities, relation words, task pattern, likely failure mode), then call `memory_search` with both the full question and `queries`. It returns compressed actionable guidance plus compact record ids; use memory_get only when you need full content for update/delete."
+            "- Do not call `memory_search` as the first evidence step. First gather 1-3 current evidence/search/page observations or identify a concrete candidate/failure state, then call `memory_search` with the full question plus 2-6 focused phrases as a checklist for search recovery or candidate verification. It returns procedural guidance plus full redacted record refs; use them only as a checklist, not evidence."
         )
     if "memory_search" in tools and _runtime_mode() == "test":
         rules.append("- Runtime mode is `test`: memory is read-only; retrieve useful records but do not create, update, or delete memory.")
@@ -213,15 +220,18 @@ def _tool_rules(allowed_tools: tuple[str, ...]) -> str:
         rules.append("- Use `wiki_search` and `wiki_page` for offline encyclopedic facts when available.")
     if "browsecomp_search" in tools:
         rules.append(
-            "- Use `browsecomp_search` for text-only BrowseComp-style web-research questions; it searches the local fixed corpus and often beats live web search for obscure clue chains. Start with distinctive quoted phrases or rare entity/constraint terms, then refine."
+            "- Use `browsecomp_search` for text-only BrowseComp-style web-research questions; it is BM25 lexical search over the local fixed corpus, not semantic QA and not live web. Make the model generate short lexical queries: usually 2-6 tokens with a rare entity/phrase/date plus one distinguishing clue. Do NOT paste the full question, do NOT stuff all constraints into one query, and do NOT use boolean OR syntax. If hits are generic, add a rare anchor; if no hits, remove one term or try an exact quoted phrase. Bad: `CEO married university founded backed company 2021`. Better: `\"founded Tencent\" wife university` or `\"Ma Huateng\" wife`."
         )
     if "browsecomp_open" in tools:
-        rules.append("- Use `browsecomp_open` to retrieve a full local BrowseComp document by docid returned from `browsecomp_search`.")
+        rules.append("- Use `browsecomp_open` to retrieve a full local BrowseComp document by docid returned from `browsecomp_search`; open at least one promising docid before finalizing unless a search snippet already quotes the exact answer span.")
     if "browser_open" in tools:
         rules.append(
-            "- Use `browser_open` to read one promising URL; it reads the full page and returns query-focused excerpts when possible. "
+            "- Use `browser_open` to inspect one promising URL. Very large pages/PDFs return a manifest with `raw_cache_path` instead of flooding the prompt; "
+            "call `browser_read` on that path with targeted query terms or ranges to inspect needed full-text chunks. "
             "If the returned title/url belongs to a different site than requested, treat it as a source mismatch, not as evidence for a new entity."
         )
+    if "browser_read" in tools:
+        rules.append("- Use `browser_read` only with a raw_cache_path returned by browser_open/browser_text; prefer targeted `query` reads before sequential chunks.")
     if "browser_open_many" in tools:
         rules.append("- Use `browser_open_many` to read several independent source URLs concurrently.")
     if "visual_web_search" in tools:
@@ -254,7 +264,9 @@ def _system_prompt(allowed_tools: tuple[str, ...], extra_system: str | None) -> 
             "Maintain a compact constraint table: requested answer type, required constraints, candidate entities, "
             "satisfied/missing/contradicted evidence, and the next targeted query. If an `EVIDENCE_STATE_UPDATE` "
             "appears, treat it as a working synthesis, not independent evidence. Preserve high-confidence candidates "
-            "unless a source-backed contradiction shows they fail; never switch entities only because a page redirected."
+            "unless a source-backed contradiction shows they fail; never switch entities only because a page redirected. "
+            "Before final_answer, choose only a candidate whose answer-specific field is source-backed and whose required "
+            "constraints are not marked missing or contradicted."
         )
     if _env_bool("SII_AGENT_CONTEXT_COMPACT", False):
         sys += (
@@ -286,29 +298,26 @@ def _overall_memory_guidance() -> str:
         return ""
     if not isinstance(data, dict):
         return ""
-    try:
-        configured_limit = int(os.getenv("SII_MEMORY_OVERALL_PROMPT_MAX_CHARS", "1600"))
-    except ValueError:
-        configured_limit = 1600
-    max_chars = max(400, min(2400, configured_limit))
+    def full_text(value: object) -> str:
+        return " ".join(str(value or "").split())
+
     lines = [
         "Use this as process guidance only; it is not evidence for the current answer.",
-        _clip_prompt_text(data.get("overall"), max_chars),
+        full_text(data.get("overall")),
     ]
     categories = data.get("categories")
     if isinstance(categories, list):
-        for item in categories[:6]:
+        for item in categories:
             if not isinstance(item, dict):
                 continue
-            pattern = _clip_prompt_text(item.get("pattern"), 80)
-            guidance = _clip_prompt_text(item.get("guidance"), 220)
+            pattern = full_text(item.get("pattern"))
+            guidance = full_text(item.get("guidance"))
             if pattern and guidance:
                 lines.append(f"- {pattern}: {guidance}")
     avoid = data.get("avoid")
     if isinstance(avoid, list) and avoid:
-        lines.append("Avoid: " + "; ".join(_clip_prompt_text(item, 140) for item in avoid[:4] if item))
-    rendered = "\n".join(line for line in lines if line).strip()
-    return _clip_prompt_text(rendered, max_chars)
+        lines.append("Avoid: " + "; ".join(full_text(item) for item in avoid if item))
+    return "\n".join(line for line in lines if line).strip()
 
 
 def _internal_gold_verify_enabled(expected: str | None) -> bool:
@@ -332,14 +341,8 @@ def _browser_extract_query(question: str) -> str:
 
 
 def _with_browser_extract_query(name: str, args: dict[str, Any], question: str) -> dict[str, Any]:
-    if name not in _BROWSER_EXTRACT_TOOLS or str(args.get("extract_query") or "").strip():
-        return args
-    extract_query = _browser_extract_query(question)
-    if not extract_query:
-        return args
-    updated = dict(args)
-    updated["extract_query"] = extract_query
-    return updated
+    # Keep browser observations as complete tool outputs; do not auto-request excerpts.
+    return args
 
 
 def _tool_count(counts: dict[str, int], names: set[str]) -> int:
@@ -450,6 +453,18 @@ def _clean_text_final_answer(text: str) -> str:
     if match:
         value = match.group(1).strip()
     return value
+
+
+_FINAL_URL_CITATION_RE = re.compile(r"https?://[^\s\])}>\"']+", flags=re.IGNORECASE)
+_FINAL_BRACKET_CITATION_RE = re.compile(
+    r"\[(?:\s*(?:docid|doc|source|citation)\s*[:#]?\s*)?(?:https?://[^\]\s]+|[A-Za-z0-9_.:-]{2,})\s*\]",
+    flags=re.IGNORECASE,
+)
+
+
+def _has_final_citation(answer: str, rationale: str) -> bool:
+    text = f"{answer}\n{rationale}"
+    return bool(_FINAL_URL_CITATION_RE.search(text) or _FINAL_BRACKET_CITATION_RE.search(text))
 
 
 def _extract_final_answer_args_from_text(content: str) -> dict[str, str] | None:
@@ -684,7 +699,6 @@ def _auto_prefetch_memory(
         "query": question,
         "queries": _prefetch_memory_queries(question),
         "k": _env_int("SII_MEMORY_AUTO_PREFETCH_K", 6, 1, 20),
-        "guidance_max_chars": _env_int("SII_MEMORY_AUTO_PREFETCH_GUIDANCE_CHARS", 900, 240, 1800),
         "auto_prefetch": True,
     }
     tool_result = dispatch("memory_search", args)
@@ -700,6 +714,116 @@ def _auto_prefetch_memory(
         messages.insert(0, {"role": "system", "content": prefetch_note})
     res.tool_call_counts["memory_search_prefetch"] = res.tool_call_counts.get("memory_search_prefetch", 0) + 1
     _append_tool_event(res, "memory_search", args, tool_result, original_name="memory_search_prefetch")
+
+
+def _memory_after_evidence_enabled(active_tools: tuple[str, ...]) -> bool:
+    return (
+        "memory_search" in active_tools
+        and _runtime_mode() == "test"
+        and _env_bool("SII_MEMORY_AUTO_AFTER_EVIDENCE", False)
+    )
+
+
+def _has_effective_memory_search(res: HarnessResult) -> bool:
+    for event in res.trajectory:
+        if not isinstance(event, dict) or event.get("role") != "tool" or event.get("name") != "memory_search":
+            continue
+        parsed = _safe_json(str(event.get("content") or ""))
+        if not isinstance(parsed, dict):
+            return True
+        guidance = parsed.get("guidance") if isinstance(parsed.get("guidance"), dict) else {}
+        if guidance.get("summary_source") != "deferred_until_evidence":
+            return True
+    return False
+
+
+def _auto_memory_queries(question: str, evidence_state: dict[str, Any]) -> list[str]:
+    queries = [
+        "multi-hop constraint verification",
+        "candidate verification against current evidence",
+        "search recovery for partial constraint matches",
+        "exact final answer span format",
+    ]
+    if isinstance(evidence_state, dict):
+        summary = str(evidence_state.get("summary") or "")
+        if summary:
+            queries.append(_clip_prompt_text(summary, 160))
+        for key in ("next_searches", "unresolved", "pitfalls"):
+            value = evidence_state.get(key)
+            if isinstance(value, list):
+                for item in value[:2]:
+                    queries.append(_clip_prompt_text(item, 120))
+            elif isinstance(value, str):
+                queries.append(_clip_prompt_text(value, 120))
+    queries.extend(_prefetch_memory_queries(question))
+    seen: set[str] = set()
+    out: list[str] = []
+    for query in queries:
+        clean = " ".join(str(query or "").split())[:160]
+        key = clean.lower()
+        if not clean or key in seen:
+            continue
+        out.append(clean)
+        seen.add(key)
+        if len(out) >= 6:
+            break
+    return out
+
+
+def _maybe_auto_memory_after_evidence(
+    res: HarnessResult,
+    messages: list[dict],
+    question: str,
+    user_content: Any | None,
+    task: str | None,
+    evidence_state: dict[str, Any],
+    active_tools: tuple[str, ...],
+) -> bool:
+    if not _memory_after_evidence_enabled(active_tools):
+        return False
+    if _has_effective_memory_search(res):
+        return False
+    research_calls = _tool_count(res.tool_call_counts, _RESEARCH_TOOLS)
+    min_evidence = _env_int("SII_MEMORY_AUTO_AFTER_EVIDENCE_MIN_TOOLS", 1, 1, 5)
+    max_evidence = _env_int("SII_MEMORY_AUTO_AFTER_EVIDENCE_MAX_TOOLS", 3, 1, 12)
+    if research_calls < min_evidence or research_calls > max_evidence:
+        return False
+    set_tool_context(
+        question=question,
+        user_content=user_content if user_content is not None else question,
+        task=task,
+        trajectory=list(res.trajectory),
+        step=res.steps,
+    )
+    args = {
+        "query": question,
+        "queries": _auto_memory_queries(question, evidence_state),
+        "k": _env_int("SII_MEMORY_AUTO_AFTER_EVIDENCE_K", 3, 1, 6),
+        "include_lessons": True,
+        "include_episodes": False,
+        "include_skills": False,
+    }
+    tool_result = dispatch("memory_search", args)
+    res.tool_calls += 1
+    res.tool_call_counts["memory_search"] = res.tool_call_counts.get("memory_search", 0) + 1
+    _append_tool_event(res, "memory_search", args, tool_result, original_name="memory_search_auto_after_evidence")
+    note = (
+        "AUTOMATIC_MEMORY_AFTER_EVIDENCE_RESULT:\n"
+        "This read-only memory result was retrieved after current evidence existed. "
+        "Use it only as a short checklist for search recovery/candidate verification; it is not evidence.\n"
+        f"{tool_result}"
+    )
+    messages.append({"role": "user", "content": note})
+    if _env_bool("SII_MEMORY_AUTO_AFTER_EVIDENCE_ONCE_NOTICE", True):
+        res.trajectory.append(
+            {
+                "role": "system",
+                "name": "memory_auto_after_evidence",
+                "args": {"research_calls": research_calls, "query_count": len(args["queries"])},
+                "content": "Injected memory checklist after current evidence.",
+            }
+        )
+    return True
 
 
 def _apply_final_tool_call(res: HarnessResult, tc: Any) -> bool:
@@ -719,8 +843,10 @@ def _apply_final_tool_call(res: HarnessResult, tc: Any) -> bool:
     answer = answer.strip()
     if not answer or _looks_invalid_final_answer(answer):
         return False
-    res.final_answer = answer
     rationale, _ = _split_inline_reasoning(str(args.get("rationale", "")))
+    if _env_bool("SII_FINAL_REQUIRE_CITATION", False) and not _has_final_citation(answer, rationale):
+        return False
+    res.final_answer = answer
     res.rationale = rationale
     res.stop_reason = "final"
     return True
@@ -736,8 +862,13 @@ def _looks_invalid_final_answer(answer: str) -> bool:
         "the answer should be",
         "has not been found",
         "cannot be found",
+        "could not find",
+        "no valid answer",
+        "no answer found",
+        "not enough information",
         "not publicly available",
         "not indexed",
+        "not found",
         "no search results",
         "unable to find",
         "i could not",
@@ -753,6 +884,203 @@ def _looks_invalid_final_answer(answer: str) -> bool:
     return False
 
 
+def _strip_support_citations(text: str | None) -> str:
+    value = str(text or "")
+    value = _FINAL_URL_CITATION_RE.sub(" ", value)
+    value = _FINAL_BRACKET_CITATION_RE.sub(" ", value)
+    return value
+
+
+def _support_key(text: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", _strip_support_citations(text).lower()).strip()
+
+
+def _tool_evidence_supports_answer(answer: str | None, result: HarnessResult) -> bool:
+    answer_key = _support_key(answer)
+    if len(answer_key) < 3 or answer_key in {"yes", "no"}:
+        return False
+    variants = {answer_key}
+    raw_answer = _strip_support_citations(answer)
+    if "," in raw_answer:
+        first_part = _support_key(raw_answer.split(",", 1)[0])
+        if len(first_part) >= 3:
+            variants.add(first_part)
+    evidence_parts = [
+        str(event.get("content") or "")
+        for event in result.trajectory
+        if (
+            isinstance(event, dict)
+            and event.get("role") == "tool"
+            and event.get("name") not in {"memory_search", "final_answer"}
+        )
+    ]
+    evidence = _support_key("\n".join(evidence_parts))
+    return bool(evidence) and any(variant and variant in evidence for variant in variants)
+
+
+def _final_claim_is_hedged(answer: str | None, rationale: str | None) -> bool:
+    haystack = f"{answer or ''}\n{rationale or ''}".lower()
+    hedges = (
+        "best guess",
+        "best-supported guess",
+        "cannot verify",
+        "could not verify",
+        "not verified",
+        "no definitive",
+        "not definitive",
+        "insufficient evidence",
+        "incomplete evidence",
+        "not enough evidence",
+        "most likely",
+        "likely answer",
+        "appears to be",
+        "seems to be",
+        "i think",
+        "i will submit",
+    )
+    return any(phrase in haystack for phrase in hedges)
+
+
+def _unsupported_hedged_final_block(answer: str, rationale: str, result: HarnessResult) -> str | None:
+    if not _env_bool("SII_FINAL_ANSWER_HEDGED_EVIDENCE_GATE", False):
+        return None
+    if not _final_claim_is_hedged(answer, rationale):
+        return None
+    if _tool_evidence_supports_answer(answer, result):
+        return None
+    return (
+        "ERROR: final_answer rejected - the proposed answer is hedged/uncertain and the answer span "
+        "does not appear in current tool evidence. Do not guess. Run one targeted BM25/web query or "
+        "open a promising BrowseComp docid to verify the exact answer span, then submit only the "
+        "source-backed concise answer."
+    )
+
+
+def _bm25_query_quality(args: dict[str, Any]) -> dict[str, Any] | None:
+    query = " ".join(str(args.get("query") or "").split())
+    if not query:
+        return None
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9'.-]*", query)
+    lowered = [token.lower() for token in tokens]
+    stopwords = {
+        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "in",
+        "is", "it", "of", "on", "or", "that", "the", "this", "to", "was", "were", "who",
+        "whose", "with",
+    }
+    rareish = [token for token in tokens if len(token) >= 5 and token.lower() not in stopwords]
+    return {
+        "query": query,
+        "token_count": len(tokens),
+        "has_quote": bool(re.search(r"[\"'“”]", query)),
+        "rareish_token_count": len(rareish),
+        "stopword_fraction": round(
+            (sum(1 for token in lowered if token in stopwords) / max(1, len(tokens))),
+            3,
+        ),
+        "looks_too_long": len(tokens) > 10,
+    }
+
+
+def _normalize_original_problem_prompt(original_prompt: str | None, fallback_question: str) -> str:
+    if original_prompt is not None:
+        cleaned = str(original_prompt).strip()
+        if cleaned:
+            return cleaned
+    return str(fallback_question or "").strip()
+
+
+_EVIDENCE_GATE_TRIVIAL = {
+    "",
+    "none",
+    "none.",
+    "none yet",
+    "none yet.",
+    "n/a",
+    "na",
+    "-",
+    "—",
+    "unknown",
+    "tbd",
+    "not applicable",
+}
+
+
+def _evidence_blocks_final_answer(
+    answer: str,
+    evidence_state: dict[str, Any] | None,
+) -> str | None:
+    """Return a blocker message when the latest evidence_state contains explicit
+    contradictions or a low-confidence/conflicted candidate matching the submitted
+    answer; otherwise return None. Acts as a hard-gate so the model cannot commit
+    when its own bookkeeping says the answer is unsafe.
+    """
+    if not _env_bool("SII_FINAL_ANSWER_EVIDENCE_GATE", False):
+        return None
+    if not isinstance(evidence_state, dict):
+        return None
+    ans_norm = " ".join(str(answer or "").strip().lower().split())
+    if not ans_norm:
+        return None
+    blockers: list[str] = []
+    for c in (evidence_state.get("constraints") or []):
+        if not isinstance(c, dict):
+            continue
+        status = str(c.get("status") or "").strip().lower()
+        if status == "contradicted":
+            blockers.append(
+                "CONSTRAINT CONTRADICTED: "
+                f"{_clip_prompt_text(c.get('constraint'), 200)!r}"
+                f" (evidence: {_clip_prompt_text(c.get('evidence'), 200)!r})"
+            )
+    matched: dict[str, Any] | None = None
+    for cand in (evidence_state.get("candidates") or []):
+        if not isinstance(cand, dict):
+            continue
+        name = " ".join(str(cand.get("name") or "").strip().lower().split())
+        if not name:
+            continue
+        if name == ans_norm or name in ans_norm or ans_norm in name:
+            matched = cand
+            break
+    if matched is not None:
+        conflicts = str(matched.get("conflicts") or "").strip()
+        conflicts_l = conflicts.lower().rstrip(". ")
+        if (
+            conflicts
+            and conflicts_l not in _EVIDENCE_GATE_TRIVIAL
+            and not conflicts_l.startswith("none")
+        ):
+            blockers.append(
+                "CANDIDATE HAS KNOWN CONFLICTS: "
+                f"{_clip_prompt_text(matched.get('name'), 120)!r}"
+                f" -> {_clip_prompt_text(conflicts, 240)!r}"
+            )
+        confidence = str(matched.get("confidence") or "").strip().lower()
+        if confidence == "low":
+            missing = str(matched.get("missing") or "").strip()
+            missing_l = missing.lower().rstrip(". ")
+            if (
+                missing
+                and missing_l not in _EVIDENCE_GATE_TRIVIAL
+                and not missing_l.startswith("none")
+            ):
+                blockers.append(
+                    "CANDIDATE CONFIDENCE LOW with unresolved missing checks: "
+                    f"{_clip_prompt_text(missing, 240)!r}"
+                )
+    if not blockers:
+        return None
+    return (
+        "ERROR: final_answer rejected — your own evidence_state still flags unresolved issues:\n"
+        + "\n".join(f"  - {b}" for b in blockers)
+        + "\nDo NOT immediately re-submit the same answer. Do one of:\n"
+        "  (a) Run targeted web_search / browser tools to resolve the contradiction; or\n"
+        "  (b) Switch to a candidate that satisfies every constraint; or\n"
+        "  (c) After fresh source-backed evidence, update evidence_state so the conflict is\n"
+        "      explicitly resolved, then call final_answer again."
+    )
+
+
 def _append_tool_event(
     res: HarnessResult,
     name: str,
@@ -765,6 +1093,17 @@ def _append_tool_event(
     if original_name and original_name != name:
         event["original_name"] = original_name
     res.trajectory.append(event)
+    if name == "browsecomp_search":
+        quality = _bm25_query_quality(args)
+        if quality is not None:
+            res.trajectory.append(
+                {
+                    "role": "system",
+                    "name": "bm25_query_quality",
+                    "args": quality,
+                    "content": "BM25 query diagnostic only; not evidence.",
+                }
+            )
 
 
 def _messages_with_short_memory(
@@ -1000,6 +1339,7 @@ def _remove_prior_evidence_messages(messages: list[dict]) -> None:
 def _summarize_evidence_state(
     *,
     question: str,
+    original_prompt: str | None,
     user_content: Any | None,
     task: str | None,
     previous_state: dict[str, Any],
@@ -1023,7 +1363,10 @@ def _summarize_evidence_state(
         )
         payload = {
             "task": task or "",
-            "original_prompt": _clip_prompt_text(question, 2400),
+            "original_prompt": _clip_prompt_text(
+                _normalize_original_problem_prompt(original_prompt, question),
+                2400,
+            ),
             "previous_evidence_state": previous_state or {},
             "new_tool_observations": pending_evidence[-6:],
             "schema": {
@@ -1107,8 +1450,25 @@ def _render_compact_context(state: dict[str, Any], max_chars: int | None = None)
     return _clip_prompt_text(json.dumps(state or {}, ensure_ascii=False, indent=2), limit)
 
 
-def _normalize_compact_context(parsed: dict[str, Any], previous: dict[str, Any], step: int) -> dict[str, Any]:
-    state = dict(previous or {})
+def _normalize_compact_context(
+    parsed: dict[str, Any],
+    previous: dict[str, Any],
+    step: int,
+    *,
+    original_prompt: str | None = None,
+) -> dict[str, Any]:
+    original_limit = _env_int("SII_CONTEXT_COMPACT_ORIGINAL_PROMPT_CHARS", 2400, 400, 8000)
+    original_value = (
+        original_prompt
+        if original_prompt is not None
+        else parsed.get("original_prompt") or (previous or {}).get("original_prompt")
+    )
+    state: dict[str, Any] = {}
+    if original_value:
+        state["original_prompt"] = _clip_prompt_text(original_value, original_limit)
+    for key, value in (previous or {}).items():
+        if key != "original_prompt":
+            state[key] = value
     for key, limit in (
         ("task_summary", 700),
         ("answer_target", 300),
@@ -1276,6 +1636,7 @@ def _rebuild_messages_after_compaction(
 def _summarize_compact_context(
     *,
     question: str,
+    original_prompt: str | None,
     user_content: Any | None,
     task: str | None,
     previous_compact: dict[str, Any],
@@ -1285,21 +1646,27 @@ def _summarize_compact_context(
     timeout: float,
 ) -> tuple[dict[str, Any] | None, str, str | None]:
     try:
+        compact_original_prompt = _clip_prompt_text(
+            original_prompt or question,
+            _env_int("SII_CONTEXT_COMPACT_ORIGINAL_PROMPT_CHARS", 2400, 400, 8000),
+        )
         system = (
             "You compact a ReAct agent's earlier context into structured state. "
+            "The original problem prompt is authoritative and MUST be copied into the output as `original_prompt`; "
+            "do not replace it with a paraphrase, failed candidate summary, or compacted task summary. "
             "Preserve all information needed to continue solving: original answer target, constraints, source-backed evidence, "
             "candidate status, useful tool history, memory guidance, rejected/contradicted candidates, unresolved checks, and next plan. "
             "Do not invent facts or final answers. Rejections are tentative unless directly contradicted by evidence. "
             "If recent trace shows a redirect/source mismatch or blocked page, preserve the prior candidate and mark the page as unusable; "
             "do not switch entities based only on that page. "
             "Do not promote candidates that fail required constraints; keep them as rejected_or_contradicted or low-confidence only. "
-            "Return strict JSON only with keys: task_summary, answer_target, current_status, constraints, evidence, candidates, "
+            "Return strict JSON only with keys: original_prompt, task_summary, answer_target, current_status, constraints, evidence, candidates, "
             "tool_history, rejected_or_contradicted, unresolved, next_plan, memory_guidance, pitfalls."
         )
         payload = {
             "task": task or "",
             "step": step,
-            "original_prompt": _clip_prompt_text(question, 2400),
+            "original_prompt": compact_original_prompt,
             "previous_compact_context": previous_compact or {},
             "latest_evidence_state": evidence_state or {},
             "recent_trace": _compact_trajectory_for_context(
@@ -1308,6 +1675,7 @@ def _summarize_compact_context(
             ),
             "rules": [
                 "Keep only durable facts and decisions needed for future steps.",
+                "Copy original_prompt into the output exactly as provided; it prevents drift from compacted or failed-candidate assumptions.",
                 "For each candidate, note supported constraints, missing checks, and conflicts.",
                 "Preserve prior high-confidence candidates unless source-backed evidence proves they fail a required constraint.",
                 "Keep next_plan as targeted searches or pages to open, not broad instructions.",
@@ -1335,6 +1703,7 @@ def _summarize_compact_context(
             fallback = _normalize_compact_context(
                 {
                     "task_summary": "Compact fallback from existing evidence state and recent trace.",
+                    "original_prompt": compact_original_prompt,
                     "answer_target": _clip_prompt_text(question, 300),
                     "current_status": _clip_prompt_text((evidence_state or {}).get("summary"), 500),
                     "constraints": (evidence_state or {}).get("constraints") or [],
@@ -1356,9 +1725,10 @@ def _summarize_compact_context(
                 },
                 previous_compact,
                 step,
+                original_prompt=compact_original_prompt,
             )
             return fallback, _render_compact_context(fallback), None
-        compact = _normalize_compact_context(parsed, previous_compact, step)
+        compact = _normalize_compact_context(parsed, previous_compact, step, original_prompt=compact_original_prompt)
         rendered = _render_compact_context(compact)
         return compact, rendered, None
     except Exception as exc:  # noqa: BLE001
@@ -1372,10 +1742,12 @@ def run_react(
     expected: str | None = None,
     task: str | None = None,
     user_content: Any | None = None,
+    original_prompt: str | None = None,
 ) -> HarnessResult:
     cfg = cfg or HarnessConfig()
     guard = StepGuard(cfg)
     res = HarnessResult()
+    original_prompt_text = _normalize_original_problem_prompt(original_prompt, question)
     short_memory = ShortTermMemory(question, max_chars=cfg.short_memory_max_chars) if cfg.use_short_memory else None
 
     allowed_tools = cfg.allowed_tools or _profile_tools()
@@ -1409,11 +1781,17 @@ def run_react(
     budget_messages_sent: set[str] = set()
     evidence_enabled = _evidence_summary_enabled(allowed_tools)
     context_compact_enabled = _context_compact_enabled()
+    retry_query_repair_mode = "[Retry query-repair mode]" in str(extra_system or "")
     evidence_state: dict[str, Any] = {}
     compact_context: dict[str, Any] = {}
     pending_evidence: list[dict[str, Any]] = []
     web_searches_since_summary = 0
     compact_failures = 0
+    auto_memory_after_evidence_attempted = False
+    final_answer_gate_rejects = 0
+    terminal_final_gate_blocked = False
+    terminal_final_gate_message = ""
+    retry_open_gate_rejected = False
 
     def append_budget_message_once(key: str, content: str) -> None:
         if key in budget_messages_sent:
@@ -1467,10 +1845,47 @@ def run_react(
                 "browsecomp_first",
                 (
                     "This text-only row has access to the official local BrowseComp BM25 index. "
-                    "First call `browsecomp_search` with distinctive phrases/constraints from the question. "
+                    "First call `browsecomp_search` with a short lexical query (2-6 rare terms, quoted phrase/name/date if available), "
+                    "not the full question or all constraints at once. "
                     "Use live web_search only after checking the local corpus."
                 ),
             )
+        if not pending_train_actions and "browsecomp_search" in active_tools:
+            browsecomp_search_calls = int(res.tool_call_counts.get("browsecomp_search") or 0)
+            browsecomp_open_calls = int(res.tool_call_counts.get("browsecomp_open") or 0)
+            if retry_query_repair_mode:
+                browsecomp_max_searches = _env_int("SII_BROWSECOMP_RETRY_SEARCH_MAX", 0, 0, 50)
+                browsecomp_must_open_after = _env_int("SII_BROWSECOMP_RETRY_MUST_OPEN_AFTER", 0, 0, 50)
+            else:
+                browsecomp_max_searches = _env_int("SII_BROWSECOMP_SEARCH_MAX", 0, 0, 50)
+                browsecomp_must_open_after = _env_int("SII_BROWSECOMP_MUST_OPEN_AFTER", 0, 0, 50)
+            search_cap_hit = browsecomp_max_searches > 0 and browsecomp_search_calls >= browsecomp_max_searches
+            open_due = (
+                browsecomp_must_open_after > 0
+                and browsecomp_search_calls >= browsecomp_must_open_after
+                and browsecomp_open_calls <= 0
+                and "browsecomp_open" in active_tools
+            )
+            if search_cap_hit or open_due:
+                active_tools = tuple(name for name in active_tools if name != "browsecomp_search")
+                if open_due:
+                    append_budget_message_once(
+                        "browsecomp_open_due",
+                        (
+                            f"You have already used {browsecomp_search_calls} BrowseComp BM25 searches without opening a document. "
+                            "Stop issuing new BM25 queries. Use browsecomp_open on the most promising docid already shown, "
+                            "or call final_answer if the exact answer span is already supported."
+                        ),
+                    )
+                elif search_cap_hit:
+                    append_budget_message_once(
+                        "browsecomp_search_cap",
+                        (
+                            f"You have reached the BrowseComp BM25 search budget ({browsecomp_search_calls}/{browsecomp_max_searches}). "
+                            "Do not run more BM25 searches. Open a promising docid, use a different evidence tool only if essential, "
+                            "or call final_answer with the best source-backed answer."
+                        ),
+                    )
         if not pending_train_actions:
             if cfg.max_research_tool_calls > 0 and research_calls >= cfg.max_research_tool_calls:
                 active_tools = ("final_answer",)
@@ -1479,7 +1894,7 @@ def run_react(
                     (
                         f"You have used the evidence tool budget ({research_calls}/{cfg.max_research_tool_calls}). "
                         "Stop searching and call `final_answer` now with the best concise answer supported by the "
-                        "evidence already gathered. The answer field must be only the concise answer span, not an explanation."
+                        "evidence already gathered. The answer field must be only the concise answer span plus citation, not an explanation."
                     ),
                 )
             else:
@@ -1490,7 +1905,7 @@ def run_react(
                         "web_search_cap",
                         (
                             f"You have already used {web_search_calls} web_search calls. Stop broad web searching; "
-                            "use a targeted page/wiki/image check only if essential, otherwise call `final_answer` with only a concise answer span."
+                            "use a targeted page/wiki/image check only if essential, otherwise call `final_answer` with only a concise cited answer span."
                         ),
                     )
                 if cfg.synthesize_after_tool_calls > 0 and research_calls >= cfg.synthesize_after_tool_calls:
@@ -1508,7 +1923,7 @@ def run_react(
                     "role": "user",
                     "content": (
                         "This is the final step. Submit your best concise answer now with `final_answer`. "
-                        "The answer field must be only a name/title/date/number/short phrase; do not include uncertainty or explanation."
+                        "The answer field must be only a name/title/date/number/short phrase plus one citation ([docid] or [URL]); do not include uncertainty or explanation."
                     ),
                 }
             )
@@ -1523,6 +1938,22 @@ def run_react(
                     ),
                 }
             )
+        if (
+            not pending_train_actions
+            and not auto_memory_after_evidence_attempted
+            and not res.final_answer
+            and guard.time_left() >= cfg.min_llm_call_seconds
+            and _maybe_auto_memory_after_evidence(
+                res,
+                messages,
+                question,
+                user_content,
+                task,
+                evidence_state,
+                active_tools,
+            )
+        ):
+            auto_memory_after_evidence_attempted = True
         specs = tool_specs(active_tools)
         time_left = guard.time_left()
         if time_left <= 0:
@@ -1619,8 +2050,8 @@ def run_react(
                     {
                         "role": "user",
                         "content": (
-                            "The previous response was not a concise answer span. Call `final_answer` with only the "
-                            "best candidate name/title/date/number; do not explain uncertainty in the answer field."
+                            "The previous response was not a concise cited answer span. Call `final_answer` with only the "
+                            "best candidate name/title/date/number plus one citation ([docid] or [URL]); do not explain uncertainty in the answer field."
                         ),
                     }
                 )
@@ -1680,12 +2111,61 @@ def run_react(
             res.tool_call_counts[name] = res.tool_call_counts.get(name, 0) + 1
 
             if name == "final_answer":
+                gate_max = _env_int("SII_FINAL_ANSWER_EVIDENCE_GATE_MAX_REJECTS", 2, 0, 10)
+                gate_min_time = _env_int("SII_FINAL_ANSWER_EVIDENCE_GATE_MIN_TIME_LEFT", 60, 0, 600)
+                gate_should_run = (
+                    final_answer_gate_rejects < gate_max
+                    and guard.time_left() >= gate_min_time
+                )
+                if gate_should_run:
+                    gate_args = _safe_json(tc.function.arguments or "{}") or {}
+                    gate_answer = str(gate_args.get("answer", "")).strip()
+                    gate_rationale = str(gate_args.get("rationale", "")).strip()
+                    if (
+                        retry_query_repair_mode
+                        and _env_bool("SII_RETRY_REQUIRE_BROWSECOMP_OPEN", True)
+                        and "browsecomp_open" in active_tools
+                        and int(res.tool_call_counts.get("browsecomp_open") or 0) <= 0
+                        and not retry_open_gate_rejected
+                        and not _tool_evidence_supports_answer(gate_answer, res)
+                    ):
+                        retry_open_gate_rejected = True
+                        final_answer_gate_rejects += 1
+                        block_msg = (
+                            "ERROR: retry final_answer rejected - this retry is in query-repair mode and has not "
+                            "opened any BrowseComp docid, and the answer span is not quoted in current snippets. "
+                            "Call browsecomp_open on the most promising docid from browsecomp_search, or run one "
+                            "short repaired BM25 query if no docid is promising, before final_answer."
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": block_msg,
+                            }
+                        )
+                        _append_tool_event(res, name, gate_args, block_msg, original_name=original_name)
+                        continue
+                    block_msg = _evidence_blocks_final_answer(gate_answer, evidence_state)
+                    if block_msg is None:
+                        block_msg = _unsupported_hedged_final_block(gate_answer, gate_rationale, res)
+                    if block_msg:
+                        final_answer_gate_rejects += 1
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": block_msg,
+                            }
+                        )
+                        _append_tool_event(res, name, gate_args, block_msg, original_name=original_name)
+                        continue
                 if internal_verify_enabled and not has_verified:
                     answer = str(args.get("answer", "")).strip()
                     if not answer:
                         tool_result = (
-                            "ERROR: final_answer requires a concise answer span only (name/title/date/number), not "
-                            "an explanation or 'not found' narrative. Retry with the best concise candidate answer."
+                            "ERROR: final_answer requires a concise answer span plus one citation ([docid] or [URL]), not "
+                            "an explanation or 'not found' narrative. Retry with the best concise cited candidate answer."
                         )
                         messages.append(
                             {
@@ -1701,8 +2181,8 @@ def run_react(
                     if isinstance(parsed_verify, dict) and parsed_verify.get("correct") is True:
                         if not _apply_final_tool_call(res, tc):
                             tool_result = (
-                                "ERROR: final_answer requires a concise answer span only (name/title/date/number), not "
-                                "an explanation or 'not found' narrative. Retry with the best concise candidate answer."
+                                "ERROR: final_answer requires a concise answer span plus one citation ([docid] or [URL]), not "
+                                "an explanation or 'not found' narrative. Retry with the best concise cited candidate answer."
                             )
                             messages.append(
                                 {
@@ -1737,8 +2217,8 @@ def run_react(
                     continue
                 if not _apply_final_tool_call(res, tc):
                     tool_result = (
-                        "ERROR: final_answer requires a concise answer span only (name/title/date/number), not "
-                        "an explanation or 'not found' narrative. Retry with the best concise candidate answer."
+                        "ERROR: final_answer requires a concise answer span plus one citation ([docid] or [URL]), not "
+                        "an explanation or 'not found' narrative. Retry with the best concise cited candidate answer."
                     )
                     messages.append(
                         {
@@ -1811,11 +2291,12 @@ def run_react(
             min_time_left = _env_int("SII_EVIDENCE_SUMMARY_MIN_TIME_LEFT", 70, 20, 180)
             if should_summarize and time_left >= min_time_left:
                 summary_timeout = min(
-                    float(_env_int("SII_EVIDENCE_SUMMARY_TIMEOUT", 30, 5, 90)),
+                    float(_env_int("SII_EVIDENCE_SUMMARY_TIMEOUT", 30, 5, 1800)),
                     max(1.0, time_left - cfg.min_llm_call_seconds),
                 )
                 updated_state, rendered_state, summary_error = _summarize_evidence_state(
                     question=question,
+                    original_prompt=original_prompt_text,
                     user_content=user_content if user_content is not None else question,
                     task=task,
                     previous_state=evidence_state,
@@ -1865,11 +2346,12 @@ def run_react(
                 min_time_left = _env_int("SII_CONTEXT_COMPACT_MIN_TIME_LEFT", 80, 20, 240)
                 if time_left >= min_time_left:
                     compact_timeout = min(
-                        float(_env_int("SII_CONTEXT_COMPACT_TIMEOUT", 30, 5, 120)),
+                        float(_env_int("SII_CONTEXT_COMPACT_TIMEOUT", 30, 5, 1800)),
                         max(1.0, time_left - cfg.min_llm_call_seconds),
                     )
                     updated_compact, rendered_compact, compact_error = _summarize_compact_context(
                         question=question,
+                        original_prompt=original_prompt_text,
                         user_content=user_content if user_content is not None else question,
                         task=task,
                         previous_compact=compact_context,
@@ -1919,14 +2401,18 @@ def run_react(
                             }
                         )
 
-    if not res.final_answer and cfg.finalize_on_stop and guard.time_left() >= cfg.min_llm_call_seconds:
+    if (
+        not res.final_answer
+        and cfg.finalize_on_stop
+        and guard.time_left() >= cfg.min_llm_call_seconds
+    ):
         messages.append(
             {
                 "role": "user",
                 "content": (
                     "The tool budget is exhausted. Based only on the gathered evidence, "
                     "call `final_answer` now with the best concise answer. Return only the answer phrase/name "
-                    "and optional citations/docids; do not add analysis or uncertainty caveats."
+                    "and at least one citation ([docid] or [URL]); do not add analysis or uncertainty caveats."
                 ),
             }
         )
@@ -1965,13 +2451,13 @@ def run_react(
                     continue
                 answer, _ = _split_inline_reasoning(str(args.get("answer", "")))
                 answer = answer.strip()
+                rationale, _ = _split_inline_reasoning(str(args.get("rationale") or ""))
                 if internal_verify_enabled and not has_verified and answer:
-                    verify_result, parsed_verify = internal_verify(answer, str(args.get("rationale") or ""))
+                    verify_result, parsed_verify = internal_verify(answer, rationale)
                     if not (isinstance(parsed_verify, dict) and parsed_verify.get("correct") is True):
                         # No interaction budget remains here. Keep the rejected final answer for scoring;
                         # runner-level gold reflection will force lesson/skill persistence.
                         res.final_answer = answer
-                        rationale, _ = _split_inline_reasoning(str(args.get("rationale") or ""))
                         res.rationale = rationale
                         res.stop_reason = "final"
                         res.tool_calls += 1

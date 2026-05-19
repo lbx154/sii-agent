@@ -272,7 +272,7 @@ def _serper_post(url: str, payload: dict) -> dict:
 
 
 def _jina_fetch(url: str, max_chars: int) -> str:
-    if not url or max_chars <= 0:
+    if not url:
         return ""
     import httpx
 
@@ -286,10 +286,7 @@ def _jina_fetch(url: str, max_chars: int) -> str:
         timeout=_jina_timeout(),
     )
     response.raise_for_status()
-    text = response.text or ""
-    if len(text) > max_chars:
-        return text[:max_chars] + f"\n\n...[truncated at {max_chars} chars]"
-    return text
+    return response.text or ""
 
 
 def _proxy_upload_image_bytes(data: bytes, filename: str, mime: str) -> str:
@@ -560,9 +557,9 @@ def _format_search_rows(results: list, query: str | None = None, limit: int | No
         url = str(item.get("url") or "")
         snippet = str(item.get("snippet") or "")
         content = str(item.get("content") or "")
-        body = snippet[:500]
+        body = snippet
         if content:
-            body = (body + "\n" if body else "") + content[:3000]
+            body = (body + "\n" if body else "") + content
         rows.append(f"[{item.get('rank') or i}] {title}\n    {url}\n    {body}")
         if limit and len(rows) >= limit:
             break
@@ -583,7 +580,7 @@ def _format_proxy_results(payload: dict, query: str | None = None, limit: int | 
 
 def _proxy_text_search(query: str, k: int) -> str:
     fetch = _env_bool("SEARCH_PROXY_FETCH", False)
-    max_chars = _clamp_int(os.getenv("SEARCH_PROXY_MAX_CHARS", "0"), 0, 0, 10000)
+    max_chars = 0
     top_k = k
     if _search_proxy_filter_garbage():
         top_k = min(10, max(k, k + _search_proxy_filter_extra_k()))
@@ -609,7 +606,7 @@ def _serper_text_search(query: str, k: int) -> str:
             "url": url,
             "snippet": str(item.get("snippet") or ""),
         }
-        if fetch and url and max_chars > 0:
+        if fetch and url:
             entry["content"] = _jina_fetch(url, max_chars)
         results.append(entry)
     return _format_search_rows(results, query=query, limit=k)
@@ -626,7 +623,7 @@ def _proxy_image_search(
     image_url = ""
     try:
         image_url = _proxy_image_url(source)
-        payload = {"image_url": image_url, "top_k": k, "fetch": fetch, "max_chars": max_chars}
+        payload = {"image_url": image_url, "top_k": k, "fetch": fetch, "max_chars": 0}
         result = _proxy_post("/search/image", payload)
         if result.get("ok", False):
             return json.dumps(
@@ -704,7 +701,7 @@ def _serper_image_search(
                 "url": url,
                 "snippet": str(item.get("snippet") or item.get("source") or ""),
             }
-            if fetch and url and max_chars > 0:
+            if fetch and url:
                 entry["content"] = _jina_fetch(url, max_chars)
             rows.append(entry)
         return json.dumps(

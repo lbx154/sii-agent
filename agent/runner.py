@@ -35,6 +35,7 @@ class RunOutcome:
     final_refinement: dict | None = None
     gold_verification: dict | None = None
     verified_reflection_memory: dict | None = None
+    short_term_reflection_memory: dict | None = None
 
 
 def _judge(predicted: str | None, expected: str | None) -> bool | None:
@@ -508,13 +509,101 @@ def _reflection_requests_retry(
     return False
 
 
-def _retry_config(cfg: HarnessConfig) -> HarnessConfig:
-    retry_steps = max(4, min(cfg.max_steps, 8))
+_SHORT_TERM_REFLECTION_SKIP_FAILURES = {
+    "",
+    "none",
+    "supported_answer",
+    "correct",
+    "already_correct",
+    "parse_error",
+    "reflection_error",
+}
+
+
+def _short_term_reflection_lessons_enabled() -> bool:
+    return os.getenv("SII_AGENT_REFLECTION_SHORT_TERM_LESSONS", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _persist_short_term_reflection_lesson(
+    memory: MemoryStore,
+    task: str | None,
+    question: str,
+    reflection: dict | None,
+    result: HarnessResult,
+) -> dict | None:
+    if not _short_term_reflection_lessons_enabled():
+        return None
+    if memory.read_only:
+        return {"lesson_added": False, "error": "memory_read_only"}
+    if not isinstance(reflection, dict):
+        return {"lesson_added": False, "error": "reflection_not_json"}
+
+    failure_mode = str(reflection.get("failure_mode") or "").strip().lower()
+    hard_failure = (
+        result.stop_reason != "final"
+        or _low_confidence_answer(result.final_answer)
+        or _verbose_uncertain_answer(result.final_answer)
+        or _self_contradictory_rationale(result.rationale)
+    )
+    if (
+        failure_mode in _SHORT_TERM_REFLECTION_SKIP_FAILURES
+        and not hard_failure
+        and not _reflection_requests_retry(reflection, result, task=task)
+    ):
+        return {"lesson_added": False, "skipped": "reflection_not_actionable", "failure_mode": failure_mode}
+
+    cleaned = _generalize_reflection(reflection)
+    if cleaned is None:
+        return {"lesson_added": False, "error": "reflection_not_json"}
+
+    lesson = Lesson(
+        ts=memory.now(),
+        question=_memory_question(question),
+        failure_mode=_text_field(cleaned.get("failure_mode"), "self_reflection_recovery"),
+        root_cause=_text_field(
+            cleaned.get("root_cause"),
+            "The no-gold self-review found a likely search, evidence, or answer-format failure.",
+        ),
+        corrective_strategy=_text_field(
+            cleaned.get("corrective_strategy"),
+            "Retry with a different focused query/tool path and verify the concise answer span against retrieved evidence.",
+        ),
+        reusable_lesson=_text_field(
+            cleaned.get("reusable_lesson"),
+            "Use no-gold self-review only as a short-lived checklist; verify the final answer from current evidence.",
+        ),
+        outcome="short_term_reflection",
+        score=0.35,
+    )
+    memory.add_lesson(lesson)
+    return {
+        "lesson_added": True,
+        "outcome": lesson.outcome,
+        "failure_mode": lesson.failure_mode,
+    }
+
+
+def _retry_config(cfg: HarnessConfig, task: str | None = None) -> HarnessConfig:
+    if task == "benchmark_csv":
+        retry_steps = max(6, min(cfg.max_steps, 12))
+    else:
+        retry_steps = max(4, min(cfg.max_steps, 8))
     return replace(cfg, max_steps=retry_steps)
 
 
+_FINAL_URL_CITATION_RE = re.compile(r"\[(?:https?://[^\]\s]+|www\.[^\]\s]+)\]")
+_FINAL_BRACKET_CITATION_RE = re.compile(r"\[[A-Za-z0-9][A-Za-z0-9_.:/#?=&+\-]{0,120}\]")
+
+
+def _strip_support_citations(text: str | None) -> str:
+    value = str(text or "")
+    value = _FINAL_URL_CITATION_RE.sub(" ", value)
+    value = _FINAL_BRACKET_CITATION_RE.sub(" ", value)
+    return value
+
+
 def _support_key(text: str | None) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+    return re.sub(r"[^a-z0-9]+", " ", _strip_support_citations(text).lower()).strip()
 
 
 def _tool_evidence_supports(answer: str | None, result: HarnessResult) -> bool:
@@ -522,17 +611,42 @@ def _tool_evidence_supports(answer: str | None, result: HarnessResult) -> bool:
     if len(answer_key) < 3 or answer_key in {"yes", "no"}:
         return False
     variants = {answer_key}
-    if "," in str(answer or ""):
-        first_part = _support_key(str(answer).split(",", 1)[0])
+    raw_answer = _strip_support_citations(answer)
+    if "," in raw_answer:
+        first_part = _support_key(raw_answer.split(",", 1)[0])
         if len(first_part) >= 3:
             variants.add(first_part)
     evidence_parts = [
         str(event.get("content") or "")
         for event in result.trajectory
-        if isinstance(event, dict) and event.get("role") == "tool"
+        if (
+            isinstance(event, dict)
+            and event.get("role") == "tool"
+            and event.get("name") not in {"memory_search", "final_answer"}
+        )
     ]
     evidence = _support_key("\n".join(evidence_parts))
     return bool(evidence) and any(variant and variant in evidence for variant in variants)
+
+
+def _rationale_low_confidence(rationale: str | None) -> bool:
+    lower = str(rationale or "").lower()
+    return any(
+        phrase in lower
+        for phrase in (
+            "best guess",
+            "cannot verify",
+            "could not verify",
+            "not verified",
+            "no definitive",
+            "not definitive",
+            "insufficient evidence",
+            "not enough evidence",
+            "most likely",
+            "appears to be",
+            "seems to be",
+        )
+    )
 
 
 def _choose_without_gold(
@@ -558,6 +672,43 @@ def _choose_without_gold(
                 failure_mode == "self_contradictory_final"
                 and not _low_confidence_answer(retry.final_answer)
                 and retry.final_answer != first.final_answer
+            ):
+                return retry
+        return first
+    first_low = (
+        _low_confidence_answer(first.final_answer)
+        or _verbose_uncertain_answer(first.final_answer)
+        or _rationale_low_confidence(first.rationale)
+    )
+    retry_low = (
+        _low_confidence_answer(retry.final_answer)
+        or _verbose_uncertain_answer(retry.final_answer)
+        or _rationale_low_confidence(retry.rationale)
+    )
+    first_support = _tool_evidence_supports(first.final_answer, first)
+    retry_support = _tool_evidence_supports(retry.final_answer, retry)
+    if task == "benchmark_csv":
+        if retry_low and not first_low and first_support:
+            return first
+        if first_low and not retry_low and retry.final_answer != first.final_answer:
+            return retry
+        if not first_support and retry_support and not retry_low:
+            return retry
+        if reflection and reflection.get("needs_retry") is True:
+            failure_mode = str(reflection.get("failure_mode", "")).strip().lower()
+            if (
+                failure_mode == "self_contradictory_final"
+                and not retry_low
+                and retry.final_answer != first.final_answer
+                and (retry_support or first_low or not first_support)
+            ):
+                return retry
+            first_len = len(first.final_answer or "")
+            retry_len = len(retry.final_answer or "")
+            if (
+                not retry_low
+                and retry_len <= max(180, first_len)
+                and (first_low or not first_support or retry_support or first.steps >= 20)
             ):
                 return retry
         return first
@@ -587,8 +738,19 @@ def _choose_without_gold(
 def run_baseline(question: str, expected: str | None = None,
                  cfg: HarnessConfig | None = None,
                  task: str | None = None,
-                 user_content: Any | None = None) -> RunOutcome:
-    res = run_react(question, cfg=cfg, expected=expected, task=task, user_content=user_content)
+                 user_content: Any | None = None,
+                 original_prompt: str | None = None) -> RunOutcome:
+    original_problem_prompt = str(original_prompt if original_prompt is not None else question or "").strip()
+    if not original_problem_prompt:
+        original_problem_prompt = str(question or "").strip()
+    res = run_react(
+        question,
+        cfg=cfg,
+        expected=expected,
+        task=task,
+        user_content=user_content,
+        original_prompt=original_problem_prompt,
+    )
     if task == "2wiki" and _allow_2wiki_postprocess():
         res.final_answer = _postprocess_2wiki_answer(res.final_answer)
     return RunOutcome(result=res, correct=_judge(res.final_answer, expected), first_result=res)
@@ -603,9 +765,13 @@ def run_evolved(question: str, expected: str | None = None,
                 use_gold_for_reflection: bool = False,
                 force_reflection: bool = False,
                 task: str | None = None,
-                user_content: Any | None = None) -> RunOutcome:
+                user_content: Any | None = None,
+                original_prompt: str | None = None) -> RunOutcome:
     cfg = cfg or HarnessConfig()
     memory = memory or MemoryStore()
+    original_problem_prompt = str(original_prompt if original_prompt is not None else question or "").strip()
+    if not original_problem_prompt:
+        original_problem_prompt = str(question or "").strip()
     extra = lesson_context if lesson_context is not None else memory.render_for_prompt(question, task=task)
     res = run_react(
         question,
@@ -614,6 +780,7 @@ def run_evolved(question: str, expected: str | None = None,
         expected=expected,
         task=task,
         user_content=user_content,
+        original_prompt=original_problem_prompt,
     )
     if task == "2wiki" and _allow_2wiki_postprocess():
         res.final_answer = _postprocess_2wiki_evolved_answer(res.final_answer, question)
@@ -627,6 +794,7 @@ def run_evolved(question: str, expected: str | None = None,
     retry_reason = None
     reflection = None
     reflection_useful = None
+    short_term_reflection_memory = None
 
     should_reflect = allow_reflection and _allow_task_reflection(task) and (
         _needs_self_reflection(res, cfg) or use_gold_for_reflection or force_reflection
@@ -638,6 +806,14 @@ def run_evolved(question: str, expected: str | None = None,
             res,
             correct=None,
             include_expected=use_gold_for_reflection,
+            original_prompt=original_problem_prompt,
+        )
+        short_term_reflection_memory = _persist_short_term_reflection_lesson(
+            memory,
+            task,
+            question,
+            reflection,
+            res,
         )
         safe_reflection = _redact_expected_obj(reflection or {}, expected)
         if allow_retry and _reflection_requests_retry(reflection, res, task=task):
@@ -645,21 +821,35 @@ def run_evolved(question: str, expected: str | None = None,
             extra2 = lesson_context if lesson_context is not None else memory.render_for_prompt(question, task=task)
             retry_hint = (
                 (extra2 + "\n\n" if extra2 else "") +
+                (
+                    f"[Original problem prompt]\n{original_problem_prompt}\n\n"
+                    if original_problem_prompt and original_problem_prompt != str(question).strip()
+                    else ""
+                ) +
                 f"[Self-review of previous attempt]\n"
                 f"failure_mode: {safe_reflection.get('failure_mode')}\n"
                 f"root_cause: {safe_reflection.get('root_cause')}\n"
                 f"corrective_strategy: {safe_reflection.get('corrective_strategy')}\n"
-                "Retry efficiently: do not repeat previous queries; use at most 3 focused searches "
-                "unless a specific missing clue requires one more. Prefer one concise exact answer. "
-                "Do not refuse or withhold merely because evidence is incomplete; provide the best-supported answer."
+                "\n[Retry query-repair mode]\n"
+                "The previous answer is not trusted. This retry is for query repair, not for guessing a new answer. "
+                "Use the Original problem prompt as the source of required constraints. Do not add demographic, "
+                "industry, nationality, gender, or other filters merely because they appeared in a failed candidate. "
+                "First classify why the previous search path failed: too broad/generic hits, off-target entity, "
+                "missing answer-field check, or no opened document. Then run repaired BM25 lexical "
+                "queries as needed before opening evidence. For browsecomp_search, use short 2-6 token lexical queries with "
+                "rare names/phrases/dates; do not paste the full question or combine every clue into one query. "
+                "You MUST call browsecomp_open on at least one promising docid before final_answer unless a search "
+                "snippet quotes the exact answer span verbatim. Submit final_answer only after the exact answer span "
+                "is supported by current tool evidence and no required constraint remains contradicted."
             )
             retry_res = run_react(
                 question,
-                cfg=_retry_config(cfg),
+                cfg=_retry_config(cfg, task=task),
                 extra_system=retry_hint,
                 expected=expected,
                 task=task,
                 user_content=user_content,
+                original_prompt=original_problem_prompt,
             )
             if task == "2wiki" and _allow_2wiki_postprocess():
                 retry_res.final_answer = _postprocess_2wiki_evolved_answer(retry_res.final_answer, question)
@@ -691,6 +881,7 @@ def run_evolved(question: str, expected: str | None = None,
             correct=True,
             include_expected=True,
             force_memory=True,
+            original_prompt=original_prompt,
         )
         verified_reflection_memory = _persist_forced_reflection_memory(memory, task, question, reflection)
         reflection_useful = bool(
@@ -714,4 +905,5 @@ def run_evolved(question: str, expected: str | None = None,
         final_refinement=final_refinement,
         gold_verification=gold_verification,
         verified_reflection_memory=verified_reflection_memory,
+        short_term_reflection_memory=short_term_reflection_memory,
     )

@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import re
+import hashlib
 import subprocess
 import tempfile
 import threading
@@ -30,28 +31,41 @@ _HEADERS = {
 _PLAYWRIGHT_INSTALL_HINT = "Run `python -m playwright install chromium` to enable browser_* tools."
 _BROWSER_MAX_SESSIONS = 4
 _BROWSER_IDLE_SECONDS = 15 * 60
-_STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "both", "but", "by", "did", "do",
-    "does", "for", "from", "had", "has", "have", "he", "her", "his", "how", "in",
-    "is", "it", "its", "of", "on", "or", "she", "that", "the", "their", "this",
-    "to", "was", "were", "what", "when", "where", "which", "who", "whom", "whose",
-    "why", "with", "you", "your", "answer", "answering", "candidate", "context",
-    "first", "paragraphs", "provided", "question", "ranked", "relevance", "use",
-    "using", "wiki", "wikipedia",
-}
-_TOKEN_RE = re.compile(r"[\wÀ-ÖØ-öø-ÿĀ-žḀ-ỿ]+(?:['’.-][\wÀ-ÖØ-öø-ÿĀ-žḀ-ỿ]+)*", re.UNICODE)
 
 
 def _clamp(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, int(value)))
 
 
-def _default_extract_chars() -> int:
+def _env_int(name: str, default: int, minimum: int = 0, maximum: int = 10_000_000) -> int:
     try:
-        value = int(os.getenv("BROWSER_EXTRACT_MAX_CHARS", "12000"))
-    except ValueError:
-        value = 12000
-    return _clamp(value, 1000, 50000)
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return _clamp(value, minimum, maximum)
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0, maximum: float = 10_000_000.0) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _browser_timeout_s(default: float = 60.0) -> float:
+    return _env_float("BROWSER_TOOL_TIMEOUT", default, 1.0, 1800.0)
+
+
+def _browser_timeout_ms(value: int | float | None = None, default_ms: int = 30000) -> int:
+    try:
+        requested = int(value if value is not None else default_ms)
+    except (TypeError, ValueError):
+        requested = default_ms
+    env_default = int(_browser_timeout_s(default_ms / 1000.0) * 1000)
+    if requested in {0, default_ms, 30000}:
+        requested = env_default
+    return _clamp(requested, 1000, 1_800_000)
 
 
 def _is_http_url(url: str) -> bool:
@@ -81,6 +95,66 @@ def _normalize_text(text: str) -> str:
     return " ".join(str(text or "").split())
 
 
+def _browser_manifest_threshold() -> int:
+    return _env_int("BROWSER_MANIFEST_THRESHOLD_CHARS", 60_000, 0, 1_000_000)
+
+
+def _browser_chunk_chars() -> int:
+    return _env_int("BROWSER_CHUNK_CHARS", 12_000, 1_000, 200_000)
+
+
+def _browser_cache_root() -> Path:
+    return Path(os.getenv("BROWSER_RAW_CACHE_DIR", "/tmp/sii-agent-browser-cache")).resolve()
+
+
+def _safe_name(value: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
+    return clean[:80] or "document"
+
+
+def _write_raw_cache(*, title: str, url: str, text: str, source_type: str) -> str | None:
+    root = _browser_cache_root()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha1(
+            f"{source_type}\0{url}\0{text}".encode("utf-8", errors="ignore")
+        ).hexdigest()[:16]
+        parsed_name = Path(urlparse(url).path).name
+        stem = _safe_name(parsed_name or title or source_type)
+        text_path = root / f"{stem}-{digest}.txt"
+        meta_path = root / f"{stem}-{digest}.json"
+        if not text_path.exists():
+            text_path.write_text(str(text or ""), encoding="utf-8")
+        if not meta_path.exists():
+            meta_path.write_text(
+                _json(
+                    {
+                        "title": title,
+                        "url": url,
+                        "source_type": source_type,
+                        "full_text_chars": len(text),
+                        "raw_cache_path": str(text_path),
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return str(text_path)
+    except OSError:
+        return None
+
+
+def _resolve_raw_cache_path(raw_cache_path: str) -> Path:
+    root = _browser_cache_root()
+    path = Path(str(raw_cache_path or "")).expanduser().resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"raw_cache_path must be under {root}") from exc
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"raw cache file not found: {path}")
+    return path
+
+
 def _canonical_extract_query(query: str) -> str:
     query = str(query or "").strip()
     if not query:
@@ -95,116 +169,6 @@ def _canonical_extract_query(query: str) -> str:
         flags=re.IGNORECASE,
     )[0]
     return _normalize_text(query)[:1000]
-
-
-def _query_tokens(query: str) -> list[str]:
-    tokens: list[str] = []
-    seen: set[str] = set()
-    for raw in _TOKEN_RE.findall(query.lower()):
-        token = raw.strip("'’.-_")
-        if len(token) < 2 or token in _STOPWORDS or token in seen:
-            continue
-        seen.add(token)
-        tokens.append(token)
-    return tokens[:48]
-
-
-def _query_phrases(tokens: list[str]) -> list[str]:
-    phrases: list[str] = []
-    for size in (4, 3, 2):
-        for i in range(0, max(0, len(tokens) - size + 1)):
-            phrase = " ".join(tokens[i:i + size])
-            if len(phrase) >= 8:
-                phrases.append(phrase)
-    return phrases[:32]
-
-
-def _chunk_text(text: str, chunk_chars: int = 900, overlap: int = 180) -> list[tuple[int, str]]:
-    if len(text) <= chunk_chars:
-        return [(0, text)]
-    chunks: list[tuple[int, str]] = []
-    step = max(1, chunk_chars - overlap)
-    for start in range(0, len(text), step):
-        chunk = text[start:start + chunk_chars]
-        if chunk:
-            chunks.append((start, chunk))
-        if start + chunk_chars >= len(text):
-            break
-    return chunks
-
-
-def _score_chunk(chunk: str, tokens: list[str], phrases: list[str]) -> int:
-    text = chunk.lower()
-    score = 0
-    for token in tokens:
-        count = text.count(token)
-        if count:
-            score += min(count, 3) * (3 if len(token) >= 6 else 1)
-    for phrase in phrases:
-        if phrase in text:
-            score += 10
-    return score
-
-
-def _extract_relevant_text(text: str, query: str, max_chars: int) -> tuple[str, dict[str, Any]]:
-    budget = max_chars if max_chars > 0 else _default_extract_chars()
-    if len(text) <= budget:
-        return text, {
-            "mode": "full_text_short_enough",
-            "selected_chunks": [{"start": 0, "end": len(text), "score": None}],
-        }
-
-    tokens = _query_tokens(query)
-    if not tokens:
-        return text[:budget], {
-            "mode": "head_extract_no_query_terms",
-            "selected_chunks": [{"start": 0, "end": min(len(text), budget), "score": None}],
-        }
-
-    phrases = _query_phrases(tokens)
-    scored = [
-        (score, start, chunk)
-        for start, chunk in _chunk_text(text)
-        if (score := _score_chunk(chunk, tokens, phrases)) > 0
-    ]
-    if not scored:
-        return text[:budget], {
-            "mode": "head_extract_no_relevant_match",
-            "query_terms": tokens,
-            "selected_chunks": [{"start": 0, "end": min(len(text), budget), "score": 0}],
-        }
-
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    selected: list[tuple[int, int, int, str]] = []
-    used_ranges: list[tuple[int, int]] = []
-    used_chars = 0
-    for score, start, chunk in scored:
-        end = start + len(chunk)
-        if any(not (end <= used_start or start >= used_end) for used_start, used_end in used_ranges):
-            continue
-        separator_cost = 24 if selected else 0
-        if used_chars + len(chunk) + separator_cost > budget and selected:
-            continue
-        selected.append((start, end, score, chunk))
-        used_ranges.append((start, end))
-        used_chars += len(chunk) + separator_cost
-        if used_chars >= budget:
-            break
-
-    selected.sort(key=lambda item: item[0])
-    parts = [
-        f"[excerpt {i}, chars {start}-{end}, score {score}]\n{chunk.strip()}"
-        for i, (start, end, score, chunk) in enumerate(selected, 1)
-    ]
-    rendered = "\n\n---\n\n".join(parts)
-    return rendered[:budget], {
-        "mode": "query_focused_extract",
-        "query_terms": tokens,
-        "selected_chunks": [
-            {"start": start, "end": end, "score": score}
-            for start, end, score, _ in selected
-        ],
-    }
 
 
 def _aio_base_url() -> str | None:
@@ -239,8 +203,9 @@ def _normalize_ws_url(cdp_url: str, base_url: str) -> str:
 def _aio_browser_info(base_url: str) -> dict[str, Any]:
     headers = _sandbox_headers()
     aio_error: BaseException | None = None
+    timeout = _browser_timeout_s(10.0)
     try:
-        response = httpx.get(f"{base_url}/v1/browser/info", headers=headers, timeout=10)
+        response = httpx.get(f"{base_url}/v1/browser/info", headers=headers, timeout=timeout)
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, dict):
@@ -255,7 +220,7 @@ def _aio_browser_info(base_url: str) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         aio_error = exc
         try:
-            response = httpx.get(f"{base_url}/browser/cdp_url", headers=headers, timeout=10)
+            response = httpx.get(f"{base_url}/browser/cdp_url", headers=headers, timeout=timeout)
             response.raise_for_status()
             payload = response.json()
             if not isinstance(payload, dict):
@@ -297,14 +262,51 @@ def _snapshot_from_text(
     source_type: str = "html",
 ) -> str:
     focused_query = _canonical_extract_query(extract_query)
-    if focused_query:
-        rendered_text, extract_meta = _extract_relevant_text(text, focused_query, max_chars)
-    else:
-        rendered_text = text[:max_chars] if max_chars else text
-        extract_meta = {
-            "mode": "full_text" if not max_chars or len(text) <= max_chars else "manual_truncate",
-            "selected_chunks": [{"start": 0, "end": len(rendered_text), "score": None}],
-        }
+    raw_cache_path = _write_raw_cache(title=title, url=url, text=text, source_type=source_type)
+    full_text_chars = len(text)
+    threshold = _browser_manifest_threshold()
+    if raw_cache_path and threshold and full_text_chars > threshold:
+        chunk_chars = _browser_chunk_chars()
+        chunk_count = (full_text_chars + chunk_chars - 1) // chunk_chars
+        return _json(
+            {
+                "title": title,
+                "url": url,
+                "source_type": source_type,
+                "text_mode": "manifest",
+                "text": "",
+                "full_text_chars": full_text_chars,
+                "returned_text_chars": 0,
+                "omitted_text_chars": 0,
+                "raw_cache_path": raw_cache_path,
+                "chunk_chars": chunk_chars,
+                "chunk_count": chunk_count,
+                "next_actions": [
+                    {
+                        "tool": "browser_read",
+                        "description": "Read a specific character range from the cached full text.",
+                        "args": {"raw_cache_path": raw_cache_path, "start": 0, "length": chunk_chars},
+                    },
+                    {
+                        "tool": "browser_read",
+                        "description": "Search the cached full text and return matching chunks.",
+                        "args": {"raw_cache_path": raw_cache_path, "query": "distinctive phrase or keywords"},
+                    },
+                ],
+                "extract_query": focused_query,
+                "links": links or [],
+                "controls": controls or [],
+                "usage_note": (
+                    "Full text was saved outside the prompt to avoid context overflow. "
+                    "Use browser_read with raw_cache_path to inspect needed chunks."
+                ),
+            }
+        )
+    rendered_text = text
+    extract_meta = {
+        "mode": "full_text",
+        "selected_chunks": [{"start": 0, "end": len(rendered_text), "score": None}],
+    }
     return _json(
         {
             "title": title,
@@ -313,9 +315,10 @@ def _snapshot_from_text(
             "text": rendered_text,
             "text_mode": extract_meta["mode"],
             "extract_query": focused_query,
-            "full_text_chars": len(text),
+            "full_text_chars": full_text_chars,
             "returned_text_chars": len(rendered_text),
-            "omitted_text_chars": max(0, len(text) - len(rendered_text)),
+            "omitted_text_chars": 0,
+            "raw_cache_path": raw_cache_path,
             "query_terms": extract_meta.get("query_terms", []),
             "selected_chunks": extract_meta.get("selected_chunks", []),
             "links": links or [],
@@ -325,7 +328,7 @@ def _snapshot_from_text(
 
 
 def _pdf_snapshot(url: str, *, max_chars: int = 0, extract_query: str = "") -> str:
-    timeout = float(os.getenv("BROWSER_PDF_TIMEOUT", "60"))
+    timeout = float(os.getenv("BROWSER_PDF_TIMEOUT", str(_browser_timeout_s(60.0))))
     max_bytes = int(os.getenv("BROWSER_PDF_MAX_BYTES", str(50 * 1024 * 1024)))
     response = httpx.get(url, headers=_HEADERS, timeout=timeout, follow_redirects=True)
     response.raise_for_status()
@@ -382,16 +385,17 @@ def _browser_service_request(
     *,
     json_body: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
-    timeout: float = 60,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     base_url = _browser_service_url()
+    request_timeout = _browser_timeout_s(60.0) if timeout is None else timeout
     response = httpx.request(
         method,
         f"{base_url}{path}",
         headers=_sandbox_headers(),
         json=json_body,
         params=params,
-        timeout=timeout,
+        timeout=request_timeout,
     )
     response.raise_for_status()
     payload = response.json()
@@ -408,7 +412,7 @@ def _service_session_id(logical_session_id: str) -> str:
         cached = _SERVICE_SESSIONS.get(logical_session_id)
         if cached:
             return cached
-        payload = _browser_service_request("POST", "/session/create", timeout=30)
+        payload = _browser_service_request("POST", "/session/create", timeout=_browser_timeout_s(30.0))
         session_id = str(payload.get("session_id") or "")
         if not session_id:
             raise RuntimeError(f"browser-service create_session returned empty session_id: {payload}")
@@ -457,28 +461,28 @@ def _service_snapshot(
     text = _service_get_text(session_id, tab_id=tab_id)
     links = _service_eval(
         session_id,
-        f"""() => Array.from(document.querySelectorAll('a')).slice(0, {max_links}).map((a) => ({{
-            text: (a.innerText || a.getAttribute('aria-label') || '').trim().slice(0, 160),
+        """() => Array.from(document.querySelectorAll('a')).map((a) => ({
+            text: (a.innerText || a.getAttribute('aria-label') || '').trim(),
             href: a.href || a.getAttribute('href') || ''
-        }})).filter((a) => a.text || a.href)""",
+        })).filter((a) => a.text || a.href)""",
         tab_id=tab_id,
     )
     controls = _service_eval(
         session_id,
-        f"""() => Array.from(document.querySelectorAll('input, textarea, select, button'))
-        .filter((el) => {{
+        """() => Array.from(document.querySelectorAll('input, textarea, select, button'))
+        .filter((el) => {
             const style = window.getComputedStyle(el);
             return el.type !== 'hidden' && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
-        }})
-        .slice(0, {max_controls}).map((el) => ({{
+        })
+        .map((el) => ({
             tag: el.tagName.toLowerCase(),
             type: el.getAttribute('type') || '',
             name: el.getAttribute('name') || '',
             id: el.id || '',
             placeholder: el.getAttribute('placeholder') || '',
-            value: (el.value || '').slice(0, 160),
-            text: (el.innerText || el.getAttribute('aria-label') || '').trim().slice(0, 160)
-        }}))""",
+            value: el.value || '',
+            text: (el.innerText || el.getAttribute('aria-label') || '').trim()
+        }))""",
         tab_id=tab_id,
     )
     return _snapshot_from_text(
@@ -525,8 +529,13 @@ def _service_click_target(session_id: str, target: str, by: str, tab_id: str | N
         _browser_service_request(
             "POST",
             "/browser/click",
-            json_body={"session_id": session_id, "tab_id": tab_id, "selector": selector, "timeout_ms": 10000},
-            timeout=20,
+            json_body={
+                "session_id": session_id,
+                "tab_id": tab_id,
+                "selector": selector,
+                "timeout_ms": _browser_timeout_ms(10000, default_ms=10000),
+            },
+            timeout=_browser_timeout_s(20.0),
         )
         return
     text = str(target or "").removeprefix("text=").removeprefix("label=").strip()
@@ -589,7 +598,7 @@ def _service_type_target(
             "press_enter": bool(submit),
             "delay_ms": 20,
         },
-        timeout=30,
+        timeout=_browser_timeout_s(30.0),
     )
 
 
@@ -608,55 +617,45 @@ def _snapshot(
     max_chars = max(0, int(max_chars))
     max_links = _clamp(max_links, 0, 100)
     max_controls = _clamp(max_controls, 0, 100)
-    text = _normalize_text(page.locator("body").inner_text(timeout=5000) if page.locator("body").count() else "")
+    text = _normalize_text(page.locator("body").inner_text(timeout=int(_browser_timeout_s(5.0) * 1000)) if page.locator("body").count() else "")
     links = page.evaluate(
-        """(limit) => Array.from(document.querySelectorAll('a')).slice(0, limit).map((a) => ({
-            text: (a.innerText || a.getAttribute('aria-label') || '').trim().slice(0, 160),
+        """() => Array.from(document.querySelectorAll('a')).map((a) => ({
+            text: (a.innerText || a.getAttribute('aria-label') || '').trim(),
             href: a.href || a.getAttribute('href') || ''
         })).filter((a) => a.text || a.href)""",
-        max_links,
     )
     controls = page.evaluate(
-        """(limit) => Array.from(document.querySelectorAll('input, textarea, select, button'))
+        """() => Array.from(document.querySelectorAll('input, textarea, select, button'))
         .filter((el) => {
             const style = window.getComputedStyle(el);
             return el.type !== 'hidden' && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
         })
-        .slice(0, limit).map((el) => ({
+        .map((el) => ({
             tag: el.tagName.toLowerCase(),
             type: el.getAttribute('type') || '',
             name: el.getAttribute('name') || '',
             id: el.id || '',
             placeholder: el.getAttribute('placeholder') || '',
-            value: (el.value || '').slice(0, 160),
-            text: (el.innerText || el.getAttribute('aria-label') || '').trim().slice(0, 160)
+            value: el.value || '',
+            text: (el.innerText || el.getAttribute('aria-label') || '').trim()
         }))""",
-        max_controls,
     )
     focused_query = _canonical_extract_query(extract_query)
-    if focused_query:
-        rendered_text, extract_meta = _extract_relevant_text(text, focused_query, max_chars)
-    else:
-        rendered_text = text[:max_chars] if max_chars else text
-        extract_meta = {
-            "mode": "full_text" if not max_chars or len(text) <= max_chars else "manual_truncate",
-            "selected_chunks": [{"start": 0, "end": len(rendered_text), "score": None}],
-        }
+    rendered_text = text
+    extract_meta = {
+        "mode": "full_text",
+        "selected_chunks": [{"start": 0, "end": len(rendered_text), "score": None}],
+    }
 
-    return _json({
-        "title": page.title(),
-        "url": page.url,
-        "text": rendered_text,
-        "text_mode": extract_meta["mode"],
-        "extract_query": focused_query,
-        "full_text_chars": len(text),
-        "returned_text_chars": len(rendered_text),
-        "omitted_text_chars": max(0, len(text) - len(rendered_text)),
-        "query_terms": extract_meta.get("query_terms", []),
-        "selected_chunks": extract_meta.get("selected_chunks", []),
-        "links": links,
-        "controls": controls,
-    })
+    return _snapshot_from_text(
+        title=page.title(),
+        url=page.url,
+        text=rendered_text,
+        max_chars=max_chars,
+        extract_query=focused_query,
+        links=links,
+        controls=controls,
+    )
 
 
 def _looks_like_text_target(target: str) -> bool:
@@ -939,7 +938,8 @@ def aio_sandbox_status() -> str:
 @register(
     "browser_open",
     "Open a URL in a persistent browser-service sandbox session and return JSON text/links/forms. "
-    "When extract_query is provided, the full page is read first and only relevant excerpts are returned.",
+    "Small pages return full visible text. Very large pages/PDFs return a manifest with raw_cache_path; "
+    "use browser_read to inspect cached full-text chunks.",
     {
         "type": "object",
         "properties": {
@@ -950,17 +950,17 @@ def aio_sandbox_status() -> str:
                 "default": "domcontentloaded",
                 "enum": ["commit", "domcontentloaded", "load", "networkidle"],
             },
-            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1000, "maximum": 120000},
+            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1000, "maximum": 1800000},
             "max_chars": {
                 "type": "integer",
                 "default": 0,
                 "minimum": 0,
-                "description": "Maximum returned text characters; 0 uses full text unless extract_query is set, then uses the default extraction budget.",
+                "description": "Deprecated/ignored; browser tools now return full available text.",
             },
             "extract_query": {
                 "type": "string",
                 "default": "",
-                "description": "Optional question/query used to return only relevant excerpts from the full page text.",
+                "description": "Deprecated/ignored; browser tools now return full available text.",
             },
         },
         "required": ["url"],
@@ -977,7 +977,7 @@ def browser_open(
     url = _normalize_browser_url(url)
     if not url:
         return "ERROR: url must not be empty"
-    timeout_ms = _clamp(timeout_ms, 1000, 120000)
+    timeout_ms = _browser_timeout_ms(timeout_ms)
     max_chars = max(0, int(max_chars))
     try:
         pdf_error: BaseException | None = None
@@ -997,7 +997,7 @@ def browser_open(
                     "wait_until": _wait_until(wait_until),
                     "timeout_ms": timeout_ms,
                 },
-                timeout=timeout_ms / 1000 + 15,
+                timeout=max(_browser_timeout_s(60.0), timeout_ms / 1000 + 15),
             )
         except Exception as exc:  # noqa: BLE001
             if "navigation started a download" in str(exc):
@@ -1020,8 +1020,8 @@ def browser_open(
 @register(
     "browser_open_many",
     "Open up to four URLs concurrently through browser-service tabs and return JSON snapshots. "
-    "Use when several independent pages need to be read in parallel. When extract_query is provided, each full page "
-    "is read first and only relevant excerpts are returned.",
+    "Use when several independent pages need to be read in parallel. Large snapshots return manifests with raw_cache_path; "
+    "use browser_read for needed chunks.",
     {
         "type": "object",
         "properties": {
@@ -1037,17 +1037,17 @@ def browser_open(
                 "default": "domcontentloaded",
                 "enum": ["commit", "domcontentloaded", "load", "networkidle"],
             },
-            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1000, "maximum": 120000},
+            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1000, "maximum": 1800000},
             "max_chars": {
                 "type": "integer",
                 "default": 0,
                 "minimum": 0,
-                "description": "Maximum returned text characters per page; 0 uses full text unless extract_query is set, then uses the default extraction budget.",
+                "description": "Deprecated/ignored; browser tools now return full available text.",
             },
             "extract_query": {
                 "type": "string",
                 "default": "",
-                "description": "Optional shared question/query used to return only relevant excerpts from each full page.",
+                "description": "Deprecated/ignored; browser tools now return full available text.",
             },
             "concurrency": {"type": "integer", "default": 4, "minimum": 1, "maximum": 4},
         },
@@ -1066,7 +1066,7 @@ def browser_open_many(
     if not urls:
         return "ERROR: urls must contain at least one URL"
     limited_urls = [_normalize_browser_url(url) for url in urls[:_BROWSER_MAX_SESSIONS]]
-    timeout_ms = _clamp(timeout_ms, 1000, 120000)
+    timeout_ms = _browser_timeout_ms(timeout_ms)
     max_chars = max(0, int(max_chars))
     concurrency = _clamp(concurrency, 1, _BROWSER_MAX_SESSIONS)
     results: list[dict[str, Any] | None] = [None] * len(limited_urls)
@@ -1097,7 +1097,7 @@ def browser_open_many(
                     "wait_until": _wait_until(wait_until),
                     "timeout_ms": timeout_ms,
                 },
-                timeout=timeout_ms / 1000 + 15,
+                timeout=max(_browser_timeout_s(60.0), timeout_ms / 1000 + 15),
             )
             snapshot = json.loads(
                 _service_snapshot(
@@ -1144,7 +1144,7 @@ def browser_open_many(
 @register(
     "browser_text",
     "Return the current sandbox browser page as JSON with title, URL, visible text, links, and controls. "
-    "When extract_query is provided, the full page is read first and only relevant excerpts are returned.",
+    "Small pages return full visible text; large pages return a manifest with raw_cache_path for browser_read.",
     {
         "type": "object",
         "properties": {
@@ -1153,12 +1153,12 @@ def browser_open_many(
                 "type": "integer",
                 "default": 0,
                 "minimum": 0,
-                "description": "Maximum returned text characters; 0 uses full text unless extract_query is set, then uses the default extraction budget.",
+                "description": "Deprecated/ignored; browser tools now return full available text.",
             },
             "extract_query": {
                 "type": "string",
                 "default": "",
-                "description": "Optional question/query used to return only relevant excerpts from the current page text.",
+                "description": "Deprecated/ignored; browser tools now return full available text.",
             },
             "max_links": {"type": "integer", "default": 20, "minimum": 0, "maximum": 100},
             "max_controls": {"type": "integer", "default": 20, "minimum": 0, "maximum": 100},
@@ -1185,10 +1185,114 @@ def browser_text(
         return _service_error(exc)
 
 
+def _query_windows(text: str, query: str, max_matches: int, context_chars: int) -> list[dict[str, Any]]:
+    normalized_query = _normalize_text(query)
+    if not normalized_query:
+        return []
+    lowered = text.lower()
+    terms = [normalized_query.lower()]
+    terms.extend(
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff_-]{2,}", normalized_query)
+        if token.lower() not in terms
+    )
+    windows: list[dict[str, Any]] = []
+    seen_ranges: set[tuple[int, int]] = set()
+    for term in terms:
+        search_from = 0
+        while len(windows) < max_matches:
+            pos = lowered.find(term, search_from)
+            if pos < 0:
+                break
+            start = max(0, pos - context_chars)
+            end = min(len(text), pos + len(term) + context_chars)
+            key = (start, end)
+            if key not in seen_ranges:
+                seen_ranges.add(key)
+                windows.append(
+                    {
+                        "start": start,
+                        "end": end,
+                        "matched": text[pos : pos + len(term)],
+                        "text": text[start:end],
+                    }
+                )
+            search_from = pos + max(1, len(term))
+    windows.sort(key=lambda item: (int(item["start"]), int(item["end"])))
+    return windows[:max_matches]
+
+
+@register(
+    "browser_read",
+    "Read or search full text cached by a browser_open/browser_text manifest. "
+    "Use raw_cache_path from the manifest. Without query, returns the requested character range; "
+    "with query, returns matching chunks from the cached full text.",
+    {
+        "type": "object",
+        "properties": {
+            "raw_cache_path": {"type": "string", "description": "raw_cache_path returned by browser_open/browser_text."},
+            "start": {"type": "integer", "default": 0, "minimum": 0},
+            "length": {"type": "integer", "default": 12000, "minimum": 1, "maximum": 50000},
+            "query": {"type": "string", "default": "", "description": "Optional phrase/keywords to find in cached text."},
+            "max_matches": {"type": "integer", "default": 5, "minimum": 1, "maximum": 10},
+            "context_chars": {"type": "integer", "default": 4000, "minimum": 200, "maximum": 20000},
+        },
+        "required": ["raw_cache_path"],
+    },
+)
+def browser_read(
+    raw_cache_path: str,
+    start: int = 0,
+    length: int = 12000,
+    query: str = "",
+    max_matches: int = 5,
+    context_chars: int = 4000,
+) -> str:
+    try:
+        path = _resolve_raw_cache_path(raw_cache_path)
+        text = path.read_text(encoding="utf-8", errors="replace")
+        full_text_chars = len(text)
+        normalized_query = _normalize_text(query)
+        if normalized_query:
+            max_matches = _clamp(max_matches, 1, 10)
+            context_chars = _clamp(context_chars, 200, 20_000)
+            matches = _query_windows(text, normalized_query, max_matches, context_chars)
+            return _json(
+                {
+                    "raw_cache_path": str(path),
+                    "mode": "query",
+                    "query": normalized_query,
+                    "full_text_chars": full_text_chars,
+                    "match_count_returned": len(matches),
+                    "matches": matches,
+                    "usage_note": "If no match is returned, retry with rarer words or read sequential chunks by start/length.",
+                }
+            )
+        start = _clamp(start, 0, max(full_text_chars, 0))
+        length = _clamp(length, 1, 50_000)
+        end = min(full_text_chars, start + length)
+        return _json(
+            {
+                "raw_cache_path": str(path),
+                "mode": "range",
+                "start": start,
+                "end": end,
+                "length": end - start,
+                "full_text_chars": full_text_chars,
+                "has_more_before": start > 0,
+                "has_more_after": end < full_text_chars,
+                "next_start": end if end < full_text_chars else None,
+                "text": text[start:end],
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"ERROR: browser_read failed: {type(exc).__name__}: {exc}"
+
+
 @register(
     "browser_click",
     "Click a CSS selector or visible text in a sandbox browser session, then return the updated page JSON. "
-    "When extract_query is provided, the full updated page is read first and only relevant excerpts are returned.",
+    "Small pages return full visible text; large pages return a manifest with raw_cache_path for browser_read.",
     {
         "type": "object",
         "properties": {
@@ -1203,17 +1307,17 @@ def browser_text(
                 "default": "domcontentloaded",
                 "enum": ["commit", "domcontentloaded", "load", "networkidle"],
             },
-            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1000, "maximum": 120000},
+            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1000, "maximum": 1800000},
             "max_chars": {
                 "type": "integer",
                 "default": 0,
                 "minimum": 0,
-                "description": "Maximum returned text characters after clicking; 0 uses full text unless extract_query is set, then uses the default extraction budget.",
+                "description": "Deprecated/ignored; browser tools now return full available text.",
             },
             "extract_query": {
                 "type": "string",
                 "default": "",
-                "description": "Optional question/query used to return only relevant excerpts after clicking.",
+                "description": "Deprecated/ignored; browser tools now return full available text.",
             },
         },
         "required": ["target"],
@@ -1228,7 +1332,7 @@ def browser_click(
     max_chars: int = 0,
     extract_query: str = "",
 ) -> str:
-    timeout_ms = _clamp(timeout_ms, 1000, 120000)
+    timeout_ms = _browser_timeout_ms(timeout_ms)
     max_chars = max(0, int(max_chars))
     try:
         service_session_id = _service_session_id(session_id)
@@ -1242,7 +1346,7 @@ def browser_click(
     "browser_type",
     "Fill an input/textarea/contenteditable target in a sandbox browser session, optionally pressing Enter. "
     "Targets can be css=..., label=..., placeholder=..., name=..., visible text, or auto-resolved. "
-    "When extract_query is provided, the full updated page is read first and only relevant excerpts are returned.",
+    "Small pages return full visible text; large pages return a manifest with raw_cache_path for browser_read.",
     {
         "type": "object",
         "properties": {
@@ -1258,17 +1362,17 @@ def browser_click(
                 "enum": ["auto", "css", "text", "label", "placeholder", "name"],
             },
             "submit": {"type": "boolean", "default": False},
-            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1000, "maximum": 120000},
+            "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1000, "maximum": 1800000},
             "max_chars": {
                 "type": "integer",
                 "default": 0,
                 "minimum": 0,
-                "description": "Maximum returned text characters after typing; 0 uses full text unless extract_query is set, then uses the default extraction budget.",
+                "description": "Deprecated/ignored; browser tools now return full available text.",
             },
             "extract_query": {
                 "type": "string",
                 "default": "",
-                "description": "Optional question/query used to return only relevant excerpts after typing.",
+                "description": "Deprecated/ignored; browser tools now return full available text.",
             },
         },
         "required": ["target", "text"],
@@ -1284,7 +1388,7 @@ def browser_type(
     max_chars: int = 0,
     extract_query: str = "",
 ) -> str:
-    timeout_ms = _clamp(timeout_ms, 1000, 120000)
+    timeout_ms = _browser_timeout_ms(timeout_ms)
     max_chars = max(0, int(max_chars))
     try:
         service_session_id = _service_session_id(session_id)
@@ -1311,7 +1415,7 @@ def browser_close(session_id: str = "default") -> str:
     if not service_session_id:
         return f"OK: browser session '{logical_session_id}' was not open"
     try:
-        _browser_service_request("DELETE", f"/session/{service_session_id}", timeout=15)
+        _browser_service_request("DELETE", f"/session/{service_session_id}", timeout=_browser_timeout_s(15.0))
     except Exception as exc:  # noqa: BLE001
         return _service_error(exc)
     return f"OK: browser session '{logical_session_id}' closed"

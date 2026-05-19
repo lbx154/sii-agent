@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sqlite3
+import hashlib
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -73,7 +74,11 @@ def _connect_sqlite(index_path: Path) -> sqlite3.Connection:
             f"{index_path} not found. Build the legacy SQLite index with: "
             "python -m scripts.build_browsecomp_fts"
         )
-    return sqlite3.connect(f"file:{index_path}?mode=ro", uri=True, timeout=30)
+    try:
+        timeout = float(os.getenv("BROWSECOMP_SQLITE_TIMEOUT", os.getenv("SQLITE_TOOL_TIMEOUT", "30")))
+    except ValueError:
+        timeout = 30.0
+    return sqlite3.connect(f"file:{index_path}?mode=ro", uri=True, timeout=timeout)
 
 
 def _fts_query(query: str) -> str:
@@ -98,10 +103,10 @@ def _snippet_tokenizer() -> Any:
         for local_name in ("Qwen3-32B", "Qwen3.5-9B"):
             for local_path in (Path(local_name), repo_root / local_name):
                 if (local_path / "tokenizer_config.json").exists():
-                    return AutoTokenizer.from_pretrained(str(local_path))
+                    return AutoTokenizer.from_pretrained(str(local_path), trust_remote_code=True)
 
     try:
-        return AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+        return AutoTokenizer.from_pretrained(TOKENIZER_NAME, trust_remote_code=True)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
             f"Could not load snippet tokenizer '{TOKENIZER_NAME}'. "
@@ -110,14 +115,22 @@ def _snippet_tokenizer() -> Any:
 
 
 def _truncate_snippet(text: str, max_tokens: int = SNIPPET_MAX_TOKENS) -> str:
-    normalized = " ".join(str(text).split())
+    normalized = " ".join(str(text or "").split())
     if max_tokens <= 0:
         return normalized
     tokenizer = _snippet_tokenizer()
-    tokens = tokenizer.encode(normalized, add_special_tokens=False)
-    if len(tokens) <= max_tokens:
+    tokens = tokenizer.encode(
+        normalized,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=max_tokens,
+    )
+    if not tokens:
+        return ""
+    snippet = tokenizer.decode(tokens, skip_special_tokens=True)
+    if len(tokens) < max_tokens:
         return normalized
-    return tokenizer.decode(tokens[:max_tokens], skip_special_tokens=True)
+    return snippet
 
 
 @lru_cache(maxsize=2)
@@ -129,7 +142,8 @@ def _lucene_searcher(index_path: str) -> Any:
             "python -m scripts.download_browsecomp_index"
         )
     try:
-        os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
+        if not os.environ.get("OPENAI_API_KEY"):
+            os.environ["OPENAI_API_KEY"] = "EMPTY"
         from pyserini.search.lucene import LuceneSearcher
     except ImportError as exc:
         raise RuntimeError(
@@ -165,6 +179,58 @@ def _lucene_document_text(searcher: Any, docid: str) -> str | None:
     if doc is None:
         return None
     return _contents_from_raw(doc.raw())
+
+
+def _frontmatter_metadata(text: str) -> dict[str, str]:
+    value = str(text or "")
+    if not value.startswith("---"):
+        return {}
+    match = re.match(r"^---\s*\n(.*?)\n---\s*(?:\n|$)", value, flags=re.DOTALL)
+    if not match:
+        return {}
+    metadata: dict[str, str] = {}
+    for line in match.group(1).splitlines():
+        key, sep, val = line.partition(":")
+        if not sep:
+            continue
+        clean_key = key.strip().lower()
+        clean_val = val.strip().strip('"').strip("'")
+        if clean_key and clean_val:
+            metadata[clean_key] = clean_val
+    return metadata
+
+
+def _document_title(text: str, docid: str) -> str:
+    metadata = _frontmatter_metadata(text)
+    if metadata.get("title"):
+        return metadata["title"]
+    for line in str(text or "").splitlines():
+        clean = line.strip().strip("#").strip()
+        if clean and clean != "---":
+            return clean[:200]
+    return f"BrowseComp document {docid}"
+
+
+def _document_source(text: str) -> str:
+    metadata = _frontmatter_metadata(text)
+    for key in ("source", "url", "site", "domain"):
+        if metadata.get(key):
+            return metadata[key]
+    return "browsecomp_fixed_corpus"
+
+
+def _raw_cache_path(docid: str, text: str) -> str | None:
+    root = Path(os.getenv("BROWSECOMP_SEARCH_RAW_DIR", "/tmp/sii-agent-browsecomp-search"))
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha1(str(text or "").encode("utf-8", errors="ignore")).hexdigest()[:12]
+        safe_docid = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(docid))[:80] or "doc"
+        path = root / f"{safe_docid}-{digest}.txt"
+        if not path.exists():
+            path.write_text(str(text or ""), encoding="utf-8")
+        return str(path)
+    except OSError:
+        return None
 
 
 def _search_lucene(index_path: Path, query: str, k: int = DEFAULT_K) -> list[tuple[str, float, str]]:
@@ -210,8 +276,8 @@ def _search_rows(query: str, k: int = DEFAULT_K) -> list[tuple[str, float, str]]
 
 def _official_search_payload(query: str, k: int = DEFAULT_K) -> str:
     try:
-        k = max(1, min(int(k), 20))
-        rows = _search_rows(query, k)
+        _ = k
+        rows = _search_rows(query, DEFAULT_K)
         record_retrieved_docids([docid for docid, _, _ in rows])
         results = [
             {
@@ -228,7 +294,7 @@ def _official_search_payload(query: str, k: int = DEFAULT_K) -> str:
 
 @register(
     "search",
-    "Search the BrowseComp-Plus fixed corpus only. Use for BrowseComp tasks, not general web/SimpleVQA questions. Returns top-5 hits with docid, score, and snippet.",
+    "Search the BrowseComp-Plus fixed corpus only. Use for BrowseComp tasks, not general web/SimpleVQA questions. Returns top-5 hits with docid, score, and a 512-token snippet.",
     {
         "type": "object",
         "properties": {
@@ -244,19 +310,19 @@ def search(query: str) -> str:
 
 @register(
     "browsecomp_search",
-    "Search the local BrowseComp fixed corpus/index. Use this first for text-only BrowseComp-style questions. Returns docid, score, and a query-focused snippet from the local corpus; this is not live web search.",
+    "Search the local BrowseComp fixed corpus/index with BM25 lexical retrieval. Use this first for text-only BrowseComp-style questions. Returns top-5 hits with docid, score, and a 512-token snippet. This is not live web search or semantic QA; short rare-term/phrase queries work best.",
     {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "Focused search query string, preferably with distinctive quoted phrases or candidate names."},
-            "k": {"type": "integer", "default": DEFAULT_K, "minimum": 1, "maximum": 20},
+            "query": {"type": "string", "description": "Focused 2-6 token BM25 lexical query with distinctive quoted phrases, rare names, dates, or candidate answer terms; do not paste the full question."},
         },
         "required": ["query"],
         "additionalProperties": False,
     },
 )
 def browsecomp_search(query: str, k: int = DEFAULT_K) -> str:
-    return _official_search_payload(query, k=k)
+    _ = k
+    return _official_search_payload(query)
 
 
 @register(

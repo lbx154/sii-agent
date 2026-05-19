@@ -136,6 +136,18 @@ def _env_api_key() -> str:
     return api_key
 
 
+def _env_float(name: str, default: float, minimum: float = 1.0, maximum: float = 1800.0) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _vision_timeout(default: float = 90.0) -> float:
+    return _env_float("VISION_TOOL_TIMEOUT", default)
+
+
 def _is_http_url(source: str) -> bool:
     parsed = urlparse(source)
     return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
@@ -182,7 +194,7 @@ def _load_image(source: str) -> tuple[str, bytes]:
         current_url = source
         for _ in range(_MAX_REDIRECTS + 1):
             _assert_public_http_url(current_url)
-            response = httpx.get(current_url, timeout=30, follow_redirects=False)
+            response = httpx.get(current_url, timeout=_vision_timeout(30.0), follow_redirects=False)
             if response.is_redirect:
                 location = response.headers.get("location")
                 if not location:
@@ -216,7 +228,7 @@ def _call_vision(model: str, image_data_url: str, prompt: str, max_tokens: int) 
     from openai import OpenAI
 
     base_url = _env_base_url()
-    client = OpenAI(api_key=_env_api_key(), base_url=base_url, timeout=90)
+    client = OpenAI(api_key=_env_api_key(), base_url=base_url, timeout=_vision_timeout(90.0))
     messages = [
         {
             "role": "user",
@@ -335,18 +347,11 @@ def _candidate_name(candidate: Any) -> str:
 
 
 def _truncate(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    return text[: max_chars - 20].rstrip() + "\n...[truncated]"
+    return text
 
 
 def _truncate_search_result(text: str, max_chars: int = 1800) -> str:
-    sections = re.split(r"\n\n(?=## )", text)
-    if len(sections) <= 1:
-        return _truncate(text, max_chars)
-    per_section = max(500, max_chars // len(sections))
-    compact = "\n\n".join(_truncate(section, per_section) for section in sections)
-    return _truncate(compact, max_chars)
+    return text
 
 
 def _dedupe(items: list[str], limit: int) -> list[str]:
@@ -426,7 +431,7 @@ def _search_many(queries: list[str], k: int, time_budget_s: float) -> list[dict[
 
 
 def _compact_json(data: Any, max_chars: int) -> str:
-    return _truncate(json.dumps(data, ensure_ascii=False, indent=2), max_chars)
+    return json.dumps(data, ensure_ascii=False, indent=2)
 
 
 def _merge_analysis(base: dict[str, Any] | None, extra: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -540,7 +545,7 @@ def image_to_search_queries(
             {
                 "queries": queries,
                 "candidate_entities": candidate_names,
-                "vision_analysis": analysis if analysis is not None else {"raw": _truncate(raw_analysis, 1500)},
+                "vision_analysis": analysis if analysis is not None else {"raw": raw_analysis},
                 "usage_note": "Call web_search with the strongest query; refine with another query if results are weak.",
             },
             4200,
@@ -624,7 +629,7 @@ def visual_web_search(
             "candidate_entities": candidate_names,
             "queries": queries,
             "evidence": evidence,
-            "vision_analysis": analysis if analysis is not None else {"raw": _truncate(raw_analysis, 1500)},
+            "vision_analysis": analysis if analysis is not None else {"raw": raw_analysis},
             "search_elapsed_seconds": round(elapsed, 2),
             "usage_note": (
                 "This is evidence only, not a final answer. Decide from the evidence yourself, "

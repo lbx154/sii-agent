@@ -12,6 +12,14 @@ Judge only from the question, the agent answer, and the shown trajectory evidenc
 Do not assume access to a hidden gold answer. Do not recommend withholding, privacy refusal,
 or "do not answer" behavior unless the user explicitly asked for that.
 
+The ORIGINAL_PROBLEM_PROMPT is the authoritative source for the answer target and required
+constraints. Treat the trajectory as noisy: failed candidates may contain accidental attributes
+that are not part of the original problem. In root_cause/corrective_strategy, never introduce a
+new search constraint, demographic filter, industry filter, gender, nationality, company type,
+date, or entity class unless it is explicitly present in ORIGINAL_PROBLEM_PROMPT or directly
+verified by tool evidence as a required clue. If a failed candidate has an extra attribute not in
+the original prompt, call it a spurious candidate attribute and tell the retry to drop it.
+
 Decide whether a short retry is useful. A retry is useful only if the answer is missing,
 is a refusal/uncertainty response, or is visibly unsupported/contradicted by retrieved evidence.
 If the final_answer tool arguments/rationale contain self-correction such as "wait", "misread",
@@ -25,7 +33,7 @@ Output STRICT JSON with keys:
   "confidence": "high|medium|low",
   "failure_mode": "...",          // e.g., "wrong_tool", "bad_query", "hallucinated_answer", "loop", "timeout"
   "root_cause": "...",            // 1-2 sentences
-  "corrective_strategy": "...",   // concrete next-time action, optimized for few searches
+  "corrective_strategy": "...",   // concrete next-time action, optimized for few searches; use only original-prompt constraints and verified evidence
   "reusable_lesson": "...",       // <=200 chars, generic enough to help similar future tasks
   "skill_update": null | {
     "title": "...",               // 3-8 words summarizing the actual procedure, e.g. "Verify relation before answering"
@@ -51,6 +59,12 @@ Use the reference answer only as supervision to diagnose why the agent's process
 incorrect attempt. Do not write a one-off memory that merely stores the reference answer, a benchmark
 name, dataset name, or the exact example.
 
+The ORIGINAL_PROBLEM_PROMPT is the authoritative source for the answer target and required
+constraints. Treat failed trajectory candidates as noisy: do not turn their accidental attributes
+into future search constraints unless the original prompt or verified evidence makes them required.
+In corrective_strategy and skill_update.step, explicitly preserve original-prompt constraints and
+drop spurious candidate attributes.
+
 You MUST produce a high-quality reusable lesson and a non-null procedural skill_update. Optimize
 the memory for future tasks with a similar reasoning/tool failure.
 
@@ -60,7 +74,7 @@ Output STRICT JSON with keys:
   "confidence": "high|medium|low",
   "failure_mode": "...",          // concrete failure such as "wrong_relation", "bad_query", "missed_context", "overtrusted_memory"
   "root_cause": "...",            // 1-2 sentences explaining the process failure, not just the correct answer
-  "corrective_strategy": "...",   // concrete next-time action, optimized for few searches/tools
+  "corrective_strategy": "...",   // concrete next-time action, optimized for few searches/tools; use only original-prompt constraints and verified evidence
   "reusable_lesson": "...",       // <=240 chars, general and actionable; do not copy the reference answer
   "skill_update": {
     "title": "...",               // 3-8 words, concrete procedure title, e.g. "Verify Relation Direction First"
@@ -173,7 +187,12 @@ def reflect(
     correct: bool | None = None,
     include_expected: bool = False,
     force_memory: bool = False,
+    original_prompt: str | None = None,
 ) -> dict:
+    original_problem_prompt = str(original_prompt if original_prompt is not None else question or "").strip()
+    if not original_problem_prompt:
+        original_problem_prompt = str(question or "").strip()
+    agent_user_prompt = str(question or "").strip()
     metadata_lines = []
     if include_expected and expected is not None:
         metadata_lines.append(f"REFERENCE_ANSWER_FOR_TRAINING: {expected}")
@@ -181,7 +200,12 @@ def reflect(
         metadata_lines.append("EXTERNAL_EVAL: previous answer was judged incorrect")
     system_prompt = GOLD_REFLECT_SYS if include_expected and (correct is False or force_memory) else REFLECT_SYS
     user = (
-        f"QUESTION: {question}\n"
+        "ORIGINAL_PROBLEM_PROMPT:\n"
+        f"{original_problem_prompt}\n\n"
+        "FULL_AGENT_USER_PROMPT:\n"
+        f"{agent_user_prompt}\n\n"
+        "Reflection rule: corrective_strategy must be grounded in ORIGINAL_PROBLEM_PROMPT plus verified "
+        "tool evidence. Do not add filters from failed candidates unless the original prompt requires them.\n"
         + ("\n".join(metadata_lines) + "\n" if metadata_lines else "")
         + f"AGENT_FINAL_ANSWER: {result.final_answer}\n"
         f"STOP_REASON: {result.stop_reason}\n"

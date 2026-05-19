@@ -148,6 +148,7 @@ def _run_one(
             cfg=cfg,
             task=ex.get("task"),
             user_content=user_content,
+            original_prompt=ex["question"],
         )
     else:
         outcome = run_evolved(
@@ -161,6 +162,7 @@ def _run_one(
             force_reflection=force_reflection,
             task=ex.get("task"),
             user_content=user_content,
+            original_prompt=ex["question"],
         )
     return _record(ex, outcome, save_traces=save_traces, lesson_context=lesson_context, prompt_image=prompt_image)
 

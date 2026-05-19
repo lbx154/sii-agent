@@ -138,7 +138,7 @@ def _run_one(
     expected = str(ex.get("answer", "")) or None
 
     if mode == "baseline":
-        res = run_react(question, cfg=cfg, extra_system=_context())
+        res = run_react(question, cfg=cfg, extra_system=_context(), original_prompt=question)
         outcome = RunOutcome(result=res, correct=judge_answer(res.final_answer, expected))
     else:
         outcome = run_evolved(
@@ -149,6 +149,7 @@ def _run_one(
             lesson_context=_context(memory_context),
             allow_reflection=allow_reflection,
             use_gold_for_reflection=False,
+            original_prompt=question,
         )
 
     retrieved_docids = get_retrieved_docids()

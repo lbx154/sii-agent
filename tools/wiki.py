@@ -38,6 +38,13 @@ def _is_sqlite_index(index_path: str) -> bool:
     return Path(index_path).suffix in {".db", ".sqlite", ".sqlite3"}
 
 
+def _sqlite_timeout() -> float:
+    try:
+        return float(os.getenv("WIKI_SQLITE_TIMEOUT", os.getenv("SQLITE_TOOL_TIMEOUT", "30")))
+    except ValueError:
+        return 30.0
+
+
 @lru_cache(maxsize=1)
 def _load_index(index_path: str) -> tuple[object, list[dict]]:
     from rank_bm25 import BM25Okapi
@@ -104,7 +111,7 @@ def _search_sqlite(index_path: str, query: str, k: int) -> str:
             f"{path} not found. Build it with: python -m scripts.build_wiki_fts"
         )
 
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=_sqlite_timeout())
     try:
         rows = []
         for match_query in _fts_queries(query):
@@ -125,7 +132,7 @@ def _search_sqlite(index_path: str, query: str, k: int) -> str:
 
     out: list[str] = []
     for rank, (doc_id, title, text, score) in enumerate(rows, 1):
-        snippet = str(text).replace("\n", " ")[:500]
+        snippet = str(text).replace("\n", " ")
         out.append(
             f"[{rank}] {title} (wiki25 id={doc_id}, score={-score:.2f})\n"
             f"    {snippet}"
@@ -140,7 +147,7 @@ def _get_page_sqlite(index_path: str, title_or_id: str, max_chars: int) -> str:
             f"{path} not found. Build it with: python -m scripts.build_wiki_fts"
         )
     needle = str(title_or_id).strip()
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=_sqlite_timeout())
     try:
         rows = conn.execute(
             """
@@ -177,8 +184,6 @@ def _get_page_sqlite(index_path: str, title_or_id: str, max_chars: int) -> str:
         out = []
         for doc_id, title, text in rows:
             content = str(text).strip()
-            if len(content) > max_chars:
-                content = content[:max_chars].rstrip() + " ..."
             out.append(f"# {title} (wiki25 id={doc_id})\n{content}")
         return "\n\n".join(out)
     finally:
@@ -227,7 +232,7 @@ def wiki_search(query: str, k: int = 5) -> str:
         if scores[idx] <= 0:
             continue
         doc = docs[idx]
-        snippet = doc["text"].replace("\n", " ")[:500]
+        snippet = doc["text"].replace("\n", " ")
         out.append(
             f"[{rank}] {doc['title']} (wiki25 id={doc['id']}, score={scores[idx]:.2f})\n"
             f"    {snippet}"
@@ -242,13 +247,18 @@ def wiki_search(query: str, k: int = 5) -> str:
         "type": "object",
         "properties": {
             "title_or_id": {"type": "string", "description": "Exact Wikipedia title or wiki25 id from wiki_search"},
-            "max_chars": {"type": "integer", "default": 4000, "minimum": 500, "maximum": 12000},
+            "max_chars": {
+                "type": "integer",
+                "default": 4000,
+                "minimum": 500,
+                "maximum": 12000,
+                "description": "Deprecated/ignored; wiki_page now returns full available page text.",
+            },
         },
         "required": ["title_or_id"],
     },
 )
 def wiki_page(title_or_id: str, max_chars: int = 4000) -> str:
-    max_chars = max(500, min(int(max_chars), 12000))
     index_path = str(_default_index_path())
     if _is_sqlite_index(index_path):
         try:
@@ -281,7 +291,5 @@ def wiki_page(title_or_id: str, max_chars: int = 4000) -> str:
     out = []
     for doc in matches[:3]:
         content = str(doc.get("text", "")).strip()
-        if len(content) > max_chars:
-            content = content[:max_chars].rstrip() + " ..."
         out.append(f"# {doc.get('title', '')} (wiki25 id={doc.get('id', '')})\n{content}")
     return "\n\n".join(out)

@@ -34,6 +34,51 @@ _TASK_SPECIFIC_SCOPES = {"keep_task_specific", "keep_simplevqa", "task_specific"
 _GENERAL_TASK_FAMILIES = {"general", "target_general", "web_research"}
 _VISUAL_TASK_FAMILIES = {"simplevqa", "visual_qa", "vqa_search", "ocr"}
 _TEXT_TASK_FAMILIES = {"browsecomp_special", "multihop_text", "comparison", "relation_chain", "2wiki"}
+_VISUAL_MEMORY_TAGS = {"visual_qa", "simplevqa", "vqa_search", "ocr"}
+_BROWSECOMP_TEXT_PRIORITY_FAMILIES = {
+    "browsecomp_special",
+    "web_research",
+    "multihop_text",
+    "relation_chain",
+    "comparison",
+    "2wiki",
+}
+_BROWSECOMP_TEXT_PRIORITY_CATEGORIES = {
+    "global_verification",
+    "query_reformulation",
+    "evidence_triage",
+    "format",
+    "generic_reasoning",
+    "tool_recovery",
+    "browser_navigation",
+    "multihop_text",
+    "comparison",
+}
+_BROWSECOMP_TEXT_PRIORITY_TERMS = {
+    "constraint",
+    "constraints",
+    "candidate",
+    "candidates",
+    "evidence",
+    "verify",
+    "verification",
+    "source",
+    "sources",
+    "query",
+    "search",
+    "format",
+    "granularity",
+    "full",
+    "name",
+    "date",
+    "unit",
+    "ticker",
+    "span",
+    "multi",
+    "hop",
+    "relation",
+    "chain",
+}
 _GENERAL_CATEGORIES = {
     "global_verification",
     "query_reformulation",
@@ -85,14 +130,6 @@ def _show_episode_answers() -> bool:
 
 def _safe_checklist_enabled() -> bool:
     return _env_bool("SII_MEMORY_SAFE_CHECKLIST", True)
-
-
-def _memory_return_ref_limit() -> int:
-    return _clamp_int(os.getenv("SII_MEMORY_MAX_RETURN_REFS", "3"), 3, 0, 6)
-
-
-def _memory_guidance_char_limit() -> int:
-    return _clamp_int(os.getenv("SII_MEMORY_GUIDANCE_MAX_CHARS", "480"), 480, 240, 900)
 
 
 def _write_blocked(tool_name: str) -> str | None:
@@ -187,8 +224,7 @@ def _clamp_int(value: int, default: int, minimum: int, maximum: int) -> int:
 
 
 def _short(text: object, limit: int) -> str:
-    clean = " ".join(str(text or "").split())
-    return clean[:limit]
+    return " ".join(str(text or "").split())
 
 
 def _hash_text(text: object, limit: int = 4096) -> str:
@@ -426,7 +462,7 @@ def _infer_memory_metadata(kind: str, item: dict[str, Any]) -> dict[str, Any]:
         "task_family": task_family,
         "memory_scope": memory_scope,
         "category": category,
-        "tags": tags[:12],
+        "tags": tags,
         "modality": modality,
         "confidence": round(confidence, 3),
         "has_explicit_metadata": any(
@@ -471,6 +507,32 @@ def _current_memory_profile(query: str, prompt_context: dict[str, Any]) -> dict[
     }
 
 
+def _is_visual_memory(result: dict[str, Any]) -> bool:
+    metadata = result.get("metadata") or {}
+    tags = {str(tag).lower() for tag in (metadata.get("tags") or [])}
+    task_family = str(metadata.get("task_family") or "").lower()
+    modality = str(metadata.get("modality") or "").lower()
+    return modality == "image" or task_family in _VISUAL_TASK_FAMILIES or bool(tags & _VISUAL_MEMORY_TAGS)
+
+
+def _browsecomp_text_priority(result: dict[str, Any]) -> bool:
+    metadata = result.get("metadata") or {}
+    tags = {str(tag).lower() for tag in (metadata.get("tags") or [])}
+    task_family = str(metadata.get("task_family") or "").lower()
+    category = str(metadata.get("category") or "").lower()
+    matched_terms = {str(term).lower() for term in (result.get("matched_terms") or [])}
+    if task_family in _BROWSECOMP_TEXT_PRIORITY_FAMILIES and task_family not in _VISUAL_TASK_FAMILIES:
+        return True
+    if category in _BROWSECOMP_TEXT_PRIORITY_CATEGORIES:
+        return True
+    if tags & _BROWSECOMP_TEXT_PRIORITY_CATEGORIES:
+        return True
+    if matched_terms & _BROWSECOMP_TEXT_PRIORITY_TERMS:
+        return True
+    text = _flatten_text((result.get("item") or {})).lower()
+    return any(term in text for term in ("constraint", "verify each", "final answer span", "answer format", "evidence"))
+
+
 def _is_general_memory(result: dict[str, Any]) -> bool:
     metadata = result.get("metadata") or {}
     scope = str(metadata.get("memory_scope") or "").lower()
@@ -495,6 +557,8 @@ def _general_memory_transfers(result: dict[str, Any], profile: dict[str, Any]) -
         tags & _CROSS_MODAL_GENERAL_CATEGORIES
     )
     task_family = str(metadata.get("task_family") or "").lower()
+    if profile["modality"] != "image" and _is_visual_memory(result):
+        return False
     if task_family in _VISUAL_TASK_FAMILIES and profile["modality"] != "image" and not cross_modal_policy:
         return False
     if task_family in _TEXT_TASK_FAMILIES and profile["modality"] != "text" and not cross_modal_policy:
@@ -510,6 +574,8 @@ def _is_strong_specific_memory(result: dict[str, Any], profile: dict[str, Any]) 
     modality = str(metadata.get("modality") or "").lower()
     score = float(result.get("score") or 0.0)
     matched_terms = list(result.get("matched_terms") or [])
+    if profile["modality"] != "image" and _is_visual_memory(result):
+        return False
     if modality and modality != profile["modality"]:
         return False
     if profile["modality"] == "image":
@@ -540,6 +606,9 @@ def _layer_memory_results(
     rejected = 0
     for result in results:
         row = dict(result)
+        if profile["modality"] != "image" and _is_visual_memory(row):
+            rejected += 1
+            continue
         if _is_general_memory(row) and _general_memory_transfers(row, profile):
             row["memory_layer"] = "general_policy"
             row["applicability_reason"] = "cross-domain abstract policy"
@@ -550,25 +619,69 @@ def _layer_memory_results(
             specific.append(row)
         else:
             rejected += 1
-    max_refs = _memory_return_ref_limit()
-    max_general = min(max_refs, _clamp_int(os.getenv("SII_MEMORY_MAX_GENERAL_REFS", "2"), 2, 0, max_refs))
-    max_specific = max(0, max_refs - max_general)
-    selected = general[:max_general] + specific[:max_specific]
-    if len(selected) < max_refs:
-        selected.extend(specific[max_specific : max_specific + (max_refs - len(selected))])
-    return selected[:max_refs], {
+    if profile["task_family"] == "browsecomp_special" and profile["modality"] == "text":
+        weak_general = 0
+        filtered_general: list[dict[str, Any]] = []
+        for row in general:
+            if _browsecomp_text_priority(row):
+                filtered_general.append(row)
+            else:
+                weak_general += 1
+        general = filtered_general
+        specific.sort(
+            key=lambda row: (
+                0 if _browsecomp_text_priority(row) else 1,
+                -float(row.get("score") or 0.0),
+                str(row.get("id")),
+            )
+        )
+        general.sort(
+            key=lambda row: (
+                0 if _browsecomp_text_priority(row) else 1,
+                -float(row.get("score") or 0.0),
+                str(row.get("id")),
+            )
+        )
+        rejected += weak_general
+    selected = general + specific
+    return selected, {
         "enabled": True,
         "profile": profile,
         "input_candidates": len(results),
-        "kept": len(selected[:max_refs]),
-        "kept_general_policy": min(len(general), max_general),
-        "kept_task_specific": max(0, min(len(specific), max_refs - min(len(general), max_general))),
+        "kept": len(selected),
+        "kept_general_policy": len(general),
+        "kept_task_specific": len(specific),
         "rejected_as_not_applicable": rejected,
         "policy": (
             "general cross-domain memories are used only as abstract checklist policies; "
             "task-specific memories require a strong task/modality match"
         ),
     }
+
+
+def _evidence_tool_count() -> int:
+    ctx = get_tool_context()
+    trajectory = ctx.get("trajectory")
+    if not isinstance(trajectory, list):
+        return 0
+    count = 0
+    for event in trajectory:
+        if not isinstance(event, dict) or event.get("role") != "tool":
+            continue
+        name = str(event.get("name") or "")
+        if name and name not in {"memory_search", "memory_search_prefetch", "memory_get", "memory_list", "final_answer"}:
+            count += 1
+    return count
+
+
+def _should_defer_memory_until_evidence(profile: dict[str, Any], auto_prefetch: bool) -> bool:
+    if auto_prefetch:
+        return False
+    if not _env_bool("SII_MEMORY_REQUIRE_EVIDENCE_BEFORE_SEARCH", True):
+        return False
+    if profile.get("task") != "benchmark_csv":
+        return False
+    return _evidence_tool_count() < _clamp_int(os.getenv("SII_MEMORY_MIN_EVIDENCE_TOOLS", "1"), 1, 0, 5)
 
 
 def _soft_metadata_adjustment(
@@ -639,7 +752,7 @@ def _scan_kind(kind: str, queries: list[str], include_seed: bool) -> tuple[list[
                 "lexical_score": round(score, 3),
                 "metadata": _infer_memory_metadata(kind, item),
                 "matched_queries": matched_queries,
-                "matched_terms": matched_terms[:16],
+                "matched_terms": matched_terms,
                 "matched_fields": matched_fields,
                 "item": redacted_item,
             }
@@ -648,7 +761,7 @@ def _scan_kind(kind: str, queries: list[str], include_seed: bool) -> tuple[list[
     return results, scanned
 
 
-def _format_memory_result(result: dict[str, Any], max_chars: int) -> dict[str, Any]:
+def _format_memory_result(result: dict[str, Any], max_chars: int = 0) -> dict[str, Any]:
     item = result["item"]
     base = {
         "type": result["type"],
@@ -686,10 +799,10 @@ def _format_memory_result(result: dict[str, Any], max_chars: int) -> dict[str, A
             "title": _short(item.get("title"), 180),
             "description": _short(item.get("description"), max_chars),
             "tags": item.get("tags"),
-            "triggers": [_short(step, 120) for step in (item.get("triggers") or [])[:8]],
-            "steps": [_short(step, max_chars) for step in (item.get("steps") or [])[:4]],
-            "verifier": [_short(step, max_chars) for step in (item.get("verifier") or [])[:3]],
-            "bad_patterns": [_short(step, max_chars) for step in (item.get("bad_patterns") or [])[:3]],
+            "triggers": [_short(step, 120) for step in (item.get("triggers") or [])],
+            "steps": [_short(step, max_chars) for step in (item.get("steps") or [])],
+            "verifier": [_short(step, max_chars) for step in (item.get("verifier") or [])],
+            "bad_patterns": [_short(step, max_chars) for step in (item.get("bad_patterns") or [])],
         }
     return base
 
@@ -697,11 +810,6 @@ def _format_memory_result(result: dict[str, Any], max_chars: int) -> dict[str, A
 def _compact_memory_ref(result: dict[str, Any]) -> dict[str, Any]:
     item = result["item"]
     metadata = result.get("metadata", {}) or {}
-    compact_metadata = {
-        key: metadata.get(key)
-        for key in ("task_family", "memory_scope", "category", "modality", "confidence")
-        if metadata.get(key) not in (None, "", [])
-    }
     base = {
         "kind": result["kind"],
         "type": result["type"],
@@ -709,11 +817,12 @@ def _compact_memory_ref(result: dict[str, Any]) -> dict[str, Any]:
         "source": result["source"],
         "score": result["score"],
         "lexical_score": result.get("lexical_score", result["score"]),
-        "metadata": compact_metadata,
+        "metadata": metadata,
         "memory_layer": result.get("memory_layer"),
         "applicability_reason": result.get("applicability_reason"),
-        "matched_fields": result["matched_fields"][:4],
-        "matched_terms": result["matched_terms"][:6],
+        "matched_fields": result["matched_fields"],
+        "matched_terms": result["matched_terms"],
+        "record": item,
     }
     if result["kind"] == "lessons":
         base["summary"] = {
@@ -724,9 +833,9 @@ def _compact_memory_ref(result: dict[str, Any]) -> dict[str, Any]:
     elif result["kind"] == "skills":
         base["summary"] = {
             "title": _short(item.get("title"), 100),
-            "steps": [_short(step, 220) for step in (item.get("steps") or [])[:2]],
-            "verifier": [_short(step, 180) for step in (item.get("verifier") or [])[:2]],
-            "avoid": [_short(step, 160) for step in (item.get("bad_patterns") or [])[:2]],
+            "steps": [_short(step, 220) for step in (item.get("steps") or [])],
+            "verifier": [_short(step, 180) for step in (item.get("verifier") or [])],
+            "avoid": [_short(step, 160) for step in (item.get("bad_patterns") or [])],
         }
     else:
         summary = {
@@ -874,7 +983,7 @@ def _current_prompt_context() -> dict[str, Any]:
     }
 
 
-def _summarize_current_trace(max_chars: int = 5000) -> str:
+def _summarize_current_trace(max_chars: int = 0) -> str:
     ctx = get_tool_context()
     trajectory = ctx.get("trajectory")
     if not isinstance(trajectory, list) or not trajectory:
@@ -897,7 +1006,7 @@ def _summarize_current_trace(max_chars: int = 5000) -> str:
         ),
         None,
     )
-    events = list(trajectory[-20:])
+    events = list(trajectory)
     if latest_evidence_summary is not None and all(event is not latest_evidence_summary for event in events):
         events.insert(0, latest_evidence_summary)
     if latest_context_compact is not None and all(event is not latest_context_compact for event in events):
@@ -926,7 +1035,7 @@ def _summarize_current_trace(max_chars: int = 5000) -> str:
             content_limit = 2200 if name == "context_compact" else 1800 if name == "evidence_summary" else 500
             content = _short(event.get("content"), content_limit)
             parts.append(f"#{i} system[{name}] {content}")
-    return _short("\n".join(parts), max_chars)
+    return "\n".join(parts)
 
 
 def _trace_signature() -> tuple[Any, ...]:
@@ -1400,15 +1509,14 @@ def _summarize_memory_guidance(
         user = {
             "current_question": _short(_original_question(query), 800),
             "current_prompt": prompt_context["prompt_text"],
-            "current_trace_so_far": _summarize_current_trace(6000),
+            "current_trace_so_far": _summarize_current_trace(),
             "image_context": {
                 "attached_to_this_message": prompt_context["image_attached"],
                 "sources": prompt_context["image_sources"],
             },
             "queries_used": queries,
-            "max_guidance_chars": max_chars,
             "output_schema": {
-                "guidance": f"single concise paragraph, <= {max_chars} chars",
+                "guidance": "single concise paragraph",
                 "apply": ["1-3 generic checklist items"],
                 "avoid": ["0-2 pitfalls, especially treating memory as evidence"],
                 "supporting_refs": [{"kind": "lessons|skills|episodes", "id": "record id", "why": "short reason"}],
@@ -1422,7 +1530,7 @@ def _summarize_memory_guidance(
                 "transfer only reusable search/verification procedures that fit the current prompt and image",
                 "if no reusable memory is specific enough, say to solve from current evidence and do not invent unsupported answers",
             ],
-            "retrieved_memory_refs": refs[:10],
+            "retrieved_memory_refs": refs,
         }
         user_text = json.dumps(user, ensure_ascii=False)
         user_content: str | list[dict[str, Any]]
@@ -1435,7 +1543,6 @@ def _summarize_memory_guidance(
             tools=None,
             temperature=0,
             response_format={"type": "json_object"},
-            max_tokens=1200,
             timeout=float(os.getenv("SII_MEMORY_SEARCH_SUMMARY_TIMEOUT", "90")),
         )
         parsed = _parse_json_object(response.choices[0].message.content or "")
@@ -1491,8 +1598,6 @@ def _summarize_memory_guidance(
             "include_skills": {"type": "boolean", "default": True},
             "include_seed": {"type": "boolean", "default": False},
             "auto_prefetch": {"type": "boolean", "default": False},
-            "max_chars_per_item": {"type": "integer", "default": 900, "minimum": 120, "maximum": 3000},
-            "guidance_max_chars": {"type": "integer", "default": 480, "minimum": 240, "maximum": 900},
         },
         "required": [],
     },
@@ -1507,12 +1612,9 @@ def memory_search(
     include_skills: bool = True,
     include_seed: bool = False,
     auto_prefetch: bool = False,
-    max_chars_per_item: int = 900,
-    guidance_max_chars: int = 480,
+    **_ignored: Any,
 ) -> str:
     k = _clamp_int(k, 3, 1, 20)
-    max_chars_per_item = _clamp_int(max_chars_per_item, 900, 120, 3000)
-    guidance_max_chars = min(_clamp_int(guidance_max_chars, 480, 240, 900), _memory_guidance_char_limit())
     root = _memory_root()
     if not str(query or "").strip() and queries:
         query = str(queries[0])
@@ -1527,6 +1629,54 @@ def memory_search(
                 "runtime_mode": _runtime_mode(),
                 "read_only": _memory_read_only(),
                 "error": "memory_search requires a non-empty query or queries.",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    profile = _current_memory_profile(query, prompt_context)
+    if _should_defer_memory_until_evidence(profile, bool(auto_prefetch)):
+        guidance = {
+            "guidance": "No memory retrieved yet: gather at least one current evidence/search result first, then call memory_search as a checklist for candidate verification or search recovery.",
+            "apply": ["Use browsecomp_search/web_search or page tools first to establish a concrete candidate or failure state."],
+            "avoid": ["Do not use memory as the first evidence source or as an answer source."],
+            "supporting_refs": [],
+            "summary_source": "deferred_until_evidence",
+        }
+        return json.dumps(
+            {
+                "memory_root": str(root),
+                "runtime_mode": _runtime_mode(),
+                "read_only": _memory_read_only(),
+                "query": query,
+                "initial_queries": initial_queries,
+                "heuristic_queries": heuristic_queries,
+                "queries_used": initial_queries,
+                "queries_used_count": len(initial_queries),
+                "query_expansion": {"enabled": False, "reason": "deferred_until_evidence"},
+                "rerank": {"enabled": False, "reason": "deferred_until_evidence"},
+                "layering": {
+                    "enabled": True,
+                    "profile": profile,
+                    "input_candidates": 0,
+                    "kept": 0,
+                    "rejected_as_not_applicable": 0,
+                    "policy": "memory_search is deferred until current evidence exists",
+                },
+                "scanned_records": {},
+                "guidance_context": {
+                    "used_current_prompt": bool(prompt_context["prompt_text"]),
+                    "used_current_trace": False,
+                    "current_trace_chars": 0,
+                    "image_attached": prompt_context["image_attached"],
+                    "image_sources": prompt_context["image_sources"],
+                },
+                "guidance": guidance,
+                "record_refs": [],
+                "full_records_suppressed": False,
+                "suppressed_result_count": 0,
+                "usage_note": (
+                    "Use memory after current evidence is available; memory is only a checklist, not evidence."
+                ),
             },
             ensure_ascii=False,
             indent=2,
@@ -1548,14 +1698,14 @@ def memory_search(
     results.sort(key=lambda row: (-float(row["score"]), str(row["kind"]), str(row["id"])))
     results = _apply_metadata_soft_rerank(results, prompt_context)
     results, layering = _layer_memory_results(results, prompt_context, query)
-    results, rerank = _rerank_memory_results(query, normalized_queries, results, k=max(_memory_return_ref_limit(), 1), auto_prefetch=bool(auto_prefetch))
-    return_limit = min(k, _memory_return_ref_limit())
+    results, rerank = _rerank_memory_results(query, normalized_queries, results, k=k, auto_prefetch=bool(auto_prefetch))
+    return_limit = k
     compact_refs = [_compact_memory_ref(result) for result in results[:return_limit]]
     guidance = _summarize_memory_guidance(
         query,
         normalized_queries,
         compact_refs,
-        max_chars=guidance_max_chars,
+            max_chars=0,
         profile=layering.get("profile") if isinstance(layering, dict) else None,
     )
     trace_summary = _summarize_current_trace()
@@ -1565,9 +1715,9 @@ def memory_search(
             "runtime_mode": _runtime_mode(),
             "read_only": _memory_read_only(),
             "query": query,
-            "initial_queries": initial_queries[:5],
-            "heuristic_queries": heuristic_queries[:5],
-            "queries_used": normalized_queries[:5],
+            "initial_queries": initial_queries,
+            "heuristic_queries": heuristic_queries,
+            "queries_used": normalized_queries,
             "queries_used_count": len(normalized_queries),
             "query_expansion": _compact_query_expansion_meta(query_expansion),
             "rerank": rerank,
@@ -1582,12 +1732,12 @@ def memory_search(
             },
             "guidance": guidance,
             "record_refs": compact_refs,
-            "full_records_suppressed": True,
-            "suppressed_result_count": max(0, len(results) - len(compact_refs)),
+            "full_records_suppressed": False,
+            "suppressed_result_count": 0,
+            "additional_match_count": max(0, len(results) - len(compact_refs)),
             "usage_note": (
                 "Use the guidance only as a short checklist, not as evidence or a source of answer candidates. "
-                "record_refs are compact ids/summaries only; "
-                "use memory_get for full content before risky updates/deletes. "
+                "record_refs include the full redacted retrieved records. "
                 "Use memory_update/delete only when the returned id clearly identifies stale or bad memory. "
                 "Memory is guidance, not evidence; verify current answers from current context/tools."
             ),
@@ -1636,14 +1786,12 @@ def memory_stats() -> str:
             "kind": {"type": "string", "default": "lessons", "enum": ["lessons", "episodes", "skills"]},
             "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
             "offset": {"type": "integer", "default": 0, "minimum": 0},
-            "max_chars_per_item": {"type": "integer", "default": 500, "minimum": 120, "maximum": 2000},
         },
     },
 )
-def memory_list(kind: str = "lessons", limit: int = 20, offset: int = 0, max_chars_per_item: int = 500) -> str:
+def memory_list(kind: str = "lessons", limit: int = 20, offset: int = 0, **_ignored: Any) -> str:
     limit = _clamp_int(limit, 20, 1, 100)
     offset = _clamp_int(offset, 0, 0, 1_000_000)
-    max_chars_per_item = _clamp_int(max_chars_per_item, 500, 120, 2000)
     path = _kind_path(kind)
     rows = _read_jsonl(path)
     normalized_kind = path.stem
@@ -1651,8 +1799,7 @@ def memory_list(kind: str = "lessons", limit: int = 20, offset: int = 0, max_cha
     for index, item in enumerate(rows[offset:offset + limit], offset):
         original_with_id = _with_id(normalized_kind, item)
         item_with_id = _with_id(normalized_kind, _redact_memory_item(normalized_kind, original_with_id))
-        preview = {key: _short(value, max_chars_per_item) for key, value in item_with_id.items() if key != "id"}
-        items.append({"index": index, "id": item_with_id["id"], "item": preview})
+        items.append({"index": index, "id": item_with_id["id"], "item": item_with_id})
     return json.dumps(
         {
             "memory_root": str(_memory_root()),
