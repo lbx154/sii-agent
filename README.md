@@ -145,20 +145,20 @@ PYTHONPATH=/root/sii-agent/third_party/sglang/python:/root/sii-agent/third_party
   > logs/services/sglang_qwen35_9b_base_8000.log 2>&1
 ```
 
-启动 Qwen3.5-27B teacher（GPU 0,1，端口 8004）：
+启动 Qwen3.5-27B teacher（GPU 0，端口 8004；单张 B200 足够）：
 
 ```bash
 cd /root/cyl/sii-agent
 mkdir -p logs/services
 
-CUDA_VISIBLE_DEVICES=0,1 \
+CUDA_VISIBLE_DEVICES=0 \
 PYTHONPATH=/root/sii-agent/third_party/sglang/python:/root/sii-agent/third_party/slime \
 /root/micromamba/envs/myslime/bin/python3.12 -m sglang.launch_server \
   --model-path /root/sii-agent/Qwen3.5-27B \
   --served-model-name qwen35-27b-sglang \
   --host 0.0.0.0 \
   --port 8004 \
-  --tp-size 2 \
+  --tp-size 1 \
   --mem-fraction-static 0.80 \
   --context-length 262144 \
   --reasoning-parser qwen3 \
