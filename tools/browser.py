@@ -986,35 +986,21 @@ def browser_open(
                 return _pdf_snapshot(url, max_chars=max_chars, extract_query=extract_query)
             except Exception as exc:  # noqa: BLE001
                 pdf_error = exc
-        service_session_id = _service_session_id(session_id)
-        try:
-            _browser_service_request(
-                "POST",
-                "/browser/navigate",
-                json_body={
-                    "session_id": service_session_id,
-                    "url": url,
-                    "wait_until": _wait_until(wait_until),
-                    "timeout_ms": timeout_ms,
-                },
-                timeout=timeout_ms / 1000 + 15,
-            )
-        except Exception as exc:  # noqa: BLE001
-            if "navigation started a download" in str(exc):
-                try:
+
+        def action(page: Any) -> str:
+            try:
+                page.goto(url, wait_until=_wait_until(wait_until), timeout=timeout_ms)
+            except Exception as exc:  # noqa: BLE001
+                if "navigation started a download" in str(exc):
                     return _pdf_snapshot(url, max_chars=max_chars, extract_query=extract_query)
-                except Exception as pdf_exc:  # noqa: BLE001
-                    raise RuntimeError(f"{exc}; PDF text extraction failed: {pdf_exc}") from pdf_exc
-            if pdf_error is not None:
-                raise RuntimeError(f"PDF text extraction failed: {pdf_error}; browser navigation failed: {exc}") from exc
-            raise
-        return _service_snapshot(
-            service_session_id,
-            max_chars=max_chars,
-            extract_query=extract_query,
-        )
+                if pdf_error is not None:
+                    raise RuntimeError(f"PDF text extraction failed: {pdf_error}; browser navigation failed: {exc}") from exc
+                raise
+            return _snapshot(page, max_chars=max_chars, extract_query=extract_query)
+
+        return _BROWSER_MANAGER.run(session_id, action, timeout_ms / 1000 + 20)
     except Exception as exc:  # noqa: BLE001
-        return _service_error(exc)
+        return _format_playwright_error(exc)
 
 
 @register(
@@ -1074,60 +1060,25 @@ def browser_open_many(
     def open_one(index: int, url: str) -> dict[str, Any]:
         if not url:
             return {"index": index, "url": url, "ok": False, "error": "url must not be empty"}
-        tab_id = ""
-        service_session_id = ""
-        close_error = ""
+        bulk_session_id = f"{session_prefix or 'bulk'}-{index}"
         try:
-            service_session_id = _service_session_id(session_prefix or "bulk")
-            new_tab = _browser_service_request(
-                "POST",
-                "/tab/new",
-                json_body={"session_id": service_session_id, "url": "about:blank"},
-            )
-            tab_id = str(new_tab.get("tab_id") or "")
-            if not tab_id:
-                raise RuntimeError(f"new_tab returned empty tab_id: {new_tab}")
-            _browser_service_request(
-                "POST",
-                "/browser/navigate",
-                json_body={
-                    "session_id": service_session_id,
-                    "tab_id": tab_id,
-                    "url": url,
-                    "wait_until": _wait_until(wait_until),
-                    "timeout_ms": timeout_ms,
-                },
-                timeout=timeout_ms / 1000 + 15,
-            )
-            snapshot = json.loads(
-                _service_snapshot(
-                    service_session_id,
-                    tab_id=tab_id,
-                    max_chars=max_chars,
-                    extract_query=extract_query,
-                )
-            )
+            def action(page: Any) -> str:
+                page.goto(url, wait_until=_wait_until(wait_until), timeout=timeout_ms)
+                return _snapshot(page, max_chars=max_chars, extract_query=extract_query)
+
+            snapshot = json.loads(_BROWSER_MANAGER.run(bulk_session_id, action, timeout_ms / 1000 + 20))
             ok = True
         except Exception as exc:  # noqa: BLE001
-            snapshot = _service_error(exc)
+            snapshot = _format_playwright_error(exc)
             ok = False
         finally:
-            if tab_id:
-                try:
-                    _browser_service_request(
-                        "POST",
-                        "/tab/close",
-                        json_body={"session_id": service_session_id, "tab_id": tab_id},
-                )
-                except Exception as exc:  # noqa: BLE001
-                    close_error = _service_error(exc)
+            _BROWSER_MANAGER.close(bulk_session_id)
         return {
             "index": index,
-            "session_id": service_session_id,
+            "session_id": bulk_session_id,
             "url": url,
             "ok": ok,
             "snapshot": snapshot,
-            **({"close_error": close_error} if close_error else {}),
         }
 
     with ThreadPoolExecutor(max_workers=min(concurrency, len(limited_urls))) as pool:
@@ -1172,17 +1123,17 @@ def browser_text(
     max_links: int = 20,
     max_controls: int = 20,
 ) -> str:
-    try:
-        service_session_id = _service_session_id(session_id)
-        return _service_snapshot(
-            service_session_id,
+    return _BROWSER_MANAGER.run(
+        session_id,
+        lambda page: _snapshot(
+            page,
             max_chars=max_chars,
             max_links=max_links,
             max_controls=max_controls,
             extract_query=extract_query,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _service_error(exc)
+        ),
+        30,
+    )
 
 
 @register(
@@ -1230,12 +1181,16 @@ def browser_click(
 ) -> str:
     timeout_ms = _clamp(timeout_ms, 1000, 120000)
     max_chars = max(0, int(max_chars))
-    try:
-        service_session_id = _service_session_id(session_id)
-        _service_click_target(service_session_id, target, by)
-        return _service_snapshot(service_session_id, max_chars=max_chars, extract_query=extract_query)
-    except Exception as exc:  # noqa: BLE001
-        return _service_error(exc)
+    def action(page: Any) -> str:
+        locator = _resolve_locator(page, target, by)
+        locator.click(timeout=timeout_ms)
+        try:
+            page.wait_for_load_state(_wait_until(wait_until), timeout=timeout_ms)
+        except Exception:  # noqa: BLE001
+            pass
+        return _snapshot(page, max_chars=max_chars, extract_query=extract_query)
+
+    return _BROWSER_MANAGER.run(session_id, action, timeout_ms / 1000 + 20)
 
 
 @register(
@@ -1286,12 +1241,18 @@ def browser_type(
 ) -> str:
     timeout_ms = _clamp(timeout_ms, 1000, 120000)
     max_chars = max(0, int(max_chars))
-    try:
-        service_session_id = _service_session_id(session_id)
-        _service_type_target(service_session_id, target, text, by, submit)
-        return _service_snapshot(service_session_id, max_chars=max_chars, extract_query=extract_query)
-    except Exception as exc:  # noqa: BLE001
-        return _service_error(exc)
+    def action(page: Any) -> str:
+        locator = _resolve_fill_locator(page, target, by)
+        locator.fill(str(text), timeout=timeout_ms)
+        if submit:
+            locator.press("Enter", timeout=timeout_ms)
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+            except Exception:  # noqa: BLE001
+                pass
+        return _snapshot(page, max_chars=max_chars, extract_query=extract_query)
+
+    return _BROWSER_MANAGER.run(session_id, action, timeout_ms / 1000 + 20)
 
 
 @register(
@@ -1305,13 +1266,4 @@ def browser_type(
     },
 )
 def browser_close(session_id: str = "default") -> str:
-    logical_session_id = session_id or "default"
-    with _SERVICE_SESSION_LOCK:
-        service_session_id = _SERVICE_SESSIONS.pop(logical_session_id, "")
-    if not service_session_id:
-        return f"OK: browser session '{logical_session_id}' was not open"
-    try:
-        _browser_service_request("DELETE", f"/session/{service_session_id}", timeout=15)
-    except Exception as exc:  # noqa: BLE001
-        return _service_error(exc)
-    return f"OK: browser session '{logical_session_id}' closed"
+    return _BROWSER_MANAGER.close(session_id)
