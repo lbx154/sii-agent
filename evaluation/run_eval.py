@@ -13,6 +13,7 @@ from typing import Iterable
 from rich.console import Console
 from rich.progress import track
 
+from agent.multimodal import build_user_content_with_image
 from agent.runner import RunOutcome, run_baseline, run_evolved
 from agent.scoring import score_answer
 from harness.controller import HarnessConfig
@@ -79,6 +80,7 @@ def _record(
     outcome: RunOutcome,
     save_traces: bool = False,
     lesson_context: str | None = None,
+    prompt_image: dict | None = None,
 ) -> dict:
     scores = score_answer(outcome.result.final_answer, ex["answer"])
     record = {
@@ -105,6 +107,9 @@ def _record(
         "verified_reflection_memory": outcome.verified_reflection_memory,
         "internal_verify_results": outcome.result.internal_verify_results,
     }
+    if ex.get("image"):
+        record["image"] = ex.get("image")
+        record["prompt_image"] = prompt_image or {"enabled": True, "attached": False}
     if outcome.first_result is not None:
         record["first_attempt"] = _attempt_summary(outcome.first_result)
         if outcome.retry_result is not None:
@@ -132,8 +137,18 @@ def _run_one(
     force_reflection: bool = False,
     save_traces: bool = False,
 ) -> dict:
+    user_content = None
+    prompt_image = None
+    if ex.get("image"):
+        user_content, prompt_image = build_user_content_with_image(ex["question"], str(ex.get("image") or ""))
     if mode == "baseline":
-        outcome = run_baseline(ex["question"], expected=ex["answer"], cfg=cfg, task=ex.get("task"))
+        outcome = run_baseline(
+            ex["question"],
+            expected=ex["answer"],
+            cfg=cfg,
+            task=ex.get("task"),
+            user_content=user_content,
+        )
     else:
         outcome = run_evolved(
             ex["question"],
@@ -145,8 +160,9 @@ def _run_one(
             use_gold_for_reflection=use_gold_for_reflection,
             force_reflection=force_reflection,
             task=ex.get("task"),
+            user_content=user_content,
         )
-    return _record(ex, outcome, save_traces=save_traces, lesson_context=lesson_context)
+    return _record(ex, outcome, save_traces=save_traces, lesson_context=lesson_context, prompt_image=prompt_image)
 
 
 def _run_parallel_batch(

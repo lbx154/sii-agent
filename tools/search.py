@@ -4,6 +4,7 @@ import base64
 import json
 import mimetypes
 import os
+import re
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -51,6 +52,10 @@ def _search_proxy_min_k() -> int:
 
 def _search_proxy_filter_garbage() -> bool:
     return _env_bool("SEARCH_PROXY_FILTER_GARBAGE", True)
+
+
+def _search_proxy_filter_benchmark_leaks() -> bool:
+    return _env_bool("SEARCH_PROXY_FILTER_BENCHMARK_LEAKS", False)
 
 
 def _search_proxy_filter_extra_k() -> int:
@@ -431,6 +436,40 @@ _LOW_SIGNAL_SEARCH_DOMAINS = {
     "youtube.com",
     "youtu.be",
 }
+_BENCHMARK_LEAK_DOMAINS = {
+    "arxiv.org",
+    "dougturnbull.org",
+    "openai.com",
+    "openreview.net",
+    "softwaredoug.com",
+}
+_BENCHMARK_POISON_MARKERS = (
+    "poisoning the well",
+    "search agents get tricked",
+    "why tiny late interaction models win",
+    "benchmark-bcplus",
+)
+_BENCHMARK_LEAK_MARKERS = (
+    "browsecomp",
+    "benchmark answer",
+    "gold answer",
+    "ground truth answer",
+    "official answer",
+    "reference answer",
+)
+_BENCHMARK_LEAK_CONTEXT_MARKERS = (
+    "benchmark",
+    "eval",
+    "evaluation",
+    "leaderboard",
+)
+_ANSWER_DUMP_MARKERS = (
+    "answer:",
+    "question:",
+    "prompt:",
+    "ground truth",
+    "reference answer",
+)
 
 
 def _normalized_host(url: str) -> str:
@@ -458,13 +497,63 @@ def _is_low_signal_search_result(item: dict, query: str | None) -> bool:
     return any(host == domain or host.endswith(f".{domain}") for domain in _LOW_SIGNAL_SEARCH_DOMAINS)
 
 
+def _normalized_search_text(text: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(text or "").lower()))
+
+
+def _is_query_echo_search_result(item: dict, query: str | None) -> bool:
+    normalized_query = _normalized_search_text(query or "")
+    if len(normalized_query) < 100:
+        return False
+    title = str(item.get("title") or "")
+    snippet = str(item.get("snippet") or "")
+    content = str(item.get("content") or "")
+    combined = _normalized_search_text("\n".join([title, snippet, content]))
+    if not combined:
+        return False
+    if normalized_query[:180] in combined:
+        return True
+    query_terms = [term for term in normalized_query.split() if len(term) >= 7]
+    if len(query_terms) < 8:
+        return False
+    hits = sum(1 for term in query_terms[:30] if term in combined)
+    return hits >= min(12, max(8, len(query_terms[:30]) // 2))
+
+
+def _is_benchmark_leak_search_result(item: dict, query: str | None) -> bool:
+    url = str(item.get("url") or "")
+    host = _normalized_host(url) if url else ""
+    title = str(item.get("title") or "")
+    snippet = str(item.get("snippet") or "")
+    content = str(item.get("content") or "")
+    combined = "\n".join([url, title, snippet, content]).lower()
+    if any(marker in combined for marker in _BENCHMARK_POISON_MARKERS):
+        return True
+    if _is_query_echo_search_result(item, query):
+        return True
+    if any(marker in combined for marker in _BENCHMARK_LEAK_MARKERS):
+        return True
+    if host and any(host == domain or host.endswith(f".{domain}") for domain in _BENCHMARK_LEAK_DOMAINS):
+        if any(marker in combined for marker in _BENCHMARK_LEAK_CONTEXT_MARKERS) and any(
+            marker in combined for marker in _ANSWER_DUMP_MARKERS
+        ):
+            return True
+    return False
+
+
 def _format_search_rows(results: list, query: str | None = None, limit: int | None = None) -> str:
     rows: list[str] = []
     skipped = 0
+    leak_skipped = 0
+    filter_garbage = _search_proxy_filter_garbage()
+    filter_benchmark_leaks = _search_proxy_filter_benchmark_leaks()
     for i, item in enumerate(results or [], 1):
         if not isinstance(item, dict):
             continue
-        if _search_proxy_filter_garbage() and _is_low_signal_search_result(item, query):
+        if filter_benchmark_leaks and _is_benchmark_leak_search_result(item, query):
+            leak_skipped += 1
+            continue
+        if filter_garbage and _is_low_signal_search_result(item, query):
             skipped += 1
             continue
         title = str(item.get("title") or "")
@@ -479,6 +568,8 @@ def _format_search_rows(results: list, query: str | None = None, limit: int | No
             break
     if rows:
         return "\n".join(rows)
+    if leak_skipped:
+        return f"(no usable results for {query!r}; filtered {leak_skipped} benchmark/meta-answer results)"
     if skipped:
         return f"(no usable results for {query!r}; filtered {skipped} low-signal social/SEO results)"
     return "(no results)" if query is None else f"(no results for {query!r})"

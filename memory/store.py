@@ -340,10 +340,138 @@ _LESSON_EMBEDDING_FEATURE_BOOST = 0.08
 _LESSON_EMBEDDING_RECENCY_BOOST = 0.005
 _LESSON_EMBEDDING_DIMS = 128
 _LESSON_EMBEDDING_MAX_FEATURES = 8192
+_LESSON_MULTI_KEY_FIELD_BONUS = 0.15
+
+_RETRIEVAL_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "being", "by",
+    "can", "could", "did", "do", "does", "for", "from", "had", "has",
+    "have", "he", "her", "hers", "him", "his", "how", "i", "if", "in",
+    "into", "is", "it", "its", "me", "my", "not", "of", "on", "only",
+    "or", "our", "ours", "she", "should", "so", "than", "that", "the",
+    "their", "them", "then", "there", "these", "they", "this", "those",
+    "to", "use", "using", "was", "we", "were", "what", "when", "where",
+    "which", "who", "why", "will", "with", "you", "your",
+}
+_RETRIEVAL_LOW_INFO_TOKENS = {
+    "answer", "asked", "asking", "asks",
+    "context", "current", "data", "dataset", "evidence", "example", "final",
+    "format", "general", "given", "gold", "image", "input", "lesson", "memory",
+    "name", "need", "needed", "needs",
+    "output", "provided", "qa", "question", "requested", "result", "results",
+    "reverse", "search", "task", "value", "verification", "visual",
+}
+_RETRIEVAL_ALWAYS_PHRASES = {
+    "answer format",
+    "multi hop",
+    "multi-hop",
+    "multi-hop reasoning",
+}
+_RETRIEVAL_PHRASES = (
+    "answer format",
+    "book cover",
+    "both candidates",
+    "cover image",
+    "cover text",
+    "compare candidates",
+    "distinguishing features",
+    "entity identification",
+    "entity name",
+    "exact answer",
+    "exact book title",
+    "exact entity",
+    "exact entity name",
+    "exact name",
+    "exact phrase",
+    "exact text",
+    "family chain",
+    "father of",
+    "final answer",
+    "image search",
+    "image to text",
+    "multi hop",
+    "multi-hop",
+    "multi-hop reasoning",
+    "multi-hop text",
+    "ocr text",
+    "printed title",
+    "provided context",
+    "publisher author",
+    "publisher released",
+    "relation chain",
+    "reverse image search",
+    "search results",
+    "spouse of",
+    "text extraction",
+    "tool failure",
+    "verify each hop",
+    "visual entity",
+    "visual comparison",
+    "visual evidence",
+    "visual qa",
+    "visual search",
+)
+
+
+def _normalise_retrieval_text(s: object) -> str:
+    text = str(s or "").lower().replace("-", " ")
+    return " ".join(_TOK.findall(text))
+
+
+def _informative_token(token: str) -> bool:
+    if len(token) <= 1:
+        return False
+    if token in _RETRIEVAL_STOPWORDS or token in _RETRIEVAL_LOW_INFO_TOKENS:
+        return False
+    if token.isdigit() and len(token) <= 2:
+        return False
+    return True
+
+
+def _retrieval_phrase_tokens(norm_text: str) -> list[str]:
+    padded = f" {norm_text} "
+    phrases: list[str] = []
+    seen: set[str] = set()
+    for phrase in _RETRIEVAL_PHRASES:
+        norm_phrase = phrase.lower().replace("-", " ")
+        norm_phrase = " ".join(_TOK.findall(norm_phrase))
+        if not norm_phrase or f" {norm_phrase} " not in padded:
+            continue
+        if phrase not in _RETRIEVAL_ALWAYS_PHRASES and not any(
+            _informative_token(token) for token in norm_phrase.split()
+        ):
+            continue
+        token = norm_phrase.replace(" ", "_")
+        if token not in seen:
+            phrases.append(token)
+            seen.add(token)
+    words = [token for token in norm_text.split() if _informative_token(token)]
+    for n in (2, 3):
+        for i in range(max(0, len(words) - n + 1)):
+            gram = words[i : i + n]
+            if all(len(token) <= 3 for token in gram):
+                continue
+            token = "_".join(gram)
+            if token in seen or len(token) > 80:
+                continue
+            phrases.append(token)
+            seen.add(token)
+            if len(phrases) >= 48:
+                return phrases
+    return phrases
+
+
+def _augment_retrieval_text(s: object) -> str:
+    text = str(s or "")
+    phrases = _retrieval_phrase_tokens(_normalise_retrieval_text(text))
+    if not phrases:
+        return text
+    return f"{text} {' '.join(phrases)}"
 
 
 def _token_list(s: object) -> list[str]:
-    return [t.lower() for t in _TOK.findall(str(s or "")) if len(t) > 1]
+    norm = _normalise_retrieval_text(s)
+    words = [token for token in norm.split() if _informative_token(token)]
+    return words + _retrieval_phrase_tokens(norm)
 
 
 def _tokens(s: str) -> set[str]:
@@ -446,21 +574,84 @@ def _skill_text(skill: dict) -> str:
     )
 
 
-def _lesson_text(lesson: dict) -> str:
+def _lesson_key_texts(lesson: dict) -> list[tuple[str, int, str]]:
     question = _original_question(_clean_value(lesson.get("question")))
     failure_mode = _clean_value(lesson.get("failure_mode"))
     root_cause = _clean_value(lesson.get("root_cause"))
     corrective_strategy = _clean_value(lesson.get("corrective_strategy"))
     reusable_lesson = _clean_value(lesson.get("reusable_lesson"))
     tags = " ".join(_clean_list(lesson.get("tags")))
-    weighted_parts = (
-        [question] * 4
-        + [reusable_lesson] * 4
-        + [corrective_strategy] * 2
-        + [failure_mode] * 2
-        + [root_cause, tags]
-    )
+    return [
+        ("reusable_lesson", 1, reusable_lesson),
+        ("corrective_strategy", 1, corrective_strategy),
+        ("failure_mode", 1, failure_mode),
+        ("tags", 1, tags),
+        ("task_family", 1, _clean_value(lesson.get("task_family"))),
+        ("memory_scope", 1, _clean_value(lesson.get("memory_scope"))),
+        ("root_cause", 1, root_cause),
+        ("filter_reason", 1, _clean_value(lesson.get("filter_reason"))),
+        ("question", 1, question),
+    ]
+
+
+def _lesson_text(lesson: dict) -> str:
+    weighted_parts: list[str] = []
+    for _field, weight, text in _lesson_key_texts(lesson):
+        if text:
+            weighted_parts.extend([text] * max(1, weight))
     return " ".join(part for part in weighted_parts if part)
+
+
+def _lesson_query_variants(question: str) -> list[str]:
+    q = _original_question(question) or question or ""
+    lower = q.lower()
+    tokens = _tokens(q)
+    variants = [q]
+    visual = any(term in lower for term in ("image", "photo", "picture", "visual", "logo", "poster", "cover", "screenshot"))
+    ocr = any(term in lower for term in ("ocr", "text in the image", "label", "sign", "caption", "cover text", "book cover", "printed"))
+    comparison = any(term in lower for term in ("which", "older", "younger", "earlier", "first", "same", "different", "compare"))
+    if visual or "image local path" in lower or "image source" in lower:
+        if ocr:
+            variants.extend(
+                [
+                    "ocr text extraction exact text book cover visual evidence",
+                    "image to text printed title cover text",
+                ]
+            )
+        elif comparison:
+            variants.extend(
+                [
+                    "visual comparison compare candidates distinguishing features",
+                    "comparison answer format visual evidence",
+                ]
+            )
+        else:
+            variants.extend(
+                [
+                    "visual qa image search entity identification",
+                    "visual evidence verification reverse image search",
+                ]
+            )
+    if ocr:
+        variants.append("ocr text extraction image answer format")
+    if comparison:
+        variants.append("comparison compare both candidates answer format")
+    if tokens & {"father", "mother", "wife", "husband", "spouse", "child", "grandfather", "grandmother"}:
+        variants.append("multi-hop relation chain verify each hop")
+    if "provided context" in lower or "2wiki" in lower:
+        variants.append("multi-hop text qa context evidence verification")
+    if any(term in lower for term in ("award", "publisher", "author", "designer", "director", "species", "chemical", "formula")):
+        variants.append("exact entity name verification search strategy")
+    variants.append("concise final answer requested format")
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in variants:
+        clean = " ".join(str(item or "").split())[:240]
+        key = clean.lower()
+        if clean and key not in seen:
+            out.append(clean)
+            seen.add(key)
+    return out[:8]
 
 
 def _phrase_hits(question: str, triggers: object) -> int:
@@ -790,18 +981,33 @@ class MemoryStore:
             docs = []
             df: Counter[str] = Counter()
             for lesson in self._lesson_candidates(task):
-                tokens = _token_list(_lesson_text(lesson))
-                counts = Counter(tokens)
-                length = sum(counts.values())
-                if length == 0:
+                key_docs: list[dict[str, object]] = []
+                lesson_terms: set[str] = set()
+                for field, weight, text in _lesson_key_texts(lesson):
+                    tokens = _token_list(text)
+                    counts = Counter(tokens)
+                    length = sum(counts.values())
+                    if length == 0:
+                        continue
+                    key_docs.append(
+                        {
+                            "field": field,
+                            "field_weight": weight,
+                            "counts": counts,
+                            "length": length,
+                        }
+                    )
+                    lesson_terms.update(counts.keys())
+                if not key_docs:
                     continue
-                df.update(counts.keys())
+                df.update(lesson_terms)
                 tags = " ".join(_clean_list(lesson.get("tags")))
                 docs.append(
                     {
                         "lesson": lesson,
-                        "counts": counts,
-                        "length": length,
+                        "key_docs": key_docs,
+                        "counts": Counter(_token_list(_lesson_text(lesson))),
+                        "length": sum(sum(key_doc["counts"].values()) * int(key_doc["field_weight"]) for key_doc in key_docs),
                         "features": _question_features(
                             f"{lesson.get('question', '')} {lesson.get('reusable_lesson', '')} {tags}"
                         ),
@@ -837,20 +1043,27 @@ class MemoryStore:
                 return self._lesson_embedding_index
 
             lessons = self._lesson_candidates(task)
-            texts = [_lesson_text(lesson) for lesson in lessons]
-            docs = [
-                {
-                    "lesson": lesson,
-                    "features": _question_features(
-                        f"{lesson.get('question', '')} {lesson.get('reusable_lesson', '')} "
-                        f"{' '.join(_clean_list(lesson.get('tags')))}"
-                    ),
-                    "recency": _recency(lesson.get("ts")),
-                }
-                for lesson, text in zip(lessons, texts)
-                if text.strip()
-            ]
-            texts = [text for text in texts if text.strip()]
+            docs = []
+            texts = []
+            for lesson in lessons:
+                features = _question_features(
+                    f"{lesson.get('question', '')} {lesson.get('reusable_lesson', '')} "
+                    f"{' '.join(_clean_list(lesson.get('tags')))}"
+                )
+                recency = _recency(lesson.get("ts"))
+                for field, weight, text in _lesson_key_texts(lesson):
+                    if not text.strip():
+                        continue
+                    docs.append(
+                        {
+                            "lesson": lesson,
+                            "field": field,
+                            "field_weight": weight,
+                            "features": features,
+                            "recency": recency,
+                        }
+                    )
+                    texts.append(f"{field} {_augment_retrieval_text(text)}")
             if not docs:
                 self._lesson_embedding_key = key
                 self._lesson_embedding_index = None
@@ -933,7 +1146,7 @@ class MemoryStore:
         index = self._lesson_embedding(task)
         if not index:
             return []
-        query = _original_question(question) or question
+        queries = [_augment_retrieval_text(query) for query in _lesson_query_variants(question)]
         qfeatures = _question_features(question)
         try:
             from sklearn.preprocessing import normalize
@@ -945,18 +1158,18 @@ class MemoryStore:
         if vectorizer is None or doc_vectors is None or not isinstance(docs, list):
             return []
         try:
-            q = vectorizer.transform([query])
+            q = vectorizer.transform(queries)
             svd = index.get("svd")
             if svd is not None:
                 q_vec = normalize(svd.transform(q), norm="l2")
-                sims = doc_vectors @ q_vec[0]
+                sims = doc_vectors @ q_vec.T
             else:
                 q_vec = normalize(q, norm="l2")
-                sims = (q_vec @ doc_vectors.T).toarray()[0]
+                sims = (doc_vectors @ q_vec.T).toarray()
         except Exception:
             return []
 
-        scored: list[tuple[float, float, dict]] = []
+        by_lesson: dict[str, dict[str, object]] = {}
         query_features = qfeatures - {"2wiki"}
         for i, doc in enumerate(docs):
             if not isinstance(doc, dict):
@@ -967,15 +1180,37 @@ class MemoryStore:
             features = doc.get("features")
             feature_overlap = len(query_features & (features if isinstance(features, set) else set()))
             recency = float(doc.get("recency") or 0.0)
-            score = float(sims[i]) + _LESSON_EMBEDDING_FEATURE_BOOST * feature_overlap + _LESSON_EMBEDDING_RECENCY_BOOST * recency
-            if score > 0:
-                scored.append((score, recency, lesson))
+            row_sims = sims[i]
+            try:
+                base_similarity = float(max(row_sims))
+            except TypeError:
+                base_similarity = float(row_sims)
+            field_weight = float(doc.get("field_weight") or 1.0)
+            score = base_similarity * (1.0 + _LESSON_MULTI_KEY_FIELD_BONUS * min(field_weight, 8.0))
+            if score <= 0:
+                continue
+            score += _LESSON_EMBEDDING_FEATURE_BOOST * feature_overlap + _LESSON_EMBEDDING_RECENCY_BOOST * recency
+            lesson_id = _stable_memory_id("lesson", lesson)
+            current = by_lesson.get(lesson_id)
+            if current is None:
+                by_lesson[lesson_id] = {
+                    "score": score,
+                    "recency": recency,
+                    "lesson": lesson,
+                    "matched_fields": {str(doc.get("field") or "")},
+                }
+            else:
+                current["score"] = max(float(current["score"]), score) + 0.02
+                current["matched_fields"].add(str(doc.get("field") or ""))
+        scored = [
+            (float(item["score"]) + 0.01 * len(item["matched_fields"]), float(item["recency"]), item["lesson"])
+            for item in by_lesson.values()
+        ]
         scored.sort(key=lambda x: (-x[0], -x[1]))
         return [lesson for _, _, lesson in scored[:k]]
 
     def _retrieve_lessons_bm25(self, question: str, k: int, task: str | None) -> list[dict]:
-        query = _original_question(question) or question
-        query_counts = Counter(_token_list(query))
+        query_counts_list = [Counter(_token_list(query)) for query in _lesson_query_variants(question)]
         qfeatures = _question_features(question)
         index = self._lesson_bm25(task)
         docs = index.get("docs", [])
@@ -990,14 +1225,28 @@ class MemoryStore:
             if not isinstance(doc, dict):
                 continue
             lesson = doc.get("lesson")
-            counts = doc.get("counts")
-            if not isinstance(lesson, dict) or not isinstance(counts, Counter):
+            key_docs = doc.get("key_docs")
+            if not isinstance(lesson, dict) or not isinstance(key_docs, list):
                 continue
-            bm25 = self._bm25_score(query_counts, counts, int(doc.get("length") or 0), avgdl, idf)
+            field_scores: list[tuple[float, str]] = []
+            for key_doc in key_docs:
+                if not isinstance(key_doc, dict) or not isinstance(key_doc.get("counts"), Counter):
+                    continue
+                field_weight = float(key_doc.get("field_weight") or 1.0)
+                best = max(
+                    self._bm25_score(query_counts, key_doc["counts"], int(key_doc.get("length") or 0), avgdl, idf)
+                    for query_counts in query_counts_list
+                )
+                if best > 0:
+                    field_scores.append((best * (1.0 + _LESSON_MULTI_KEY_FIELD_BONUS * min(field_weight, 8.0)), str(key_doc.get("field") or "")))
+            if not field_scores:
+                continue
+            field_scores.sort(reverse=True)
+            bm25 = field_scores[0][0] + 0.15 * sum(score for score, _field in field_scores[1:4])
             features = doc.get("features")
             feature_overlap = len(query_features & (features if isinstance(features, set) else set()))
             recency = float(doc.get("recency") or 0.0)
-            score = bm25 + _LESSON_FEATURE_BOOST * feature_overlap + _LESSON_RECENCY_BOOST * recency
+            score = bm25 + _LESSON_FEATURE_BOOST * feature_overlap + _LESSON_RECENCY_BOOST * recency + 0.25 * len({field for _score, field in field_scores})
             if score > 0:
                 scored.append((score, recency, lesson))
         scored.sort(key=lambda x: (-x[0], -x[1]))

@@ -208,9 +208,10 @@ def _search_rows(query: str, k: int = DEFAULT_K) -> list[tuple[str, float, str]]
     return _search_lucene(index_path, query, k)
 
 
-def _official_search_payload(query: str) -> str:
+def _official_search_payload(query: str, k: int = DEFAULT_K) -> str:
     try:
-        rows = _search_rows(query, DEFAULT_K)
+        k = max(1, min(int(k), 20))
+        rows = _search_rows(query, k)
         record_retrieved_docids([docid for docid, _, _ in rows])
         results = [
             {
@@ -242,6 +243,23 @@ def search(query: str) -> str:
 
 
 @register(
+    "browsecomp_search",
+    "Search the local BrowseComp fixed corpus/index. Use this first for text-only BrowseComp-style questions. Returns docid, score, and a query-focused snippet from the local corpus; this is not live web search.",
+    {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Focused search query string, preferably with distinctive quoted phrases or candidate names."},
+            "k": {"type": "integer", "default": DEFAULT_K, "minimum": 1, "maximum": 20},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+)
+def browsecomp_search(query: str, k: int = DEFAULT_K) -> str:
+    return _official_search_payload(query, k=k)
+
+
+@register(
     "get_document",
     "Retrieve a full BrowseComp-Plus corpus document by its docid.",
     {
@@ -254,6 +272,26 @@ def search(query: str) -> str:
     },
 )
 def get_document(docid: str) -> str:
+    return _get_document_payload(docid)
+
+
+@register(
+    "browsecomp_open",
+    "Open/retrieve a full document from the local BrowseComp fixed corpus by docid returned from browsecomp_search.",
+    {
+        "type": "object",
+        "properties": {
+            "docid": {"type": "string", "description": "Document ID returned by browsecomp_search."},
+        },
+        "required": ["docid"],
+        "additionalProperties": False,
+    },
+)
+def browsecomp_open(docid: str) -> str:
+    return _get_document_payload(docid)
+
+
+def _get_document_payload(docid: str) -> str:
     index_path = _default_index_path()
     try:
         if _is_sqlite_index(index_path):

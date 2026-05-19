@@ -30,6 +30,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from agent.multimodal import image_url_from_source, multimodal_user_content  # noqa: E402
 from agent.react import run_react  # noqa: E402
 from agent.scoring import score_answer  # noqa: E402
 from harness.controller import HarnessConfig  # noqa: E402
@@ -42,6 +43,8 @@ BASELINE_TOOLS = (
     "web_search",
     "wiki_search",
     "wiki_page",
+    "browsecomp_search",
+    "browsecomp_open",
     "reverse_image_search",
     "visual_web_search",
     "image_to_text",
@@ -59,6 +62,8 @@ MEMORY_QUERY_TOOLS = (
     "web_search",
     "wiki_search",
     "wiki_page",
+    "browsecomp_search",
+    "browsecomp_open",
     "reverse_image_search",
     "visual_web_search",
     "image_to_text",
@@ -89,6 +94,10 @@ BROWSER_TOOLS = {
     "browser_click",
     "browser_type",
     "browser_close",
+}
+BROWSECOMP_TOOLS = {
+    "browsecomp_search",
+    "browsecomp_open",
 }
 STOPWORDS = {
     "about",
@@ -172,6 +181,7 @@ BASELINE_EXTRA = (
     "Cross-check current evidence before final_answer. No reflection retry is available; solve carefully within "
     "this single ReAct attempt. Only use visual/image tools when the prompt provides an actual image file path "
     "or direct image URL; never pass an ordinary web page or search-result URL to image tools. "
+    "For text-only BrowseComp-style rows, use browsecomp_search/browsecomp_open early because they query the local fixed corpus. "
     "Timed benchmark strategy: avoid broad search loops. After a few evidence calls, identify the strongest "
     "candidate, use at most one targeted verification if essential, then answer concisely."
 )
@@ -180,11 +190,13 @@ MEMORY_EXTRA = (
     "Evaluation/test mode with read-only memory. You can and should call memory_search early when it may help: "
     "query the full question plus 2-6 focused phrases/entities/patterns. Treat memory_search guidance only as "
     "procedural advice, not evidence. Do not create/update/delete memory. Verify the final "
-    "answer using current web_search or page evidence. No reflection retry is available; solve carefully within this single ReAct attempt. "
+    "answer using current browsecomp_search/web_search or page evidence. For text-only BrowseComp-style rows, use browsecomp_search/browsecomp_open early because they query the local fixed corpus. "
+    "No reflection retry is available; solve carefully within this single ReAct attempt. "
     "Only use visual/image tools when the prompt provides an actual image file path or direct image URL; never pass "
     "an ordinary web page or search-result URL to image tools. Timed benchmark strategy: avoid broad search loops. "
     "After memory plus a few evidence calls, identify the strongest candidate, use at most one targeted verification "
-    "if essential, then answer concisely."
+    "if essential, then answer concisely. For person names, preserve the full source-backed name exactly; do not drop "
+    "the first given name or alter particles/casing."
 )
 
 
@@ -203,9 +215,33 @@ def _set_default_env() -> None:
     os.environ["SII_MEMORY_OVERALL_IN_PROMPT"] = "0"
     os.environ.setdefault("SII_MEMORY_OVERALL_PROMPT_MAX_CHARS", "2200")
     os.environ.setdefault("SII_MEMORY_SEARCH_LLM_SUMMARY", "1")
+    os.environ.setdefault("SII_MEMORY_SEARCH_EXPAND_QUERIES", "1")
+    os.environ.setdefault("SII_MEMORY_AUTO_PREFETCH", "0")
+    os.environ.setdefault("SII_MEMORY_SEARCH_RERANK", "1")
+    os.environ.setdefault("SII_MEMORY_RERANK_AUTO_PREFETCH", "0")
+    os.environ.setdefault("SII_MEMORY_SHOW_EPISODE_ANSWERS", "0")
+    os.environ.setdefault("SII_AGENT_EVIDENCE_SUMMARY", "1")
+    os.environ.setdefault("SII_EVIDENCE_SUMMARY_WEB_EVERY", "3")
+    os.environ.setdefault("SII_EVIDENCE_SUMMARY_TIMEOUT", "30")
+    os.environ.setdefault("SII_EVIDENCE_SUMMARY_MIN_TIME_LEFT", "70")
+    os.environ.setdefault("SII_EVIDENCE_STATE_MAX_CHARS", "2200")
+    os.environ.setdefault("SII_AGENT_CONTEXT_COMPACT", "1")
+    os.environ.setdefault("SII_CONTEXT_COMPACT_EVERY", "6")
+    os.environ.setdefault("SII_CONTEXT_COMPACT_TIMEOUT", "30")
+    os.environ.setdefault("SII_CONTEXT_COMPACT_MIN_TIME_LEFT", "80")
+    os.environ.setdefault("SII_CONTEXT_COMPACT_MAX_CHARS", "3500")
+    os.environ.setdefault("SII_CONTEXT_COMPACT_KEEP_RECENT_MESSAGES", "12")
     os.environ.setdefault("SEARCH_PROXY_MIN_K", "5")
     os.environ.setdefault("SEARCH_PROXY_FILTER_GARBAGE", "1")
+    os.environ.setdefault("SEARCH_PROXY_FILTER_BENCHMARK_LEAKS", "0")
     os.environ.setdefault("SEARCH_PROXY_FILTER_EXTRA_K", "5")
+    if "BROWSECOMP_INDEX_PATH" not in os.environ:
+        bm25_index = ROOT / "indexes/bm25"
+        sqlite_index = ROOT / "data/browsecomp-plus/browsecomp_fts.sqlite"
+        if bm25_index.exists():
+            os.environ["BROWSECOMP_INDEX_PATH"] = str(bm25_index)
+        elif sqlite_index.exists():
+            os.environ["BROWSECOMP_INDEX_PATH"] = str(sqlite_index)
 
 
 def _cap_timeout_env(name: str, max_seconds: float) -> None:
@@ -242,19 +278,30 @@ def _load_rows(csv_path: Path, n: int, offset: int) -> tuple[list[str], list[dic
     return fieldnames, all_rows, selected
 
 
-def _build_question(row: dict[str, str]) -> str:
+def _build_question(row: dict[str, str], *, include_prefetch: bool = True) -> str:
     problem = " ".join(str(row.get("problem") or "").split())
     image = str(row.get("_image_ref") or "").strip()
+    image_attached = str(row.get("_prompt_image_attached") or "").strip().lower() in {"1", "true", "yes"}
+    image_attach_error = str(row.get("_prompt_image_error") or "").strip()
     parts = [problem]
-    prefetch_context = str(row.get("_prefetch_context") or "").strip()
+    prefetch_context = str(row.get("_prefetch_context") or "").strip() if include_prefetch else ""
     if prefetch_context:
         parts.append(
-            "Provided search context from automatic prefetch. Treat it as current search evidence; "
-            "if it contains the answer, do not keep searching just to be cautious.\n\n"
+            "Unverified automatic search snippets. They may contain useful answer candidates or noise. "
+            "Use them as weak hints; verify when possible, and preserve exact wording, units, and date format "
+            "when a snippet directly answers the question.\n\n"
             f"{prefetch_context}"
         )
     if image:
-        parts.append(f"Image file/source: {image}")
+        if image_attached:
+            parts.append(
+                "The image itself is attached to this message for direct visual inspection.\n"
+                f"Image local path/source for tools: {image}"
+            )
+        else:
+            parts.append(f"Image file/source: {image}")
+            if image_attach_error:
+                parts.append(f"Direct model image attachment failed: {image_attach_error}")
         parts.append(
             "If the image is needed, call image_to_text, image_to_search_queries, visual_web_search, "
             "or reverse_image_search with this source path/URL. Do not copy raw image data into tool arguments."
@@ -265,6 +312,40 @@ def _build_question(row: dict[str, str]) -> str:
         "of the requested value."
     )
     return "\n\n".join(parts)
+
+
+def _build_user_prompt(
+    row: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    include_prefetch: bool = True,
+) -> tuple[str | list[dict[str, Any]], dict[str, Any]]:
+    image_ref = str(row.get("_image_ref") or "").strip()
+    prompt_images = bool(getattr(args, "prompt_images", True))
+    prompt_meta: dict[str, Any] = {"enabled": prompt_images, "attached": False}
+    prompt_image, prompt_error = (None, None)
+    image_meta = row.get("_image_meta")
+    if image_ref and prompt_images:
+        prompt_image, prompt_error = image_url_from_source(
+            image_ref,
+            image_meta if isinstance(image_meta, dict) else None,
+        )
+    row_for_question = dict(row)
+    if prompt_image:
+        row_for_question["_prompt_image_attached"] = "1"
+        prompt_meta.update(
+            {
+                "attached": True,
+                "source": "url" if prompt_image.startswith(("http://", "https://")) else "data_url",
+            }
+        )
+    elif prompt_error:
+        row_for_question["_prompt_image_error"] = prompt_error
+        prompt_meta["error"] = prompt_error
+    question = _build_question(row_for_question, include_prefetch=include_prefetch)
+    if not prompt_image:
+        return question, prompt_meta
+    return multimodal_user_content(question, prompt_image), prompt_meta
 
 
 def _words(text: str) -> list[str]:
@@ -359,8 +440,30 @@ def _prefetch_search_context(problem: str, args: argparse.Namespace) -> tuple[st
             else:
                 os.environ["SEARCH_PROXY_MAX_CHARS"] = old_max_chars
         records.append({"query": query, "content": result})
-        blocks.append(f"[prefetch query: {query}]\n{result[: args.prefetch_max_chars]}")
+        if _is_usable_prefetch_result(result):
+            blocks.append(f"[prefetch query: {query}]\n{result[: args.prefetch_max_chars]}")
     return "\n\n".join(blocks), records
+
+
+def _is_usable_prefetch_result(result: str) -> bool:
+    text = str(result or "").strip()
+    if not text:
+        return False
+    lines = text.splitlines()
+    if lines and lines[0].strip().startswith("## "):
+        text = "\n".join(lines[1:]).strip()
+    lowered = text.lower()
+    return not (
+        lowered.startswith("error:")
+        or lowered.startswith("(no results")
+        or lowered.startswith("(no usable results")
+    )
+
+
+def _should_prefetch_search(row: dict[str, str], args: argparse.Namespace) -> bool:
+    if args.prefetch_searches <= 0:
+        return False
+    return bool(row.get("_image_ref")) or bool(getattr(args, "prefetch_text", False))
 
 
 def _postprocess_answer(question: str, answer: str | None) -> str:
@@ -463,11 +566,16 @@ def _run_one(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     row_tools = tools if row.get("_image_ref") else tuple(name for name in tools if name not in VISUAL_TOOLS)
+    if row.get("_image_ref"):
+        row_tools = tuple(name for name in row_tools if name not in BROWSECOMP_TOOLS)
     if not args.enable_browser_tools:
         row_tools = tuple(name for name in row_tools if name not in BROWSER_TOOLS)
     row_extra_system = extra_system
     if not row.get("_image_ref"):
-        row_extra_system += " This row has no image input; use text/web tools for web pages, not visual/image tools."
+        row_extra_system += (
+            " This row has no image input; use text/web tools for web pages, not visual/image tools. "
+            "Start with browsecomp_search for distinctive phrases/constraints, then use browsecomp_open on promising docids before falling back to live web_search."
+        )
     if not args.enable_browser_tools:
         row_extra_system += " Browser tools are disabled for this timed run; rely on web_search/wiki/visual snippets and answer from the best-supported evidence."
     cfg = HarnessConfig(
@@ -485,15 +593,21 @@ def _run_one(
     expected = str(row.get("answer") or "").strip()
     started = time.time()
     try:
-        prefetch_context, prefetch_records = _prefetch_search_context(str(row.get("problem") or ""), args)
+        if _should_prefetch_search(row, args):
+            prefetch_context, prefetch_records = _prefetch_search_context(str(row.get("problem") or ""), args)
+        else:
+            prefetch_context, prefetch_records = "", []
         row_for_prompt = dict(row)
         row_for_prompt["_prefetch_context"] = prefetch_context
+        user_content, prompt_image_meta = _build_user_prompt(row_for_prompt, args, include_prefetch=True)
+        clean_question = _build_question(row, include_prefetch=False)
         result = run_react(
-            _build_question(row_for_prompt),
+            clean_question,
             cfg=cfg,
             extra_system=row_extra_system,
             expected=None,
             task="benchmark_csv",
+            user_content=user_content,
         )
         final_answer = _postprocess_answer(row.get("problem", ""), result.final_answer)
         scores = score_answer(final_answer, expected)
@@ -516,6 +630,7 @@ def _run_one(
             "problem": row.get("problem", ""),
             "image": row.get("_image_ref", ""),
             "image_meta": row.get("_image_meta", {}),
+            "prompt_image": prompt_image_meta,
             "answer": final_answer,
             "expected": expected,
             "correct": bool(scores.get("correct")),
@@ -527,6 +642,8 @@ def _run_one(
             "tool_call_counts": tool_call_counts,
             "stop_reason": result.stop_reason,
             "finish_reasons": result.finish_reasons,
+            "evidence_state": result.evidence_state,
+            "compact_context": result.compact_context,
             "elapsed": time.time() - started,
             "trajectory": (prefetch_trajectory + result.trajectory) if args.save_trace else [],
             "error": None,
@@ -540,6 +657,11 @@ def _run_one(
             "problem": row.get("problem", ""),
             "image": row.get("_image_ref", ""),
             "image_meta": row.get("_image_meta", {}),
+            "prompt_image": {
+                "enabled": bool(getattr(args, "prompt_images", True)),
+                "attached": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            },
             "answer": "",
             "expected": expected,
             "correct": bool(scores.get("correct")),
@@ -551,6 +673,8 @@ def _run_one(
             "tool_call_counts": {},
             "stop_reason": f"error: {type(exc).__name__}: {exc}",
             "finish_reasons": {},
+            "evidence_state": {},
+            "compact_context": {},
             "elapsed": time.time() - started,
             "trajectory": [],
             "error": f"{type(exc).__name__}: {exc}",
@@ -568,6 +692,8 @@ def _submission_trace_record(record: dict[str, Any]) -> dict[str, Any]:
         "tool_call_counts": record["tool_call_counts"],
         "stop_reason": record["stop_reason"],
         "elapsed": record["elapsed"],
+        "evidence_state": record.get("evidence_state", {}),
+        "compact_context": record.get("compact_context", {}),
         "trajectory": record["trajectory"],
     }
 
@@ -756,18 +882,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-wall-seconds", type=float, default=180.0)
     parser.add_argument("--max-llm-call-seconds", type=float, default=600.0)
     parser.add_argument("--min-llm-call-seconds", type=float, default=30.0)
-    parser.add_argument("--max-parallel-tool-calls", type=int, default=1)
+    parser.add_argument("--max-parallel-tool-calls", type=int, default=4)
     parser.add_argument("--max-web-search-calls", type=int, default=0)
     parser.add_argument("--max-research-tool-calls", type=int, default=12)
     parser.add_argument("--synthesize-after-tool-calls", type=int, default=6)
     parser.add_argument("--enable-browser-tools", action="store_true", help="Allow browser_open/browser interaction tools.")
     parser.add_argument("--prefetch-searches", type=int, default=2)
+    parser.add_argument("--prefetch-text", action="store_true", help="Also inject automatic web-search prefetch for non-image text rows.")
     parser.add_argument("--prefetch-k", type=int, default=5)
     parser.add_argument("--prefetch-max-chars", type=int, default=12000)
     parser.add_argument("--prefetch-fetch-max-chars", type=int, default=0)
+    parser.add_argument(
+        "--no-prompt-images",
+        dest="prompt_images",
+        action="store_false",
+        help="Do not attach image inputs directly to the model prompt; keep only image tool references.",
+    )
     parser.add_argument("--resume", action="store_true", help="Reuse completed rows already present in mode JSONL files.")
     parser.add_argument("--no-save-trace", dest="save_trace", action="store_false")
-    parser.set_defaults(save_trace=True)
+    parser.set_defaults(save_trace=True, prompt_images=True)
     return parser.parse_args()
 
 
@@ -811,15 +944,34 @@ def main() -> None:
         "max_research_tool_calls": args.max_research_tool_calls,
         "synthesize_after_tool_calls": args.synthesize_after_tool_calls,
         "browser_tools_enabled": args.enable_browser_tools,
+        "prompt_images": args.prompt_images,
         "prefetch_searches": args.prefetch_searches,
+        "prefetch_text": args.prefetch_text,
         "prefetch_k": args.prefetch_k,
         "prefetch_max_chars": args.prefetch_max_chars,
         "prefetch_fetch_max_chars": args.prefetch_fetch_max_chars,
         "search_proxy_timeout": os.getenv("SEARCH_PROXY_TIMEOUT"),
         "search_proxy_min_k": os.getenv("SEARCH_PROXY_MIN_K"),
         "search_proxy_filter_garbage": os.getenv("SEARCH_PROXY_FILTER_GARBAGE"),
+        "search_proxy_filter_benchmark_leaks": os.getenv("SEARCH_PROXY_FILTER_BENCHMARK_LEAKS"),
         "search_proxy_filter_extra_k": os.getenv("SEARCH_PROXY_FILTER_EXTRA_K"),
+        "browsecomp_index_path": os.getenv("BROWSECOMP_INDEX_PATH"),
         "memory_search_summary_timeout": os.getenv("SII_MEMORY_SEARCH_SUMMARY_TIMEOUT"),
+        "memory_search_expand_queries": os.getenv("SII_MEMORY_SEARCH_EXPAND_QUERIES"),
+        "memory_search_expand_timeout": os.getenv("SII_MEMORY_SEARCH_EXPAND_TIMEOUT"),
+        "memory_auto_prefetch": os.getenv("SII_MEMORY_AUTO_PREFETCH"),
+        "memory_search_rerank": os.getenv("SII_MEMORY_SEARCH_RERANK"),
+        "memory_rerank_auto_prefetch": os.getenv("SII_MEMORY_RERANK_AUTO_PREFETCH"),
+        "memory_show_episode_answers": os.getenv("SII_MEMORY_SHOW_EPISODE_ANSWERS"),
+        "evidence_summary": os.getenv("SII_AGENT_EVIDENCE_SUMMARY"),
+        "evidence_summary_web_every": os.getenv("SII_EVIDENCE_SUMMARY_WEB_EVERY"),
+        "evidence_summary_timeout": os.getenv("SII_EVIDENCE_SUMMARY_TIMEOUT"),
+        "evidence_summary_min_time_left": os.getenv("SII_EVIDENCE_SUMMARY_MIN_TIME_LEFT"),
+        "context_compact": os.getenv("SII_AGENT_CONTEXT_COMPACT"),
+        "context_compact_every": os.getenv("SII_CONTEXT_COMPACT_EVERY"),
+        "context_compact_timeout": os.getenv("SII_CONTEXT_COMPACT_TIMEOUT"),
+        "context_compact_min_time_left": os.getenv("SII_CONTEXT_COMPACT_MIN_TIME_LEFT"),
+        "context_compact_max_chars": os.getenv("SII_CONTEXT_COMPACT_MAX_CHARS"),
         "output_format_reference": str(ROOT / "benchmarkreadme.md"),
         "submission_format": "group_{mode}.json trace, group_{mode}.csv answers, group_{mode}.zip bundle",
         "overall_in_prompt": False,

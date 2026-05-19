@@ -118,6 +118,7 @@ def load_simplevqa(n: int | None = None, split: str = "test") -> Iterator[dict]:
             "task": "simplevqa",
             "split": split,
             "question": question,
+            "image": image_path,
             "answer": ex["answer"],
             "language": ex.get("language"),
             "original_category": ex.get("original_category"),

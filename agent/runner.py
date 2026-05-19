@@ -10,6 +10,7 @@ import json
 import os
 import re
 import unicodedata
+from typing import Any
 
 from .llm import chat
 from .react import run_react
@@ -585,8 +586,9 @@ def _choose_without_gold(
 
 def run_baseline(question: str, expected: str | None = None,
                  cfg: HarnessConfig | None = None,
-                 task: str | None = None) -> RunOutcome:
-    res = run_react(question, cfg=cfg, expected=expected, task=task)
+                 task: str | None = None,
+                 user_content: Any | None = None) -> RunOutcome:
+    res = run_react(question, cfg=cfg, expected=expected, task=task, user_content=user_content)
     if task == "2wiki" and _allow_2wiki_postprocess():
         res.final_answer = _postprocess_2wiki_answer(res.final_answer)
     return RunOutcome(result=res, correct=_judge(res.final_answer, expected), first_result=res)
@@ -600,11 +602,19 @@ def run_evolved(question: str, expected: str | None = None,
                 lesson_context: str | None = None,
                 use_gold_for_reflection: bool = False,
                 force_reflection: bool = False,
-                task: str | None = None) -> RunOutcome:
+                task: str | None = None,
+                user_content: Any | None = None) -> RunOutcome:
     cfg = cfg or HarnessConfig()
     memory = memory or MemoryStore()
     extra = lesson_context if lesson_context is not None else memory.render_for_prompt(question, task=task)
-    res = run_react(question, cfg=cfg, extra_system=extra or None, expected=expected, task=task)
+    res = run_react(
+        question,
+        cfg=cfg,
+        extra_system=extra or None,
+        expected=expected,
+        task=task,
+        user_content=user_content,
+    )
     if task == "2wiki" and _allow_2wiki_postprocess():
         res.final_answer = _postprocess_2wiki_evolved_answer(res.final_answer, question)
     final_refinement = None
@@ -643,7 +653,14 @@ def run_evolved(question: str, expected: str | None = None,
                 "unless a specific missing clue requires one more. Prefer one concise exact answer. "
                 "Do not refuse or withhold merely because evidence is incomplete; provide the best-supported answer."
             )
-            retry_res = run_react(question, cfg=_retry_config(cfg), extra_system=retry_hint, expected=expected, task=task)
+            retry_res = run_react(
+                question,
+                cfg=_retry_config(cfg),
+                extra_system=retry_hint,
+                expected=expected,
+                task=task,
+                user_content=user_content,
+            )
             if task == "2wiki" and _allow_2wiki_postprocess():
                 retry_res.final_answer = _postprocess_2wiki_evolved_answer(retry_res.final_answer, question)
             retry_refinement = None

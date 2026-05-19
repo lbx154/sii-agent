@@ -6,20 +6,36 @@ import os
 import time
 import hashlib
 import re
+import ast
+from collections import OrderedDict
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
-from memory.store import MemoryStore, _2WIKI_SEED_LESSONS, _2WIKI_SEED_SKILLS
+from memory.store import MemoryStore, _2WIKI_SEED_LESSONS, _2WIKI_SEED_SKILLS, _token_list as _memory_token_list
 
 from .registry import register
+from .runtime_context import get_tool_context
 
 _TOK = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]+")
-_MAX_QUERIES = 6
+_MAX_QUERIES = 8
 _KIND_LABELS = {
     "lessons": "lesson",
     "episodes": "episode",
     "skills": "skill",
 }
+_ANSWER_KEY_RE = re.compile(r"(?:^|_)(?:answer|expected|gold|reference|final)(?:_|$)", re.IGNORECASE)
+_CACHE_MAX = 512
+_CACHE_LOCK = Lock()
+_EXPANSION_CACHE: OrderedDict[str, tuple[list[str], dict[str, Any]]] = OrderedDict()
+_RERANK_CACHE: OrderedDict[str, tuple[list[dict[str, Any]], dict[str, Any]]] = OrderedDict()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _memory_root() -> Path:
@@ -33,6 +49,14 @@ def _runtime_mode() -> str:
 
 def _memory_read_only() -> bool:
     return _runtime_mode() == "test"
+
+
+def _include_incorrect_episodes() -> bool:
+    return _env_bool("SII_MEMORY_INCLUDE_INCORRECT_EPISODES", False)
+
+
+def _show_episode_answers() -> bool:
+    return _env_bool("SII_MEMORY_SHOW_EPISODE_ANSWERS", not _memory_read_only())
 
 
 def _write_blocked(tool_name: str) -> str | None:
@@ -102,6 +126,22 @@ def _with_id(kind: str, item: dict[str, Any]) -> dict[str, Any]:
     return updated
 
 
+def _redact_memory_item(kind: str, item: dict[str, Any]) -> dict[str, Any]:
+    normalized = str(kind or "").strip().lower()
+    if normalized in {"episode", "episodes"} and not _show_episode_answers():
+        redacted: dict[str, Any] = {}
+        for key, value in item.items():
+            key_text = str(key)
+            if _ANSWER_KEY_RE.search(key_text):
+                continue
+            if key_text in {"steps", "trajectory", "tool_calls"}:
+                continue
+            redacted[key_text] = value
+        redacted["episode_answer_redacted"] = True
+        return redacted
+    return dict(item)
+
+
 def _clamp_int(value: int, default: int, minimum: int, maximum: int) -> int:
     try:
         number = int(value)
@@ -115,8 +155,33 @@ def _short(text: object, limit: int) -> str:
     return clean[:limit]
 
 
+def _hash_text(text: object, limit: int = 4096) -> str:
+    value = str(text or "")
+    if len(value) > limit:
+        value = f"{value[:limit]}\n...len={len(value)}"
+    return hashlib.sha1(value.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _cache_get(cache: OrderedDict[str, Any], key: str) -> Any | None:
+    with _CACHE_LOCK:
+        if key not in cache:
+            return None
+        value = cache.pop(key)
+        cache[key] = value
+        return value
+
+
+def _cache_set(cache: OrderedDict[str, Any], key: str, value: Any) -> None:
+    with _CACHE_LOCK:
+        if key in cache:
+            cache.pop(key)
+        cache[key] = value
+        while len(cache) > _CACHE_MAX:
+            cache.popitem(last=False)
+
+
 def _tokens(text: object) -> set[str]:
-    return {tok.lower() for tok in _TOK.findall(str(text or "")) if len(tok) > 1}
+    return set(_memory_token_list(text))
 
 
 def _flatten_text(value: object) -> str:
@@ -154,24 +219,45 @@ def _normalize_queries(query: str, queries: list[str] | None) -> list[str]:
     return normalized
 
 
+def _merge_queries(*groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            clean = " ".join(str(item or "").split())[:240]
+            key = clean.lower()
+            if not clean or key in seen:
+                continue
+            merged.append(clean)
+            seen.add(key)
+            if len(merged) >= _MAX_QUERIES:
+                return merged
+    return merged
+
+
 def _field_texts(kind: str, item: dict[str, Any]) -> list[tuple[str, int, str]]:
     if kind == "lessons":
         return [
-            ("reusable_lesson", 8, _flatten_text(item.get("reusable_lesson"))),
-            ("corrective_strategy", 7, _flatten_text(item.get("corrective_strategy"))),
-            ("failure_mode", 6, _flatten_text(item.get("failure_mode"))),
-            ("root_cause", 5, _flatten_text(item.get("root_cause"))),
-            ("tags", 5, _flatten_text(item.get("tags"))),
-            ("question", 2, _original_question(_flatten_text(item.get("question")))),
+            ("reusable_lesson", 1, _flatten_text(item.get("reusable_lesson"))),
+            ("corrective_strategy", 1, _flatten_text(item.get("corrective_strategy"))),
+            ("failure_mode", 1, _flatten_text(item.get("failure_mode"))),
+            ("task_family", 1, _flatten_text(item.get("task_family"))),
+            ("memory_scope", 1, _flatten_text(item.get("memory_scope"))),
+            ("root_cause", 1, _flatten_text(item.get("root_cause"))),
+            ("tags", 1, _flatten_text(item.get("tags"))),
+            ("filter_reason", 1, _flatten_text(item.get("filter_reason"))),
+            ("question", 1, _original_question(_flatten_text(item.get("question")))),
         ]
     if kind == "episodes":
-        return [
-            ("answer", 6, _flatten_text(item.get("answer"))),
+        fields = [
             ("correct", 4, _flatten_text(item.get("correct"))),
             ("stop_reason", 4, _flatten_text(item.get("stop_reason"))),
             ("tool_call_counts", 3, _flatten_text(item.get("tool_call_counts"))),
             ("question", 2, _original_question(_flatten_text(item.get("question")))),
         ]
+        if _show_episode_answers():
+            fields.insert(0, ("answer", 6, _flatten_text(item.get("answer"))))
+        return fields
     return [
         ("id", 7, _flatten_text(item.get("id"))),
         ("title", 7, _flatten_text(item.get("title"))),
@@ -205,6 +291,8 @@ def _score_record(kind: str, item: dict[str, Any], queries: list[str]) -> tuple[
             overlap = q_tokens & field_tokens
             if overlap:
                 query_score += weight * len(overlap)
+                phrase_overlap = {token for token in overlap if "_" in token}
+                query_score += weight * len(phrase_overlap)
                 matched_terms.update(overlap)
                 matched_fields.add(field)
                 if len(q_tokens) > 1 and overlap == q_tokens:
@@ -213,6 +301,76 @@ def _score_record(kind: str, item: dict[str, Any], queries: list[str]) -> tuple[
             matched_queries.append(query)
             score += query_score
     return score, matched_queries, sorted(matched_terms), sorted(matched_fields)
+
+
+def _infer_memory_metadata(kind: str, item: dict[str, Any]) -> dict[str, Any]:
+    text = _flatten_text(item).lower()
+    explicit_task_family = str(item.get("task_family") or "").strip().lower()
+    task_family = explicit_task_family or "general"
+    if explicit_task_family:
+        task_family = explicit_task_family
+    elif "browsecomp" in text or "benchmark_answered" in text or "benchmark-csv" in text:
+        task_family = "browsecomp_special"
+    elif "simplevqa" in text:
+        task_family = "simplevqa"
+    elif "2wikimultihopqa" in text or "provided context" in text or "2wiki" in text:
+        task_family = "2wiki"
+    elif "film" in text or "director" in text:
+        task_family = "film_director"
+    modality = (
+        "image"
+        if task_family in {"visual_qa", "vqa_search", "ocr"}
+        or any(term in text for term in ("image", "photo", "visual", "screenshot", "picture", "ocr"))
+        else "text"
+    )
+    confidence = 0.5
+    if kind == "episodes":
+        if item.get("correct") is True:
+            confidence = 0.8
+        elif item.get("correct") is False:
+            confidence = 0.1
+    elif kind in {"lessons", "skills"}:
+        try:
+            confidence = max(0.1, min(1.0, float(item.get("score"))))
+        except (TypeError, ValueError):
+            confidence = 0.6
+    return {
+        "task_family": task_family,
+        "modality": modality,
+        "confidence": round(confidence, 3),
+        "has_explicit_metadata": any(key in item for key in ("task_family", "modality", "source_run", "confidence")),
+        "source_run": str(item.get("source_run") or item.get("run") or item.get("run_root") or ""),
+    }
+
+
+def _soft_metadata_adjustment(
+    result: dict[str, Any],
+    prompt_context: dict[str, Any],
+    matched_terms: list[str],
+) -> float:
+    metadata = result.get("metadata") or {}
+    prompt_text = str(prompt_context.get("prompt_text") or "").lower()
+    image_attached = bool(prompt_context.get("image_attached"))
+    task = str(prompt_context.get("task") or "").lower()
+    score = 0.0
+    if image_attached and metadata.get("modality") == "image":
+        score += 4.0
+    if image_attached and metadata.get("modality") == "text":
+        score -= 1.0
+    task_family = str(metadata.get("task_family") or "")
+    if task in {"benchmark_csv", "special"}:
+        if task_family in {"browsecomp_special", "simplevqa"}:
+            score += 4.0
+        elif task_family == "2wiki" and len(matched_terms) < 4:
+            score -= 4.0
+    if "provided context" not in prompt_text and task_family == "2wiki" and len(matched_terms) < 3:
+        score -= 2.0
+    try:
+        confidence = float(metadata.get("confidence") or 0.5)
+    except (TypeError, ValueError):
+        confidence = 0.5
+    score += (confidence - 0.5) * 2.0
+    return score
 
 
 def _seed_records(kind: str) -> list[tuple[int | None, dict[str, Any]]]:
@@ -231,6 +389,8 @@ def _scan_kind(kind: str, queries: list[str], include_seed: bool) -> tuple[list[
         candidates.extend(("seed", index, item) for index, item in _seed_records(kind))
     results: list[dict[str, Any]] = []
     for source, index, item in candidates:
+        if kind == "episodes" and item.get("correct") is False and not _include_incorrect_episodes():
+            continue
         score, matched_queries, matched_terms, matched_fields = _score_record(kind, item, queries)
         if score <= 0:
             continue
@@ -238,6 +398,7 @@ def _scan_kind(kind: str, queries: list[str], include_seed: bool) -> tuple[list[
             score += 4
         if source == "seed":
             score += 2
+        redacted_item = _redact_memory_item(kind, item)
         results.append(
             {
                 "type": _KIND_LABELS[kind],
@@ -247,10 +408,12 @@ def _scan_kind(kind: str, queries: list[str], include_seed: bool) -> tuple[list[
                 "index": index,
                 "id": _record_id(kind, item),
                 "score": round(score, 3),
+                "lexical_score": round(score, 3),
+                "metadata": _infer_memory_metadata(kind, item),
                 "matched_queries": matched_queries,
                 "matched_terms": matched_terms[:16],
                 "matched_fields": matched_fields,
-                "item": item,
+                "item": redacted_item,
             }
         )
     results.sort(key=lambda row: (-float(row["score"]), str(row["source"]), str(row["id"])))
@@ -266,6 +429,8 @@ def _format_memory_result(result: dict[str, Any], max_chars: int) -> dict[str, A
         "source_file": result["source_file"],
         "index": result["index"],
         "score": result["score"],
+        "lexical_score": result.get("lexical_score", result["score"]),
+        "metadata": result.get("metadata", {}),
         "matched_queries": result["matched_queries"],
         "matched_terms": result["matched_terms"],
         "matched_fields": result["matched_fields"],
@@ -309,6 +474,8 @@ def _compact_memory_ref(result: dict[str, Any]) -> dict[str, Any]:
         "id": result["id"],
         "source": result["source"],
         "score": result["score"],
+        "lexical_score": result.get("lexical_score", result["score"]),
+        "metadata": result.get("metadata", {}),
         "matched_fields": result["matched_fields"][:8],
         "matched_terms": result["matched_terms"][:12],
     }
@@ -326,12 +493,14 @@ def _compact_memory_ref(result: dict[str, Any]) -> dict[str, Any]:
             "avoid": [_short(step, 160) for step in (item.get("bad_patterns") or [])[:2]],
         }
     else:
-        base["summary"] = {
+        summary = {
             "correct": item.get("correct"),
-            "answer": _short(item.get("answer"), 120),
             "tool_call_counts": item.get("tool_call_counts"),
             "stop_reason": item.get("stop_reason"),
         }
+        if item.get("correct") is True and _show_episode_answers() and item.get("answer") is not None:
+            summary["answer"] = _short(item.get("answer"), 120)
+        base["summary"] = summary
     return base
 
 
@@ -342,16 +511,64 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.DOTALL | re.IGNORECASE)
     if fenced:
         raw = fenced.group(1)
-    if not raw.startswith("{"):
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start >= 0 and end > start:
-            raw = raw[start:end + 1]
+    if raw.startswith("{"):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            try:
+                parsed_literal = ast.literal_eval(raw)
+                return parsed_literal if isinstance(parsed_literal, dict) else None
+            except Exception:
+                pass
+    start = raw.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for index, char in enumerate(raw[start:], start):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                raw = raw[start:index + 1]
+                break
+    else:
+        return None
     try:
         parsed = json.loads(raw)
     except Exception:
-        return None
+        try:
+            parsed = ast.literal_eval(raw)
+        except Exception:
+            return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _response_text(response: Any) -> str:
+    try:
+        msg = response.choices[0].message
+    except Exception:  # noqa: BLE001
+        return ""
+    content = str(getattr(msg, "content", "") or "")
+    if content.strip():
+        return content
+    reasoning = getattr(msg, "reasoning_content", None)
+    if reasoning is None and isinstance(msg, dict):
+        reasoning = msg.get("reasoning_content")
+    return str(reasoning or "")
 
 
 def _clean_str_list(value: object, limit: int, item_chars: int) -> list[str]:
@@ -383,6 +600,399 @@ def _sanitize_guidance_text(text: object) -> str:
     for old, new in replacements.items():
         value = re.sub(re.escape(old), new, value, flags=re.IGNORECASE)
     return value
+
+
+def _current_prompt_context() -> dict[str, Any]:
+    ctx = get_tool_context()
+    content = ctx.get("user_content")
+    text_parts: list[str] = []
+    image_parts: list[dict[str, Any]] = []
+    image_sources: list[str] = []
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type") or "")
+            if part_type == "text":
+                text_parts.append(str(part.get("text") or ""))
+            elif part_type == "image_url":
+                image_url = part.get("image_url")
+                if isinstance(image_url, dict):
+                    url = str(image_url.get("url") or "")
+                    if url:
+                        image_parts.append({"type": "image_url", "image_url": image_url})
+                        image_sources.append("data_url" if url.startswith("data:image/") else url)
+    elif content is not None:
+        text_parts.append(str(content))
+    question = str(ctx.get("question") or "")
+    prompt_text = "\n\n".join(part for part in text_parts if part).strip() or question
+    if not image_sources:
+        for match in re.finditer(r"Image (?:local path/source|file/source|source):\s*(.+)", prompt_text, flags=re.IGNORECASE):
+            image_sources.append(match.group(1).strip())
+    return {
+        "task": str(ctx.get("task") or ""),
+        "prompt_text": _short(prompt_text, 2400),
+        "image_attached": bool(image_parts),
+        "image_sources": image_sources[:3],
+        "image_parts": image_parts[:1],
+    }
+
+
+def _summarize_current_trace(max_chars: int = 5000) -> str:
+    ctx = get_tool_context()
+    trajectory = ctx.get("trajectory")
+    if not isinstance(trajectory, list) or not trajectory:
+        return ""
+    latest_evidence_summary = next(
+        (
+            event for event in reversed(trajectory)
+            if isinstance(event, dict)
+            and event.get("role") == "system"
+            and event.get("name") == "evidence_summary"
+        ),
+        None,
+    )
+    latest_context_compact = next(
+        (
+            event for event in reversed(trajectory)
+            if isinstance(event, dict)
+            and event.get("role") == "system"
+            and event.get("name") == "context_compact"
+        ),
+        None,
+    )
+    events = list(trajectory[-20:])
+    if latest_evidence_summary is not None and all(event is not latest_evidence_summary for event in events):
+        events.insert(0, latest_evidence_summary)
+    if latest_context_compact is not None and all(event is not latest_context_compact for event in events):
+        events.insert(0, latest_context_compact)
+    parts: list[str] = []
+    for i, event in enumerate(events, 1):
+        if not isinstance(event, dict):
+            continue
+        role = str(event.get("role") or "")
+        if role == "assistant":
+            calls = []
+            for tc in event.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                calls.append(f"{fn.get('name', '?')}({fn.get('arguments', '')})")
+            content = _short(event.get("content"), 500)
+            parts.append(f"#{i} assistant calls: {'; '.join(calls) or '(no tool)'} content: {content}")
+        elif role == "tool":
+            name = str(event.get("name") or "?")
+            args = _short(event.get("args"), 280)
+            content = _short(event.get("content"), 900)
+            parts.append(f"#{i} tool[{name}] args={args} result={content}")
+        elif role == "system":
+            name = str(event.get("name") or "system")
+            content_limit = 2200 if name == "context_compact" else 1800 if name == "evidence_summary" else 500
+            content = _short(event.get("content"), content_limit)
+            parts.append(f"#{i} system[{name}] {content}")
+    return _short("\n".join(parts), max_chars)
+
+
+def _trace_signature() -> tuple[Any, ...]:
+    ctx = get_tool_context()
+    trajectory = ctx.get("trajectory")
+    if not isinstance(trajectory, list):
+        return (0,)
+    tool_events = [
+        event for event in trajectory
+        if isinstance(event, dict) and event.get("role") in {"tool", "system"}
+    ][-5:]
+    return (
+        len(trajectory),
+        tuple(
+            (
+                str(event.get("name") or event.get("role") or ""),
+                _hash_text(event.get("content"), 1200),
+            )
+            for event in tool_events
+        ),
+    )
+
+
+def _context_cache_key(query: str, queries: list[str]) -> str:
+    prompt_context = _current_prompt_context()
+    image_key = "|".join(prompt_context.get("image_sources") or [])
+    if prompt_context.get("image_attached") and not image_key:
+        image_key = "attached"
+    payload = {
+        "memory_root": str(_memory_root()),
+        "task": prompt_context.get("task") or "",
+        "query": _original_question(query),
+        "prompt": _hash_text(prompt_context.get("prompt_text"), 8000),
+        "image": _hash_text(image_key),
+        "queries": queries,
+        "trace": _trace_signature(),
+        "show_episode_answers": _show_episode_answers(),
+    }
+    return _hash_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), 16000)
+
+
+def _memory_query_expansion_enabled() -> bool:
+    return _env_bool("SII_MEMORY_SEARCH_EXPAND_QUERIES", True)
+
+
+def _heuristic_memory_queries(query: str, prompt_context: dict[str, Any], max_queries: int = _MAX_QUERIES) -> list[str]:
+    prompt_text = str(prompt_context.get("prompt_text") or "")
+    combined = f"{query}\n{prompt_text}".lower()
+    queries: list[str] = []
+    image_attached = bool(prompt_context.get("image_attached"))
+    visual = image_attached or any(
+        term in combined
+        for term in ("image", "photo", "picture", "visual", "screenshot", "poster", "cover", "logo", "diagram")
+    )
+    ocr = any(term in combined for term in ("ocr", "text in the image", "label", "sign", "caption", "cover text", "book cover", "printed"))
+    comparison = any(term in combined for term in ("which", "older", "younger", "earlier", "first", "same", "different", "compare"))
+    if visual:
+        if ocr:
+            queries.extend(
+                [
+                    "ocr text extraction exact text book cover visual evidence",
+                    "image to text printed title cover text",
+                ]
+            )
+        elif comparison:
+            queries.extend(
+                [
+                    "visual comparison compare candidates distinguishing features",
+                    "comparison answer format visual evidence",
+                ]
+            )
+        else:
+            queries.extend(
+                [
+                    "visual qa image search entity identification",
+                    "visual evidence verification reverse image search",
+                ]
+            )
+    if ocr:
+        queries.append("ocr text extraction image answer format")
+    if comparison:
+        queries.append("comparison compare both candidates answer format")
+    if any(term in combined for term in ("father", "mother", "wife", "husband", "spouse", "child", "grandfather", "grandmother", "in-law")):
+        queries.append("multi-hop relation chain verify each hop")
+    if "provided context" in combined or "2wiki" in combined:
+        queries.append("multi-hop text qa context evidence verification")
+    if any(term in combined for term in ("award", "publisher", "author", "designer", "director", "species", "chemical", "formula")):
+        queries.append("exact entity name verification search strategy")
+    queries.append("concise final answer requested format")
+    return _merge_queries(queries)[:max_queries]
+
+
+def _expand_memory_queries(query: str, queries: list[str], max_queries: int = _MAX_QUERIES) -> tuple[list[str], dict[str, Any]]:
+    if not _memory_query_expansion_enabled():
+        return queries, {"enabled": False}
+    cache_key = _context_cache_key(query, queries)
+    cached = _cache_get(_EXPANSION_CACHE, cache_key)
+    if cached is not None:
+        cached_queries, cached_meta = cached
+        meta = dict(cached_meta)
+        meta["cache"] = "hit"
+        return list(cached_queries), meta
+    prompt_context = _current_prompt_context()
+    if not prompt_context["prompt_text"] and not query:
+        return queries, {"enabled": True, "expanded": False, "reason": "empty_prompt"}
+    try:
+        from agent.llm import chat
+
+        system = (
+            "You generate retrieval queries for an agent memory store. "
+            "The memory contains reusable lessons, skills, and prior episodes. "
+            "Given the current prompt, optional image, and initial query phrases, produce short query phrases that help find transferable procedures. "
+            "Think by analogy: include task pattern, answer type, visual clue type, relation chain, search strategy, and verification failure modes. "
+            "Do NOT solve the current question, guess the answer, copy benchmark wording, or include final-answer candidates. "
+            "Return strict JSON only: {\"queries\":[\"...\"]}."
+        )
+        payload = {
+            "current_prompt": prompt_context["prompt_text"],
+            "current_trace_so_far": _summarize_current_trace(4000),
+            "image_context": {
+                "attached_to_this_message": prompt_context["image_attached"],
+                "sources": prompt_context["image_sources"],
+            },
+            "initial_queries": queries,
+            "rules": [
+                "2-8 short phrases, each <= 12 words",
+                "prefer reusable procedures over entity-only phrases",
+                "include visual/image-specific retrieval phrases when the image matters",
+                "do not include candidate answers",
+            ],
+        }
+        user_text = json.dumps(payload, ensure_ascii=False)
+        user_content: str | list[dict[str, Any]]
+        if prompt_context["image_parts"]:
+            user_content = [{"type": "text", "text": user_text}, *prompt_context["image_parts"]]
+        else:
+            user_content = user_text
+        response = chat(
+            [{"role": "system", "content": system}, {"role": "user", "content": user_content}],
+            tools=None,
+            temperature=0,
+            response_format={"type": "json_object"},
+            max_tokens=600,
+            timeout=float(os.getenv("SII_MEMORY_SEARCH_EXPAND_TIMEOUT", "45")),
+        )
+        parsed = _parse_json_object(_response_text(response))
+        expanded_raw = parsed.get("queries") if isinstance(parsed, dict) else []
+        expanded = [
+            _short(item, 160)
+            for item in (expanded_raw or [])
+            if isinstance(item, str) and item.strip()
+        ]
+        merged = _merge_queries(queries, expanded[: max(0, max_queries - len(queries))])
+        meta = {
+            "enabled": True,
+            "expanded": bool(expanded),
+            "added": [item for item in merged if item not in queries],
+            "image_attached": prompt_context["image_attached"],
+            "cache": "miss",
+        }
+        _cache_set(_EXPANSION_CACHE, cache_key, (merged, meta))
+        return merged, meta
+    except Exception as exc:  # noqa: BLE001
+        meta = {
+            "enabled": True,
+            "expanded": False,
+            "error": f"{type(exc).__name__}: {_short(exc, 240)}",
+            "cache": "miss",
+        }
+        _cache_set(_EXPANSION_CACHE, cache_key, (queries, meta))
+        return queries, meta
+
+
+def _memory_rerank_enabled() -> bool:
+    return _env_bool("SII_MEMORY_SEARCH_RERANK", True)
+
+
+def _apply_metadata_soft_rerank(results: list[dict[str, Any]], prompt_context: dict[str, Any]) -> list[dict[str, Any]]:
+    adjusted: list[dict[str, Any]] = []
+    for result in results:
+        row = dict(result)
+        metadata_delta = _soft_metadata_adjustment(row, prompt_context, list(row.get("matched_terms") or []))
+        row["metadata_score_delta"] = round(metadata_delta, 3)
+        row["score"] = round(float(row.get("score") or 0.0) + metadata_delta, 3)
+        adjusted.append(row)
+    adjusted.sort(key=lambda row: (-float(row["score"]), str(row["kind"]), str(row["id"])))
+    return adjusted
+
+
+def _rerank_memory_results(
+    query: str,
+    queries: list[str],
+    results: list[dict[str, Any]],
+    *,
+    k: int,
+    auto_prefetch: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if not results:
+        return results, {"enabled": False, "reason": "no_candidates"}
+    if not _memory_rerank_enabled():
+        return results, {"enabled": False}
+    if auto_prefetch and not _env_bool("SII_MEMORY_RERANK_AUTO_PREFETCH", False):
+        return results, {"enabled": True, "skipped": True, "reason": "auto_prefetch"}
+    if len(results) >= 5:
+        top = float(results[0].get("score") or 0)
+        fifth = max(float(results[min(4, len(results) - 1)].get("score") or 0), 0.001)
+        if top > 2.0 * fifth:
+            return results, {"enabled": True, "skipped": True, "reason": "large_score_gap", "top": top, "fifth": fifth}
+    candidate_limit = _clamp_int(os.getenv("SII_MEMORY_RERANK_CANDIDATES", "20"), 20, 5, 30)
+    candidates = results[:candidate_limit]
+    cache_key = _context_cache_key(query, queries) + "|" + _hash_text("|".join(str(item.get("id")) for item in candidates))
+    cached = _cache_get(_RERANK_CACHE, cache_key)
+    if cached is not None:
+        reranked, meta = cached
+        updated_meta = dict(meta)
+        updated_meta["cache"] = "hit"
+        return list(reranked), updated_meta
+    try:
+        from agent.llm import chat
+
+        prompt_context = _current_prompt_context()
+        refs = [_compact_memory_ref(result) for result in candidates]
+        payload = {
+            "current_prompt": prompt_context["prompt_text"],
+            "current_trace_so_far": _summarize_current_trace(5000),
+            "image_context": {
+                "attached_to_this_message": prompt_context["image_attached"],
+                "sources": prompt_context["image_sources"],
+            },
+            "queries_used": queries,
+            "candidate_refs": refs,
+            "instructions": [
+                "Rank only candidates whose reusable method fits the current prompt/image/trace.",
+                "Do not rank by old answer text; episode answers are intentionally redacted.",
+                "Return IDs only, best first. Omit unrelated candidates.",
+            ],
+        }
+        user_text = json.dumps(payload, ensure_ascii=False)
+        user_content: str | list[dict[str, Any]]
+        if prompt_context["image_parts"]:
+            user_content = [{"type": "text", "text": user_text}, *prompt_context["image_parts"]]
+        else:
+            user_content = user_text
+        response = chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a relevance reranker for an agent memory store. "
+                        "Select reusable lessons/skills/episodes that transfer to the current task. "
+                        "Return strict JSON: {\"ranked_ids\":[\"...\"]}."
+                    ),
+                },
+                {"role": "user", "content": user_content},
+            ],
+            tools=None,
+            temperature=0,
+            response_format={"type": "json_object"},
+            max_tokens=300,
+            timeout=float(os.getenv("SII_MEMORY_RERANK_TIMEOUT", "5")),
+        )
+        parsed = _parse_json_object(response.choices[0].message.content or "")
+        ranked_ids = [str(item) for item in (parsed or {}).get("ranked_ids", []) if str(item).strip()]
+        by_id = {str(result.get("id")): result for result in candidates}
+        selected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item_id in ranked_ids:
+            result = by_id.get(item_id)
+            if result is None or item_id in seen:
+                continue
+            row = dict(result)
+            row["rerank_selected"] = True
+            selected.append(row)
+            seen.add(item_id)
+            if len(selected) >= k:
+                break
+        for result in results:
+            item_id = str(result.get("id"))
+            if item_id in seen:
+                continue
+            selected.append(result)
+            if len(selected) >= len(results):
+                break
+        meta = {
+            "enabled": True,
+            "skipped": False,
+            "candidate_count": len(candidates),
+            "ranked_ids": ranked_ids[:k],
+            "cache": "miss",
+        }
+        _cache_set(_RERANK_CACHE, cache_key, (selected, meta))
+        return selected, meta
+    except Exception as exc:  # noqa: BLE001
+        meta = {
+            "enabled": True,
+            "skipped": True,
+            "reason": "error",
+            "error": f"{type(exc).__name__}: {_short(exc, 240)}",
+            "cache": "miss",
+        }
+        _cache_set(_RERANK_CACHE, cache_key, (results, meta))
+        return results, meta
 
 
 def _fallback_guidance(refs: list[dict[str, Any]], max_chars: int) -> dict[str, Any]:
@@ -437,21 +1047,33 @@ def _summarize_memory_guidance(
 
         system = (
             "You compress retrieved long-term memory for a general ReAct agent. "
+            "You must transfer reusable methods from memory to the current problem, not copy old answers. "
+            "Consider the full current prompt and any attached image together with the memory refs when deciding what transfers. "
             "Do not dump records. Produce only the most useful, task-relevant guidance. "
             "Memory is guidance, not evidence; tell the agent what procedure/checks to apply, not what final answer to give. "
+            "For web-search tasks, convert memory into concrete search discipline: which constraint to anchor first, "
+            "when to quote exact phrases, when to reject a candidate, and what answer-specific field must be verified. "
+            "If an attached image is present, inspect it directly and mention how visual clues should guide search/verification. "
             "Do not mention gold answers, gold standards, benchmark names, dataset names, exact examples, or record dumps. "
             "If records mention gold/benchmark-specific wording, generalize it to requested-answer formatting and current-task verification. "
             "If a record looks stale, harmful, duplicate, or too specific, mention that it should be inspected with memory_get before update/delete. "
             "Return strict JSON only."
         )
+        prompt_context = _current_prompt_context()
         user = {
             "current_question": _short(_original_question(query), 800),
+            "current_prompt": prompt_context["prompt_text"],
+            "current_trace_so_far": _summarize_current_trace(6000),
+            "image_context": {
+                "attached_to_this_message": prompt_context["image_attached"],
+                "sources": prompt_context["image_sources"],
+            },
             "queries_used": queries,
             "max_guidance_chars": max_chars,
             "output_schema": {
                 "guidance": f"single concise paragraph, <= {max_chars} chars",
                 "apply": ["2-5 concrete instructions"],
-                "avoid": ["0-4 pitfalls"],
+                "avoid": ["0-4 pitfalls, especially candidate drift or answering with failed constraints"],
                 "supporting_refs": [{"kind": "lessons|skills|episodes", "id": "record id", "why": "short reason"}],
             },
             "style_rules": [
@@ -459,11 +1081,19 @@ def _summarize_memory_guidance(
                 "never say gold answer/gold standard",
                 "do not use examples or exact entity names",
                 "do not reveal full record content",
+                "transfer only reusable search/verification procedures that fit the current prompt and image",
+                "if no reusable memory is specific enough, say to solve from current evidence and do not invent unsupported answers",
             ],
             "retrieved_memory_refs": refs[:10],
         }
+        user_text = json.dumps(user, ensure_ascii=False)
+        user_content: str | list[dict[str, Any]]
+        if prompt_context["image_parts"]:
+            user_content = [{"type": "text", "text": user_text}, *prompt_context["image_parts"]]
+        else:
+            user_content = user_text
         response = chat(
-            [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user, ensure_ascii=False)}],
+            [{"role": "system", "content": system}, {"role": "user", "content": user_content}],
             tools=None,
             temperature=0,
             response_format={"type": "json_object"},
@@ -503,8 +1133,9 @@ def _summarize_memory_guidance(
 
 @register(
     "memory_search",
-    "Search concrete records from global memory. Provide the current question plus 2-6 focused query phrases/entity names; "
-    "the tool scans lessons, episodes, and skills, then returns a compressed actionable guidance summary plus record ids.",
+    "Search concrete records from global memory. Provide the current question plus optional focused phrases; "
+    "the tool expands the input into task-pattern queries and matches multiple lesson keys "
+    "(lesson, strategy, failure mode, tags, task family, source question) before returning actionable guidance plus record ids.",
     {
         "type": "object",
         "properties": {
@@ -521,14 +1152,15 @@ def _summarize_memory_guidance(
             "include_episodes": {"type": "boolean", "default": True},
             "include_skills": {"type": "boolean", "default": True},
             "include_seed": {"type": "boolean", "default": False},
+            "auto_prefetch": {"type": "boolean", "default": False},
             "max_chars_per_item": {"type": "integer", "default": 900, "minimum": 120, "maximum": 3000},
             "guidance_max_chars": {"type": "integer", "default": 900, "minimum": 240, "maximum": 1800},
         },
-        "required": ["query"],
+        "required": [],
     },
 )
 def memory_search(
-    query: str,
+    query: str = "",
     queries: list[str] | None = None,
     k: int = 8,
     task: str = "general",
@@ -536,6 +1168,7 @@ def memory_search(
     include_episodes: bool = True,
     include_skills: bool = True,
     include_seed: bool = False,
+    auto_prefetch: bool = False,
     max_chars_per_item: int = 900,
     guidance_max_chars: int = 900,
 ) -> str:
@@ -543,8 +1176,13 @@ def memory_search(
     max_chars_per_item = _clamp_int(max_chars_per_item, 900, 120, 3000)
     guidance_max_chars = _clamp_int(guidance_max_chars, 900, 240, 1800)
     root = _memory_root()
-    normalized_queries = _normalize_queries(query, queries)
-    if not normalized_queries:
+    if not str(query or "").strip() and queries:
+        query = str(queries[0])
+    initial_queries = _normalize_queries(query, queries)
+    prompt_context = _current_prompt_context()
+    heuristic_queries = _heuristic_memory_queries(query, prompt_context)
+    initial_queries = _merge_queries(initial_queries, heuristic_queries)
+    if not initial_queries:
         return json.dumps(
             {
                 "memory_root": str(root),
@@ -555,6 +1193,7 @@ def memory_search(
             ensure_ascii=False,
             indent=2,
         )
+    normalized_queries, query_expansion = _expand_memory_queries(query, initial_queries)
     kinds = []
     if include_lessons:
         kinds.append("lessons")
@@ -569,16 +1208,30 @@ def memory_search(
         scanned[kind] = count
         results.extend(kind_results)
     results.sort(key=lambda row: (-float(row["score"]), str(row["kind"]), str(row["id"])))
+    results = _apply_metadata_soft_rerank(results, prompt_context)
+    results, rerank = _rerank_memory_results(query, normalized_queries, results, k=max(k, 1), auto_prefetch=bool(auto_prefetch))
     compact_refs = [_compact_memory_ref(result) for result in results[:k]]
     guidance = _summarize_memory_guidance(query, normalized_queries, compact_refs, max_chars=guidance_max_chars)
+    trace_summary = _summarize_current_trace()
     return json.dumps(
         {
             "memory_root": str(root),
             "runtime_mode": _runtime_mode(),
             "read_only": _memory_read_only(),
             "query": query,
+            "initial_queries": initial_queries,
+            "heuristic_queries": heuristic_queries,
             "queries_used": normalized_queries,
+            "query_expansion": query_expansion,
+            "rerank": rerank,
             "scanned_records": scanned,
+            "guidance_context": {
+                "used_current_prompt": bool(prompt_context["prompt_text"]),
+                "used_current_trace": bool(trace_summary),
+                "current_trace_chars": len(trace_summary),
+                "image_attached": prompt_context["image_attached"],
+                "image_sources": prompt_context["image_sources"],
+            },
             "guidance": guidance,
             "record_refs": compact_refs,
             "full_records_suppressed": True,
@@ -646,7 +1299,8 @@ def memory_list(kind: str = "lessons", limit: int = 20, offset: int = 0, max_cha
     normalized_kind = path.stem
     items = []
     for index, item in enumerate(rows[offset:offset + limit], offset):
-        item_with_id = _with_id(normalized_kind, item)
+        original_with_id = _with_id(normalized_kind, item)
+        item_with_id = _with_id(normalized_kind, _redact_memory_item(normalized_kind, original_with_id))
         preview = {key: _short(value, max_chars_per_item) for key, value in item_with_id.items() if key != "id"}
         items.append({"index": index, "id": item_with_id["id"], "item": preview})
     return json.dumps(
@@ -683,6 +1337,7 @@ def memory_get(id: str, kind: str = "lessons") -> str:
     for index, item in enumerate(_read_jsonl(path)):
         item_with_id = _with_id(normalized_kind, item)
         if item_with_id["id"] == id:
+            redacted_item = _with_id(normalized_kind, _redact_memory_item(normalized_kind, item_with_id))
             return json.dumps(
                 {
                     "memory_root": str(_memory_root()),
@@ -690,7 +1345,7 @@ def memory_get(id: str, kind: str = "lessons") -> str:
                     "read_only": _memory_read_only(),
                     "kind": normalized_kind,
                     "index": index,
-                    "item": item_with_id,
+                    "item": redacted_item,
                 },
                 ensure_ascii=False,
                 indent=2,

@@ -38,6 +38,8 @@ class HarnessResult:
     finish_reasons: dict[str, int] = field(default_factory=dict)
     short_memory_stats: dict[str, int] = field(default_factory=dict)
     internal_verify_results: list[dict[str, Any]] = field(default_factory=list)
+    evidence_state: dict[str, Any] = field(default_factory=dict)
+    compact_context: dict[str, Any] = field(default_factory=dict)
 
 
 class StepGuard:

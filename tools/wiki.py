@@ -152,7 +152,7 @@ def _get_page_sqlite(index_path: str, title_or_id: str, max_chars: int) -> str:
             (needle, needle),
         ).fetchall()
         if not rows:
-            rows = conn.execute(
+            candidates = conn.execute(
                 """
                 SELECT id, title, text, bm25(wiki_fts, 2.0, 1.0) AS score
                 FROM wiki_fts
@@ -162,7 +162,16 @@ def _get_page_sqlite(index_path: str, title_or_id: str, max_chars: int) -> str:
                 """,
                 (_quoted(needle),),
             ).fetchall()
-            rows = [(doc_id, title, text) for doc_id, title, text, _score in rows]
+            if candidates:
+                candidate_text = "\n".join(
+                    f"- {title} (wiki25 id={doc_id}, score={-_score:.2f})"
+                    for doc_id, title, _text, _score in candidates
+                )
+                return (
+                    f"(no exact page found for {needle!r}; candidate titles only. "
+                    "Use wiki_search or call wiki_page with the exact title/id.)\n"
+                    f"{candidate_text}"
+                )
         if not rows:
             return "(no page found)"
         out = []
@@ -257,8 +266,17 @@ def wiki_page(title_or_id: str, max_chars: int = 4000) -> str:
         if str(doc.get("id", "")).lower() == needle or str(doc.get("title", "")).lower() == needle
     ]
     if not matches:
-        matches = [doc for doc in docs if needle in str(doc.get("title", "")).lower()][:3]
-    if not matches:
+        candidates = [doc for doc in docs if needle in str(doc.get("title", "")).lower()][:3]
+        if candidates:
+            candidate_text = "\n".join(
+                f"- {doc.get('title', '')} (wiki25 id={doc.get('id', '')})"
+                for doc in candidates
+            )
+            return (
+                f"(no exact page found for {title_or_id!r}; candidate titles only. "
+                "Use wiki_search or call wiki_page with the exact title/id.)\n"
+                f"{candidate_text}"
+            )
         return "(no page found)"
     out = []
     for doc in matches[:3]:
