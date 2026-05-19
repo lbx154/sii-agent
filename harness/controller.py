@@ -19,6 +19,10 @@ class HarnessConfig:
     max_consecutive_no_tool: int = 2  # LLM keeps "thinking" without acting
     use_short_memory: bool = False
     short_memory_max_chars: int = 2500
+    max_parallel_tool_calls: int = 0  # 0 disables; otherwise execute at most this many per turn
+    max_web_search_calls: int = 0  # 0 disables; otherwise remove web_search after this many calls
+    max_research_tool_calls: int = 0  # 0 disables; otherwise force final after this many evidence calls
+    synthesize_after_tool_calls: int = 0  # 0 disables; otherwise send a one-time convergence reminder
 
 
 @dataclass

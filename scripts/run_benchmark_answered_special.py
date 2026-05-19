@@ -5,7 +5,7 @@ The benchmark protocol here is intentionally test-only:
 - no train-time gold verification
 - no memory writes
 - baseline has no memory tools
-- memory mode can query read-only memory and receives overall guidance
+- memory mode can query read-only memory without overall prompt injection
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import sys
 import threading
 import time
@@ -29,9 +30,10 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from agent.react import _overall_memory_guidance, run_react  # noqa: E402
+from agent.react import run_react  # noqa: E402
 from agent.scoring import score_answer  # noqa: E402
 from harness.controller import HarnessConfig  # noqa: E402
+from tools.search import web_search  # noqa: E402
 
 
 csv.field_size_limit(sys.maxsize)
@@ -80,23 +82,109 @@ VISUAL_TOOLS = {
     "image_to_text",
     "image_to_search_queries",
 }
+BROWSER_TOOLS = {
+    "browser_open",
+    "browser_open_many",
+    "browser_text",
+    "browser_click",
+    "browser_type",
+    "browser_close",
+}
+STOPWORDS = {
+    "about",
+    "a",
+    "an",
+    "according",
+    "after",
+    "also",
+    "and",
+    "another",
+    "are",
+    "as",
+    "available",
+    "been",
+    "before",
+    "between",
+    "both",
+    "but",
+    "by",
+    "can",
+    "company",
+    "could",
+    "during",
+    "each",
+    "from",
+    "for",
+    "had",
+    "has",
+    "have",
+    "identify",
+    "into",
+    "in",
+    "its",
+    "known",
+    "many",
+    "more",
+    "most",
+    "name",
+    "not",
+    "of",
+    "on",
+    "one",
+    "only",
+    "or",
+    "other",
+    "over",
+    "person",
+    "please",
+    "question",
+    "requested",
+    "same",
+    "show",
+    "some",
+    "specific",
+    "that",
+    "the",
+    "their",
+    "there",
+    "this",
+    "through",
+    "to",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "whose",
+    "with",
+    "would",
+    "years",
+    "fictional",
+    "character",
+    "occasionally",
+    "audience",
+    "involving",
+}
 
 BASELINE_EXTRA = (
-    "Evaluation mode. No memory tools are available in this run. Use live search and browser tools as needed. "
-    "For slow pages, browser_open/browser_open_many may use timeout_ms up to 120000. "
+    "Evaluation mode. No memory tools are available in this run. Use live search and available page tools as needed. "
     "Cross-check current evidence before final_answer. No reflection retry is available; solve carefully within "
     "this single ReAct attempt. Only use visual/image tools when the prompt provides an actual image file path "
-    "or direct image URL; never pass an ordinary web page or search-result URL to image tools."
+    "or direct image URL; never pass an ordinary web page or search-result URL to image tools. "
+    "Timed benchmark strategy: avoid broad search loops. After a few evidence calls, identify the strongest "
+    "candidate, use at most one targeted verification if essential, then answer concisely."
 )
 
 MEMORY_EXTRA = (
     "Evaluation/test mode with read-only memory. You can and should call memory_search early when it may help: "
-    "query the full question plus 2-6 focused phrases/entities/patterns. Treat memory_search guidance and overall "
-    "memory guidance only as procedural advice, not evidence. Do not create/update/delete memory. Verify the final "
-    "answer using current web_search/browser evidence. For slow pages, browser_open/browser_open_many may use "
-    "timeout_ms up to 120000. No reflection retry is available; solve carefully within this single ReAct attempt. "
+    "query the full question plus 2-6 focused phrases/entities/patterns. Treat memory_search guidance only as "
+    "procedural advice, not evidence. Do not create/update/delete memory. Verify the final "
+    "answer using current web_search or page evidence. No reflection retry is available; solve carefully within this single ReAct attempt. "
     "Only use visual/image tools when the prompt provides an actual image file path or direct image URL; never pass "
-    "an ordinary web page or search-result URL to image tools."
+    "an ordinary web page or search-result URL to image tools. Timed benchmark strategy: avoid broad search loops. "
+    "After memory plus a few evidence calls, identify the strongest candidate, use at most one targeted verification "
+    "if essential, then answer concisely."
 )
 
 
@@ -112,12 +200,30 @@ def _set_default_env() -> None:
     os.environ["VLLM_ENABLE_THINKING"] = os.getenv("VLLM_ENABLE_THINKING") or "0"
     os.environ["SII_AGENT_RUNTIME_MODE"] = os.getenv("SII_AGENT_RUNTIME_MODE") or "test"
     os.environ.setdefault("SII_AGENT_MEMORY_ROOT", "logs/memory")
-    os.environ.setdefault("SII_MEMORY_OVERALL_IN_PROMPT", "1")
+    os.environ["SII_MEMORY_OVERALL_IN_PROMPT"] = "0"
     os.environ.setdefault("SII_MEMORY_OVERALL_PROMPT_MAX_CHARS", "2200")
     os.environ.setdefault("SII_MEMORY_SEARCH_LLM_SUMMARY", "1")
-    os.environ.setdefault("SII_MEMORY_SEARCH_SUMMARY_TIMEOUT", "240")
-    os.environ.setdefault("SEARCH_PROXY_TIMEOUT", "300")
-    os.environ.setdefault("SEARCH_PROXY_UPLOAD_TIMEOUT", "300")
+    os.environ.setdefault("SEARCH_PROXY_MIN_K", "5")
+    os.environ.setdefault("SEARCH_PROXY_FILTER_GARBAGE", "1")
+    os.environ.setdefault("SEARCH_PROXY_FILTER_EXTRA_K", "5")
+
+
+def _cap_timeout_env(name: str, max_seconds: float) -> None:
+    try:
+        cap = max(1.0, float(max_seconds))
+    except (TypeError, ValueError):
+        return
+    raw = os.getenv(name)
+    if raw is None:
+        os.environ[name] = str(int(cap) if cap.is_integer() else cap)
+        return
+    try:
+        current = float(raw)
+    except ValueError:
+        os.environ[name] = str(int(cap) if cap.is_integer() else cap)
+        return
+    if current > cap:
+        os.environ[name] = str(int(cap) if cap.is_integer() else cap)
 
 
 def _load_rows(csv_path: Path, n: int, offset: int) -> tuple[list[str], list[dict[str, str]], list[tuple[int, dict[str, str]]]]:
@@ -140,14 +246,135 @@ def _build_question(row: dict[str, str]) -> str:
     problem = " ".join(str(row.get("problem") or "").split())
     image = str(row.get("_image_ref") or "").strip()
     parts = [problem]
+    prefetch_context = str(row.get("_prefetch_context") or "").strip()
+    if prefetch_context:
+        parts.append(
+            "Provided search context from automatic prefetch. Treat it as current search evidence; "
+            "if it contains the answer, do not keep searching just to be cautious.\n\n"
+            f"{prefetch_context}"
+        )
     if image:
         parts.append(f"Image file/source: {image}")
         parts.append(
             "If the image is needed, call image_to_text, image_to_search_queries, visual_web_search, "
             "or reverse_image_search with this source path/URL. Do not copy raw image data into tool arguments."
         )
-    parts.append("Return only the concise answer requested by the problem.")
+    parts.append(
+        "Return only the concise answer span requested by the problem. For counts, return the number only; "
+        "for names, return the full name only; do not include explanatory words or units unless they are part "
+        "of the requested value."
+    )
     return "\n\n".join(parts)
+
+
+def _words(text: str) -> list[str]:
+    return [word.strip("'’.-") for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9'’.-]*", text) if word.strip("'’.-")]
+
+
+def _informative_words(text: str) -> list[str]:
+    items = []
+    for word in _words(text):
+        key = word.strip("'’.-").lower()
+        if len(key) < 3 or key in STOPWORDS:
+            continue
+        items.append(word.strip("'’.-"))
+    return items
+
+
+def _keyword_query(problem: str, limit: int = 18) -> str:
+    words = _informative_words(problem)
+    scored = []
+    for i, word in enumerate(words):
+        key = word.lower()
+        score = int(len(key) >= 7) + int(any(ch.isdigit() for ch in key)) + int(any(ch.isupper() for ch in word))
+        scored.append((score, i, word))
+    keep = sorted(scored, key=lambda item: (-item[0], item[1]))[:limit]
+    keep_ordered = [word for _, _, word in sorted(keep, key=lambda item: item[1])]
+    return " ".join(keep_ordered)[:260]
+
+
+def _phrase_query(problem: str) -> str:
+    words = _words(problem)
+    candidates: list[tuple[int, int, str]] = []
+    for n in range(2, 5):
+        for i in range(0, max(0, len(words) - n + 1)):
+            chunk = words[i : i + n]
+            keys = [word.strip("'’.-").lower() for word in chunk]
+            if any(key in STOPWORDS for key in keys[:1] + keys[-1:]):
+                continue
+            if not any(len(key) >= 7 or any(ch.isdigit() for ch in key) for key in keys):
+                continue
+            score = sum((len(key) if len(key) >= 7 else 0) + (4 if any(ch.isdigit() for ch in key) else 0) for key in keys)
+            candidates.append((score, i, " ".join(chunk)))
+    phrases = []
+    seen = set()
+    for _, _, phrase in sorted(candidates, key=lambda item: (-item[0], item[1])):
+        key = phrase.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        phrases.append(phrase)
+        if len(phrases) >= 2:
+            break
+    if not phrases:
+        return _keyword_query(problem, limit=10)
+    target = "answer"
+    lower = problem.lower()
+    if "character" in lower:
+        target = "character"
+    elif "full name" in lower or "who" in lower:
+        target = "full name"
+    elif "how many" in lower or "number" in lower:
+        target = "number"
+    return " ".join(f'"{phrase}"' for phrase in phrases) + f" {target}"
+
+
+def _prefetch_search_context(problem: str, args: argparse.Namespace) -> tuple[str, list[dict[str, str]]]:
+    if args.prefetch_searches <= 0:
+        return "", []
+    queries = []
+    for query in (_phrase_query(problem), _keyword_query(problem)):
+        query = " ".join(query.split())
+        if query and query.lower() not in {item.lower() for item in queries}:
+            queries.append(query)
+        if len(queries) >= args.prefetch_searches:
+            break
+    records = []
+    blocks = []
+    for query in queries:
+        old_fetch = os.environ.get("SEARCH_PROXY_FETCH")
+        old_max_chars = os.environ.get("SEARCH_PROXY_MAX_CHARS")
+        if args.prefetch_fetch_max_chars > 0:
+            os.environ["SEARCH_PROXY_FETCH"] = "1"
+            os.environ["SEARCH_PROXY_MAX_CHARS"] = str(args.prefetch_fetch_max_chars)
+        try:
+            result = web_search(query, k=args.prefetch_k)
+        finally:
+            if old_fetch is None:
+                os.environ.pop("SEARCH_PROXY_FETCH", None)
+            else:
+                os.environ["SEARCH_PROXY_FETCH"] = old_fetch
+            if old_max_chars is None:
+                os.environ.pop("SEARCH_PROXY_MAX_CHARS", None)
+            else:
+                os.environ["SEARCH_PROXY_MAX_CHARS"] = old_max_chars
+        records.append({"query": query, "content": result})
+        blocks.append(f"[prefetch query: {query}]\n{result[: args.prefetch_max_chars]}")
+    return "\n\n".join(blocks), records
+
+
+def _postprocess_answer(question: str, answer: str | None) -> str:
+    text = str(answer or "").strip()
+    text = re.sub(r"^(?:the answer is|answer:)\s*", "", text, flags=re.IGNORECASE).strip()
+    text = text.rstrip(" .;:")
+    question_l = str(question or "").lower()
+    if re.search(r"\b(how many|number of|count of)\b", question_l):
+        match = re.match(r"^([+-]?\d[\d,]*(?:\.\d+)?%?)\s+[A-Za-z][A-Za-z -]*(?:\s+available|\s+remaining)?$", text)
+        if match:
+            text = match.group(1)
+        if re.fullmatch(r"\d{5,}", text):
+            return f"{int(text):,}"
+    return text
 
 
 def _guess_image_ext(mime: str | None, data: bytes) -> str:
@@ -236,9 +463,13 @@ def _run_one(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     row_tools = tools if row.get("_image_ref") else tuple(name for name in tools if name not in VISUAL_TOOLS)
+    if not args.enable_browser_tools:
+        row_tools = tuple(name for name in row_tools if name not in BROWSER_TOOLS)
     row_extra_system = extra_system
     if not row.get("_image_ref"):
-        row_extra_system += " This row has no image input; use web_search/browser tools for web pages, not visual/image tools."
+        row_extra_system += " This row has no image input; use text/web tools for web pages, not visual/image tools."
+    if not args.enable_browser_tools:
+        row_extra_system += " Browser tools are disabled for this timed run; rely on web_search/wiki/visual snippets and answer from the best-supported evidence."
     cfg = HarnessConfig(
         max_steps=args.max_steps,
         max_wall_seconds=args.max_wall_seconds,
@@ -246,18 +477,38 @@ def _run_one(
         max_llm_call_seconds=args.max_llm_call_seconds,
         min_llm_call_seconds=args.min_llm_call_seconds,
         allowed_tools=row_tools,
+        max_parallel_tool_calls=args.max_parallel_tool_calls,
+        max_web_search_calls=args.max_web_search_calls,
+        max_research_tool_calls=args.max_research_tool_calls,
+        synthesize_after_tool_calls=args.synthesize_after_tool_calls,
     )
     expected = str(row.get("answer") or "").strip()
     started = time.time()
     try:
+        prefetch_context, prefetch_records = _prefetch_search_context(str(row.get("problem") or ""), args)
+        row_for_prompt = dict(row)
+        row_for_prompt["_prefetch_context"] = prefetch_context
         result = run_react(
-            _build_question(row),
+            _build_question(row_for_prompt),
             cfg=cfg,
             extra_system=row_extra_system,
             expected=None,
             task="benchmark_csv",
         )
-        scores = score_answer(result.final_answer, expected)
+        final_answer = _postprocess_answer(row.get("problem", ""), result.final_answer)
+        scores = score_answer(final_answer, expected)
+        prefetch_trajectory = [
+            {
+                "role": "tool",
+                "name": "prefetch_web_search",
+                "args": {"query": item["query"]},
+                "content": item["content"],
+            }
+            for item in prefetch_records
+        ]
+        tool_call_counts = dict(result.tool_call_counts)
+        if prefetch_records:
+            tool_call_counts["prefetch_web_search"] = len(prefetch_records)
         return {
             "id": f"benchmark-csv-{idx}",
             "index": idx,
@@ -265,19 +516,19 @@ def _run_one(
             "problem": row.get("problem", ""),
             "image": row.get("_image_ref", ""),
             "image_meta": row.get("_image_meta", {}),
-            "answer": result.final_answer or "",
+            "answer": final_answer,
             "expected": expected,
             "correct": bool(scores.get("correct")),
             "exact": bool(scores.get("exact")),
             "f1": float(scores.get("f1") or 0.0),
             "rationale": result.rationale,
             "steps": result.steps,
-            "tool_calls": result.tool_calls,
-            "tool_call_counts": result.tool_call_counts,
+            "tool_calls": result.tool_calls + len(prefetch_records),
+            "tool_call_counts": tool_call_counts,
             "stop_reason": result.stop_reason,
             "finish_reasons": result.finish_reasons,
-            "elapsed": result.elapsed,
-            "trajectory": result.trajectory if args.save_trace else [],
+            "elapsed": time.time() - started,
+            "trajectory": (prefetch_trajectory + result.trajectory) if args.save_trace else [],
             "error": None,
         }
     except Exception as exc:  # noqa: BLE001
@@ -502,9 +753,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=int, default=50)
     parser.add_argument("--max-steps", type=int, default=26)
     parser.add_argument("--max-llm-tokens", type=int, default=120000)
-    parser.add_argument("--max-wall-seconds", type=float, default=1800.0)
+    parser.add_argument("--max-wall-seconds", type=float, default=180.0)
     parser.add_argument("--max-llm-call-seconds", type=float, default=600.0)
     parser.add_argument("--min-llm-call-seconds", type=float, default=30.0)
+    parser.add_argument("--max-parallel-tool-calls", type=int, default=1)
+    parser.add_argument("--max-web-search-calls", type=int, default=0)
+    parser.add_argument("--max-research-tool-calls", type=int, default=12)
+    parser.add_argument("--synthesize-after-tool-calls", type=int, default=6)
+    parser.add_argument("--enable-browser-tools", action="store_true", help="Allow browser_open/browser interaction tools.")
+    parser.add_argument("--prefetch-searches", type=int, default=2)
+    parser.add_argument("--prefetch-k", type=int, default=5)
+    parser.add_argument("--prefetch-max-chars", type=int, default=12000)
+    parser.add_argument("--prefetch-fetch-max-chars", type=int, default=0)
     parser.add_argument("--resume", action="store_true", help="Reuse completed rows already present in mode JSONL files.")
     parser.add_argument("--no-save-trace", dest="save_trace", action="store_false")
     parser.set_defaults(save_trace=True)
@@ -514,6 +774,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     _set_default_env()
+    _cap_timeout_env("SEARCH_PROXY_TIMEOUT", args.max_wall_seconds)
+    _cap_timeout_env("SEARCH_PROXY_UPLOAD_TIMEOUT", args.max_wall_seconds)
+    _cap_timeout_env("SII_MEMORY_SEARCH_SUMMARY_TIMEOUT", args.max_wall_seconds)
     csv_path = Path(args.csv)
     run_name = args.run_name or f"benchmark_answered_special_26s_120k_c{args.concurrency}_{time.strftime('%Y%m%d_%H%M%S')}"
     run_root = Path(args.out) / run_name
@@ -524,7 +787,6 @@ def main() -> None:
     image_metas = []
     for idx, row in selected_rows:
         image_metas.append({"index": idx, **_prepare_image(row, idx, images_dir)})
-    overall = _overall_memory_guidance()
     config = {
         "run_root": str(run_root),
         "csv_path": str(csv_path),
@@ -544,12 +806,24 @@ def main() -> None:
         "max_wall_seconds": args.max_wall_seconds,
         "max_llm_call_seconds": args.max_llm_call_seconds,
         "min_llm_call_seconds": args.min_llm_call_seconds,
+        "max_parallel_tool_calls": args.max_parallel_tool_calls,
+        "max_web_search_calls": args.max_web_search_calls,
+        "max_research_tool_calls": args.max_research_tool_calls,
+        "synthesize_after_tool_calls": args.synthesize_after_tool_calls,
+        "browser_tools_enabled": args.enable_browser_tools,
+        "prefetch_searches": args.prefetch_searches,
+        "prefetch_k": args.prefetch_k,
+        "prefetch_max_chars": args.prefetch_max_chars,
+        "prefetch_fetch_max_chars": args.prefetch_fetch_max_chars,
         "search_proxy_timeout": os.getenv("SEARCH_PROXY_TIMEOUT"),
+        "search_proxy_min_k": os.getenv("SEARCH_PROXY_MIN_K"),
+        "search_proxy_filter_garbage": os.getenv("SEARCH_PROXY_FILTER_GARBAGE"),
+        "search_proxy_filter_extra_k": os.getenv("SEARCH_PROXY_FILTER_EXTRA_K"),
         "memory_search_summary_timeout": os.getenv("SII_MEMORY_SEARCH_SUMMARY_TIMEOUT"),
         "output_format_reference": str(ROOT / "benchmarkreadme.md"),
         "submission_format": "group_{mode}.json trace, group_{mode}.csv answers, group_{mode}.zip bundle",
-        "overall_in_prompt": bool(overall),
-        "overall_preview": overall[:700],
+        "overall_in_prompt": False,
+        "overall_preview": "",
         "save_trace": args.save_trace,
         "image_handling": {
             "images_dir": str(images_dir),

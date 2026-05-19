@@ -76,6 +76,20 @@ TOOL_PROFILES = {
 }
 DEFAULT_TOOLS = BENCHMARK_TOOLS
 _BROWSER_EXTRACT_TOOLS = {"browser_open", "browser_open_many", "browser_text", "browser_click", "browser_type"}
+_RESEARCH_TOOLS = {
+    "web_search",
+    "wiki_search",
+    "wiki_page",
+    "browser_open",
+    "browser_open_many",
+    "browser_text",
+    "browser_click",
+    "browser_type",
+    "visual_web_search",
+    "image_to_text",
+    "image_to_search_queries",
+    "reverse_image_search",
+}
 
 
 SYSTEM_PROMPT = """You are a careful research agent.
@@ -92,6 +106,7 @@ Rules:
 {tool_rules}
 - Cross-check at least one source for non-trivial claims. If the user provides a `Provided context` section, treat that context as the primary source and do not search only to cross-check facts already present there.
 - DO NOT repeat the same query / URL — refine instead.
+- For distinctive phrases or unusual clue wording, run an early exact quoted-phrase search instead of only broad paraphrases.
 - Answer in the same language as the user question when possible; for Chinese questions, prefer the common Chinese name/phrase over an English alias.
 - Prefer 1-3 evidence tool calls. Training memory CRUD calls are allowed when the rules require them.
 - When you have a plausible answer and have completed required memory actions, call `final_answer` with a concise answer.
@@ -143,7 +158,7 @@ def _tool_rules(allowed_tools: tuple[str, ...]) -> str:
             "Skip CRUD when the retrieved memory is good and the current run teaches nothing reusable."
         )
     if "web_search" in tools:
-        rules.append("- Use `web_search` for live facts through the configured search-proxy; it returns top snippets, not full pages.")
+        rules.append("- Use `web_search` for live facts through the configured search-proxy or direct Serper fallback; it returns top snippets, not full pages.")
     if "wiki_search" in tools:
         rules.append("- Use `wiki_search` and `wiki_page` for offline encyclopedic facts when available.")
     if "browser_open" in tools:
@@ -253,6 +268,10 @@ def _with_browser_extract_query(name: str, args: dict[str, Any], question: str) 
     return updated
 
 
+def _tool_count(counts: dict[str, int], names: set[str]) -> int:
+    return sum(int(counts.get(name) or 0) for name in names)
+
+
 def _safe_json(s: str) -> dict | None:
     try:
         return json.loads(s)
@@ -350,6 +369,17 @@ def _parse_content_tool_calls(content: str) -> list[Any]:
     return calls
 
 
+def _split_inline_reasoning(content: str) -> tuple[str, str]:
+    text = content or ""
+    reasoning_parts = [
+        match.group(1).strip()
+        for match in re.finditer(r"<think\b[^>]*>(.*?)</think>", text, flags=re.I | re.S)
+        if match.group(1).strip()
+    ]
+    visible = re.sub(r"<think\b[^>]*>.*?</think>", "", text, flags=re.I | re.S).strip()
+    return visible, "\n\n".join(reasoning_parts)
+
+
 def _dump_tool_call(tc: Any) -> dict:
     if hasattr(tc, "model_dump"):
         return tc.model_dump()
@@ -397,11 +427,13 @@ def _apply_final_tool_call(res: HarnessResult, tc: Any) -> bool:
     args = _safe_json(tc.function.arguments or "{}")
     if args is None:
         return False
-    answer = str(args.get("answer", "")).strip()
+    answer, _ = _split_inline_reasoning(str(args.get("answer", "")))
+    answer = answer.strip()
     if not answer:
         return False
     res.final_answer = answer
-    res.rationale = args.get("rationale", "")
+    rationale, _ = _split_inline_reasoning(str(args.get("rationale", "")))
+    res.rationale = rationale
     res.stop_reason = "final"
     return True
 
@@ -459,6 +491,14 @@ def run_react(
         {"role": "user", "content": question},
     ]
     has_verified = not internal_verify_enabled
+    budget_messages_sent: set[str] = set()
+
+    def append_budget_message_once(key: str, content: str) -> None:
+        if key in budget_messages_sent:
+            return
+        budget_messages_sent.add(key)
+        messages.append({"role": "user", "content": content})
+        res.trajectory.append({"role": "system", "name": "budget_notice", "content": content})
 
     def record_verify_result(tool_result: str) -> dict | None:
         nonlocal has_verified
@@ -491,6 +531,38 @@ def run_react(
     for step in range(cfg.max_steps):
         active_tools = allowed_tools
         pending_train_actions = internal_verify_enabled and not has_verified
+        research_calls = _tool_count(res.tool_call_counts, _RESEARCH_TOOLS)
+        web_search_calls = int(res.tool_call_counts.get("web_search") or 0)
+        if not pending_train_actions:
+            if cfg.max_research_tool_calls > 0 and research_calls >= cfg.max_research_tool_calls:
+                active_tools = ("final_answer",)
+                append_budget_message_once(
+                    "research_cap",
+                    (
+                        f"You have used the evidence tool budget ({research_calls}/{cfg.max_research_tool_calls}). "
+                        "Stop searching and call `final_answer` now with the best concise answer supported by the "
+                        "evidence already gathered."
+                    ),
+                )
+            else:
+                if cfg.max_web_search_calls > 0 and web_search_calls >= cfg.max_web_search_calls:
+                    if "web_search" in active_tools:
+                        active_tools = tuple(name for name in active_tools if name != "web_search")
+                    append_budget_message_once(
+                        "web_search_cap",
+                        (
+                            f"You have already used {web_search_calls} web_search calls. Stop broad web searching; "
+                            "use a targeted page/wiki/image check only if essential, otherwise call `final_answer`."
+                        ),
+                    )
+                if cfg.synthesize_after_tool_calls > 0 and research_calls >= cfg.synthesize_after_tool_calls:
+                    append_budget_message_once(
+                        "synthesize_notice",
+                        (
+                            f"You have used {research_calls} evidence tool calls. Converge now: identify the strongest "
+                            "candidate, run at most one targeted verification if needed, then call `final_answer`."
+                        ),
+                    )
         if step == cfg.max_steps - 1 and not pending_train_actions:
             active_tools = ("final_answer",)
             messages.append(
@@ -538,23 +610,31 @@ def run_react(
         finish_reason = str(getattr(choice, "finish_reason", "") or "unknown")
         res.finish_reasons[finish_reason] = res.finish_reasons.get(finish_reason, 0) + 1
         msg = choice.message
-        parsed_content_tool_calls = [] if msg.tool_calls else _parse_content_tool_calls(msg.content or "")
+        visible_content, inline_reasoning = _split_inline_reasoning(msg.content or "")
+        parsed_content_tool_calls = [] if msg.tool_calls else _parse_content_tool_calls(visible_content)
         effective_tool_calls = list(msg.tool_calls or []) or parsed_content_tool_calls
         dumped_tool_calls = [_dump_tool_call(tc) for tc in effective_tool_calls]
-        assistant_content = "" if parsed_content_tool_calls else (msg.content or "")
-        reasoning_content = _message_reasoning(msg)
+        tool_calls_to_run = effective_tool_calls
+        skipped_parallel_tool_calls: list[Any] = []
+        if cfg.max_parallel_tool_calls > 0 and len(effective_tool_calls) > cfg.max_parallel_tool_calls:
+            tool_calls_to_run = effective_tool_calls[: cfg.max_parallel_tool_calls]
+            skipped_parallel_tool_calls = effective_tool_calls[cfg.max_parallel_tool_calls :]
+        assistant_content = "" if parsed_content_tool_calls else visible_content
+        reasoning_content = "\n\n".join(
+            part for part in (_message_reasoning(msg).strip(), inline_reasoning) if part
+        )
         assistant_message = {"role": "assistant", "content": assistant_content}
         if effective_tool_calls:
             assistant_message["tool_calls"] = dumped_tool_calls
         messages.append(assistant_message)
         res.steps = step + 1
-        assistant_event = {"role": "assistant", "content": msg.content or "", "tool_calls": dumped_tool_calls}
+        assistant_event = {"role": "assistant", "content": visible_content, "tool_calls": dumped_tool_calls}
         if reasoning_content:
             assistant_event["reasoning_content"] = reasoning_content
         res.trajectory.append(assistant_event)
 
         if not effective_tool_calls:
-            content = (msg.content or "").strip()
+            content = visible_content.strip()
             if active_tools == ("final_answer",) and content:
                 if internal_verify_enabled and not has_verified:
                     verify_result, parsed_verify = internal_verify(content, "text finalization on forced final step")
@@ -589,7 +669,7 @@ def run_react(
             continue
         guard.reset_no_tool()
 
-        for tc in effective_tool_calls:
+        for tc in tool_calls_to_run:
             name = tc.function.name
             args = _safe_json(tc.function.arguments or "{}")
             res.tool_calls += 1
@@ -710,6 +790,22 @@ def run_react(
             )
             res.trajectory.append({"role": "tool", "name": name, "args": args, "content": tool_result})
 
+        for tc in skipped_parallel_tool_calls:
+            name = tc.function.name
+            tool_result = (
+                "NOTICE: extra parallel tool call skipped. This agent executes only one tool call per turn; "
+                "read the executed tool result, then call one next tool or `final_answer`."
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": tool_result,
+                }
+            )
+            skipped_args = _safe_json(tc.function.arguments or "{}") or {}
+            res.trajectory.append({"role": "tool", "name": name, "args": skipped_args, "content": tool_result})
+
         if guard.time_left() <= 0:
             res.stop_reason = "timeout"
             break
@@ -740,26 +836,33 @@ def run_react(
                 res.finish_reasons.get(f"forced_{finish_reason}", 0) + 1
             )
             msg = choice.message
-            parsed_content_tool_calls = [] if msg.tool_calls else _parse_content_tool_calls(msg.content or "")
+            visible_content, inline_reasoning = _split_inline_reasoning(msg.content or "")
+            parsed_content_tool_calls = [] if msg.tool_calls else _parse_content_tool_calls(visible_content)
             effective_tool_calls = list(msg.tool_calls or []) or parsed_content_tool_calls
             dumped_tool_calls = [_dump_tool_call(tc) for tc in effective_tool_calls]
-            res.trajectory.append(
-                {"role": "assistant", "content": msg.content or "", "tool_calls": dumped_tool_calls}
+            reasoning_content = "\n\n".join(
+                part for part in (_message_reasoning(msg).strip(), inline_reasoning) if part
             )
+            assistant_event = {"role": "assistant", "content": visible_content, "tool_calls": dumped_tool_calls}
+            if reasoning_content:
+                assistant_event["reasoning_content"] = reasoning_content
+            res.trajectory.append(assistant_event)
             for tc in effective_tool_calls:
                 if tc.function.name != "final_answer":
                     continue
                 args = _safe_json(tc.function.arguments or "{}")
                 if args is None:
                     continue
-                answer = str(args.get("answer", "")).strip()
+                answer, _ = _split_inline_reasoning(str(args.get("answer", "")))
+                answer = answer.strip()
                 if internal_verify_enabled and not has_verified and answer:
                     verify_result, parsed_verify = internal_verify(answer, str(args.get("rationale") or ""))
                     if not (isinstance(parsed_verify, dict) and parsed_verify.get("correct") is True):
                         # No interaction budget remains here. Keep the rejected final answer for scoring;
                         # runner-level gold reflection will force lesson/skill persistence.
                         res.final_answer = answer
-                        res.rationale = str(args.get("rationale") or "")
+                        rationale, _ = _split_inline_reasoning(str(args.get("rationale") or ""))
+                        res.rationale = rationale
                         res.stop_reason = "final"
                         res.tool_calls += 1
                         res.tool_call_counts["final_answer"] = res.tool_call_counts.get("final_answer", 0) + 1
@@ -768,7 +871,7 @@ def run_react(
                     res.tool_calls += 1
                     res.tool_call_counts["final_answer"] = res.tool_call_counts.get("final_answer", 0) + 1
                     break
-            content = (msg.content or "").strip()
+            content = visible_content.strip()
             if content and not res.final_answer:
                 if internal_verify_enabled and not has_verified:
                     verify_result, parsed_verify = internal_verify(content, "forced finalization after tool budget")

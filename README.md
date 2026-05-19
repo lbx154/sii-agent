@@ -158,7 +158,7 @@ python -m scripts.build_wiki_fts \
 export WIKI25_INDEX_PATH=data/wiki25/wiki25_fts.sqlite
 ```
 
-`web_search` 只调用课题提供的 search-proxy；离线 Wiki 仍通过单独的 `wiki_search` / `wiki_page` 工具使用。代理端负责 Serper + Jina，API key 留在代理端：
+`web_search` 优先调用课题提供的 search-proxy；离线 Wiki 仍通过单独的 `wiki_search` / `wiki_page` 工具使用。代理端负责 Serper + Jina，API key 留在代理端：
 
 ```bash
 export SEARCH_PROXY_URL=http://127.0.0.1:1227
@@ -167,7 +167,17 @@ export SEARCH_PROXY_MAX_CHARS=0
 export SEARCH_PROXY_IMAGE_UPLOAD_BACKENDS=tmpfiles,catbox,proxy
 ```
 
-`reverse_image_search` 也会调用 search-proxy 的 image/lens 搜索。
+如果没有 `SEARCH_PROXY_URL`，`web_search` 会直接调用 Serper Search，`reverse_image_search` 会直接调用 Serper Lens；此时需要在本机配置 key：
+
+```bash
+export SERPER_API_KEY=...
+export SERPER_FETCH=0
+export SERPER_MAX_CHARS=0
+# 可选：fetch 正文时用于 Jina Reader
+export JINA_API_KEY=...
+```
+
+`reverse_image_search` 会优先调用 search-proxy 的 image/lens 搜索；无 proxy 时使用 Serper Lens，并保留本地图片上传与文本 fallback。
 
 ### BrowseComp-Plus
 

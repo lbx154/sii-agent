@@ -173,6 +173,10 @@ def _safe_error(exc: Exception, limit: int = 1200) -> str:
     return _truncate(text, limit)
 
 
+def _strip_inline_reasoning(content: str) -> str:
+    return re.sub(r"<think\b[^>]*>.*?</think>", "", content or "", flags=re.I | re.S).strip()
+
+
 def _load_image(source: str) -> tuple[str, bytes]:
     if _is_http_url(source):
         current_url = source
@@ -243,7 +247,7 @@ def _call_vision(model: str, image_data_url: str, prompt: str, max_tokens: int) 
     message = response.choices[0].message
     content = getattr(message, "content", None)
     if content:
-        return str(content).strip()
+        return _strip_inline_reasoning(str(content))
     for attr in ("reasoning", "reasoning_content"):
         value = getattr(message, attr, None)
         if value:

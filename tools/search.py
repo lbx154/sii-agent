@@ -1,4 +1,4 @@
-"""Search tools backed by the configured harness search-proxy."""
+"""Search tools backed by search-proxy or direct Serper/Serper Lens."""
 from __future__ import annotations
 import base64
 import json
@@ -24,7 +24,7 @@ def _clamp_int(value: int, default: int, minimum: int, maximum: int) -> int:
 
 
 def _configured_backends() -> list[str]:
-    return ["proxy"]
+    return ["proxy"] if _search_proxy_url() else ["serper"]
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -43,6 +43,18 @@ def _search_proxy_timeout() -> float:
         return float(os.getenv("SEARCH_PROXY_TIMEOUT", "120"))
     except ValueError:
         return 120.0
+
+
+def _search_proxy_min_k() -> int:
+    return _clamp_int(os.getenv("SEARCH_PROXY_MIN_K", "0"), 0, 0, 10)
+
+
+def _search_proxy_filter_garbage() -> bool:
+    return _env_bool("SEARCH_PROXY_FILTER_GARBAGE", True)
+
+
+def _search_proxy_filter_extra_k() -> int:
+    return _clamp_int(os.getenv("SEARCH_PROXY_FILTER_EXTRA_K", "5"), 5, 0, 10)
 
 
 def _search_proxy_upload_timeout() -> float:
@@ -80,9 +92,48 @@ def _search_proxy_verify_ssl() -> bool:
     return _env_bool("SEARCH_PROXY_VERIFY_SSL", True)
 
 
+def _serper_api_key() -> str:
+    key = os.getenv("SERPER_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("SERPER_API_KEY is not set and SEARCH_PROXY_URL is not configured")
+    return key
+
+
+def _jina_api_key() -> str:
+    return os.getenv("JINA_API_KEY", "").strip()
+
+
+def _serper_timeout() -> float:
+    try:
+        return float(os.getenv("SERPER_TIMEOUT", os.getenv("SEARCH_PROXY_TIMEOUT", "30")))
+    except ValueError:
+        return 30.0
+
+
+def _jina_timeout() -> float:
+    try:
+        return float(os.getenv("JINA_TIMEOUT", "45"))
+    except ValueError:
+        return 45.0
+
+
+def _direct_fetch_enabled() -> bool:
+    return _env_bool("SERPER_FETCH", _env_bool("SEARCH_PROXY_FETCH", False))
+
+
+def _direct_max_chars() -> int:
+    return _clamp_int(
+        os.getenv("SERPER_MAX_CHARS", os.getenv("SEARCH_PROXY_MAX_CHARS", "0")),
+        0,
+        0,
+        10000,
+    )
+
+
 @register(
     "web_search",
-    "Search the web via the configured search-proxy and return top results (title, url, snippet/content). "
+    "Search the web via the configured search-proxy, or direct Serper when no proxy is configured, "
+    "and return top results (title, url, snippet/content). "
     "Use for any factual / up-to-date question.",
     {
         "type": "object",
@@ -95,15 +146,24 @@ def _search_proxy_verify_ssl() -> bool:
 )
 def web_search(query: str, k: int = 3) -> str:
     k = _clamp_int(k, 3, 1, 10)
-    result = _guarded_search("search-proxy", lambda: _proxy_text_search(query, k))
+    min_k = _search_proxy_min_k()
+    if min_k:
+        k = max(k, min_k)
+    if _search_proxy_url():
+        label = "proxy"
+        result = _guarded_search("search-proxy", lambda: _proxy_text_search(query, k))
+    else:
+        label = "serper"
+        result = _guarded_search("serper", lambda: _serper_text_search(query, k))
     if result == "(no results)":
         return result
-    return f"## proxy\n{result}"
+    return f"## {label}\n{result}"
 
 
 @register(
     "reverse_image_search",
-    "Use the configured search-proxy image/lens search to find web pages related to an image URL or local image path. "
+    "Use the configured search-proxy image/lens search, or direct Serper Lens when no proxy is configured, "
+    "to find web pages related to an image URL or local image path. "
     "Use when the image itself must be matched to pages/entities. Pass the user question as query so the tool can fall back to text search if image upload/lens is unavailable.",
     {
         "type": "object",
@@ -135,6 +195,18 @@ def reverse_image_search(
 ) -> str:
     k = _clamp_int(k, 3, 1, 10)
     max_chars = _clamp_int(max_chars, 0, 0, 10000)
+    if not _search_proxy_url():
+        return _guarded_search(
+            "serper lens",
+            lambda: _serper_image_search(
+                source,
+                query=query,
+                k=k,
+                fetch=bool(fetch),
+                max_chars=max_chars,
+                fallback_to_text=bool(fallback_to_text),
+            ),
+        )
     return _guarded_search(
         "search-proxy image",
         lambda: _proxy_image_search(
@@ -173,6 +245,46 @@ def _proxy_post(path: str, payload: dict) -> dict:
     if not isinstance(data, dict):
         raise RuntimeError(f"search-proxy returned non-object JSON: {data!r}")
     return data
+
+
+def _serper_post(url: str, payload: dict) -> dict:
+    import httpx
+
+    response = httpx.post(
+        url,
+        json=payload,
+        headers={
+            "X-API-KEY": _serper_api_key(),
+            "Content-Type": "application/json",
+        },
+        timeout=_serper_timeout(),
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Serper returned non-object JSON: {data!r}")
+    return data
+
+
+def _jina_fetch(url: str, max_chars: int) -> str:
+    if not url or max_chars <= 0:
+        return ""
+    import httpx
+
+    headers = {"Accept": "text/plain"}
+    jina_key = _jina_api_key()
+    if jina_key:
+        headers["Authorization"] = f"Bearer {jina_key}"
+    response = httpx.get(
+        "https://r.jina.ai/" + url,
+        headers=headers,
+        timeout=_jina_timeout(),
+    )
+    response.raise_for_status()
+    text = response.text or ""
+    if len(text) > max_chars:
+        return text[:max_chars] + f"\n\n...[truncated at {max_chars} chars]"
+    return text
 
 
 def _proxy_upload_image_bytes(data: bytes, filename: str, mime: str) -> str:
@@ -305,11 +417,56 @@ def _proxy_image_url(source: str) -> str:
     return _public_upload_image_bytes(path.read_bytes(), path.name, mime or "application/octet-stream")
 
 
-def _format_proxy_results(payload: dict, query: str | None = None) -> str:
-    if not payload.get("ok", False):
-        return f"ERROR: search-proxy failed: {payload.get('error', 'unknown error')}"
+_LOW_SIGNAL_SEARCH_DOMAINS = {
+    "facebook.com",
+    "instagram.com",
+    "linkedin.com",
+    "pinterest.com",
+    "quora.com",
+    "reddit.com",
+    "tiktok.com",
+    "threads.net",
+    "twitter.com",
+    "x.com",
+    "youtube.com",
+    "youtu.be",
+}
+
+
+def _normalized_host(url: str) -> str:
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    host = parsed.netloc.lower().split("@")[-1].split(":")[0]
+    return host[4:] if host.startswith("www.") else host
+
+
+def _explicit_site_requested(query: str | None, host: str) -> bool:
+    if not query:
+        return False
+    lower = query.lower()
+    parts = host.split(".")
+    base = ".".join(parts[-2:]) if len(parts) >= 2 else host
+    return f"site:{host}" in lower or f"site:{base}" in lower
+
+
+def _is_low_signal_search_result(item: dict, query: str | None) -> bool:
+    url = str(item.get("url") or "")
+    if not url:
+        return False
+    host = _normalized_host(url)
+    if _explicit_site_requested(query, host):
+        return False
+    return any(host == domain or host.endswith(f".{domain}") for domain in _LOW_SIGNAL_SEARCH_DOMAINS)
+
+
+def _format_search_rows(results: list, query: str | None = None, limit: int | None = None) -> str:
     rows: list[str] = []
-    for i, item in enumerate(payload.get("results", []) or [], 1):
+    skipped = 0
+    for i, item in enumerate(results or [], 1):
+        if not isinstance(item, dict):
+            continue
+        if _search_proxy_filter_garbage() and _is_low_signal_search_result(item, query):
+            skipped += 1
+            continue
         title = str(item.get("title") or "")
         url = str(item.get("url") or "")
         snippet = str(item.get("snippet") or "")
@@ -318,16 +475,53 @@ def _format_proxy_results(payload: dict, query: str | None = None) -> str:
         if content:
             body = (body + "\n" if body else "") + content[:3000]
         rows.append(f"[{item.get('rank') or i}] {title}\n    {url}\n    {body}")
+        if limit and len(rows) >= limit:
+            break
     if rows:
         return "\n".join(rows)
+    if skipped:
+        return f"(no usable results for {query!r}; filtered {skipped} low-signal social/SEO results)"
     return "(no results)" if query is None else f"(no results for {query!r})"
+
+
+def _format_proxy_results(payload: dict, query: str | None = None, limit: int | None = None) -> str:
+    if not payload.get("ok", False):
+        return f"ERROR: search-proxy failed: {payload.get('error', 'unknown error')}"
+    return _format_search_rows(payload.get("results", []) or [], query=query, limit=limit)
 
 
 def _proxy_text_search(query: str, k: int) -> str:
     fetch = _env_bool("SEARCH_PROXY_FETCH", False)
     max_chars = _clamp_int(os.getenv("SEARCH_PROXY_MAX_CHARS", "0"), 0, 0, 10000)
-    payload = {"query": query, "top_k": k, "fetch": fetch, "max_chars": max_chars}
-    return _format_proxy_results(_proxy_post("/search/text", payload), query=query)
+    top_k = k
+    if _search_proxy_filter_garbage():
+        top_k = min(10, max(k, k + _search_proxy_filter_extra_k()))
+    payload = {"query": query, "top_k": top_k, "fetch": fetch, "max_chars": max_chars}
+    return _format_proxy_results(_proxy_post("/search/text", payload), query=query, limit=k)
+
+
+def _serper_text_search(query: str, k: int) -> str:
+    top_k = k
+    if _search_proxy_filter_garbage():
+        top_k = min(10, max(k, k + _search_proxy_filter_extra_k()))
+    data = _serper_post("https://google.serper.dev/search", {"q": query, "num": top_k})
+    fetch = _direct_fetch_enabled()
+    max_chars = _direct_max_chars()
+    results: list[dict] = []
+    for rank, item in enumerate((data.get("organic", []) or [])[:top_k], 1):
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("link") or "")
+        entry = {
+            "rank": rank,
+            "title": str(item.get("title") or ""),
+            "url": url,
+            "snippet": str(item.get("snippet") or ""),
+        }
+        if fetch and url and max_chars > 0:
+            entry["content"] = _jina_fetch(url, max_chars)
+        results.append(entry)
+    return _format_search_rows(results, query=query, limit=k)
 
 
 def _proxy_image_search(
@@ -389,6 +583,83 @@ def _proxy_image_search(
             "error": image_error,
             "results": [],
             "usage_note": "Image lens/upload failed and no fallback query was provided.",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def _serper_image_search(
+    source: str,
+    query: str,
+    k: int,
+    fetch: bool,
+    max_chars: int,
+    fallback_to_text: bool,
+) -> str:
+    image_url = ""
+    try:
+        image_url = _proxy_image_url(source)
+        result = _serper_post("https://google.serper.dev/lens", {"url": image_url})
+        items = result.get("organic") or result.get("visual_matches") or result.get("images") or []
+        rows: list[dict] = []
+        for rank, item in enumerate(items[:k], 1):
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("link") or item.get("url") or "")
+            entry = {
+                "rank": rank,
+                "title": str(item.get("title") or ""),
+                "url": url,
+                "snippet": str(item.get("snippet") or item.get("source") or ""),
+            }
+            if fetch and url and max_chars > 0:
+                entry["content"] = _jina_fetch(url, max_chars)
+            rows.append(entry)
+        return json.dumps(
+            {
+                "mode": "serper_lens",
+                "source": source,
+                "uploaded_or_resolved_image_url": image_url,
+                "ok": True,
+                "error": None,
+                "results": rows,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as exc:  # noqa: BLE001
+        image_error = f"{type(exc).__name__}: {exc}"
+
+    fallback_query = " ".join(str(query or "").split())
+    if fallback_to_text and fallback_query:
+        fallback_results = _serper_text_search(fallback_query, k)
+        return json.dumps(
+            {
+                "mode": "text_fallback",
+                "source": source,
+                "uploaded_or_resolved_image_url": image_url,
+                "ok": False,
+                "image_error": image_error,
+                "fallback_query": fallback_query,
+                "fallback_results": fallback_results,
+                "usage_note": (
+                    "Serper Lens/upload failed, so this returned text-search fallback results. "
+                    "Use browser_open on promising URLs or refine the query if needed."
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    return json.dumps(
+        {
+            "mode": "serper_lens",
+            "source": source,
+            "uploaded_or_resolved_image_url": image_url,
+            "ok": False,
+            "error": image_error,
+            "results": [],
+            "usage_note": "Serper Lens/upload failed and no fallback query was provided.",
         },
         ensure_ascii=False,
         indent=2,
