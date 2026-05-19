@@ -24,6 +24,7 @@ from tools.retrieval_log import get_retrieved_docids, reset_retrieved_docids
 
 
 console = Console()
+DEFAULT_GLOBAL_MEMORY_ROOT = "logs/memory"
 
 DEFAULT_CANARY = (
     "BENCHMARK DATA SHOULD NEVER APPEAR AS PLAIN TEXT ONLINE. "
@@ -39,6 +40,11 @@ Rules:
 - When confident, call `final_answer` with a concise answer and include citations in the answer text.
 - If evidence is incomplete, give the best supported answer and cite the documents used.
 """
+
+
+def _normalize_runtime_mode(runtime_mode: str | None) -> str:
+    mode = str(runtime_mode or "train").strip().lower()
+    return mode if mode in {"train", "test"} else "train"
 
 
 def _derive_key(password: str, length: int) -> bytes:
@@ -105,9 +111,10 @@ def _prepare_memory(
 ) -> MemoryStore | None:
     if mode != "evolved":
         return None
-    root = Path(memory_root) if memory_root else out / "memory"
+    root = Path(memory_root or os.getenv("SII_AGENT_MEMORY_ROOT", DEFAULT_GLOBAL_MEMORY_ROOT))
     if memory_mode == "fresh" and root.exists():
         shutil.rmtree(root)
+    os.environ["SII_AGENT_MEMORY_ROOT"] = str(root)
     return MemoryStore(root=root, read_only=(memory_mode == "read_only"))
 
 
@@ -271,8 +278,13 @@ def run(
     save_traces: bool = False,
     short_memory: bool = False,
     short_memory_max_chars: int = 2500,
+    runtime_mode: str = "train",
 ) -> dict:
     assert mode in {"baseline", "evolved"}
+    runtime_mode = _normalize_runtime_mode(runtime_mode)
+    os.environ["SII_AGENT_RUNTIME_MODE"] = runtime_mode
+    requested_memory_mode = memory_mode
+    effective_memory_mode = "read_only" if runtime_mode == "test" else memory_mode
     cfg = HarnessConfig(
         max_steps=max_steps,
         max_wall_seconds=max_wall_seconds,
@@ -295,7 +307,7 @@ def run(
         ex for ex in all_examples
         if _safe_qid(ex["query_id"]) not in completed_ids
     ]
-    memory = _prepare_memory(mode, out, memory_root, memory_mode)
+    memory = _prepare_memory(mode, out, memory_root, effective_memory_mode)
 
     t0 = time.time()
     locals_path = (out / "local_runs.jsonl").open("a" if resume_dir else "w", encoding="utf-8")
@@ -372,7 +384,9 @@ def run(
         "concurrency": concurrency,
         "evolve_batch_size": evolve_batch_size if mode == "evolved" else None,
         "memory_root": str(memory.root) if memory else None,
-        "memory_mode": memory_mode if mode == "evolved" else None,
+        "runtime_mode": runtime_mode,
+        "memory_mode": effective_memory_mode if mode == "evolved" else None,
+        "requested_memory_mode": requested_memory_mode if mode == "evolved" else None,
         "memory_k": memory_k if mode == "evolved" else None,
         "save_traces": save_traces,
         "short_memory": short_memory,
@@ -389,6 +403,12 @@ def run(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["baseline", "evolved"], required=True)
+    parser.add_argument(
+        "--runtime-mode",
+        choices=["train", "test"],
+        default="test" if os.getenv("SII_AGENT_RUNTIME_MODE", "").strip().lower() == "test" else "train",
+        help="train writes global memory/reflections; test freezes memory read-only.",
+    )
     parser.add_argument("--n", type=int, default=20, help="Number of queries; 0 means all")
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--source", default=None, help="Optional decrypted BrowseComp JSONL")
@@ -404,7 +424,7 @@ def main() -> None:
     parser.add_argument(
         "--memory-mode",
         choices=["fresh", "read_write", "read_only"],
-        default="fresh",
+        default="read_write",
     )
     parser.add_argument("--no-reflection", action="store_true")
     parser.add_argument("--out", default="logs/browsecomp")
@@ -440,6 +460,7 @@ def main() -> None:
         args.save_traces,
         args.short_memory,
         args.short_memory_max_chars,
+        args.runtime_mode,
     )
 
 

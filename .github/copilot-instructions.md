@@ -79,9 +79,9 @@ evaluation/run_eval.py
 - `agent/react.py` is the ReAct loop. It builds the system prompt, chooses the active tool profile, calls the LLM with OpenAI-style tool specs, parses both native OpenAI `tool_calls` and Qwen textual `<tool_call><function=...>` output, dispatches tools, and forces `final_answer` near the step limit.
 - `agent/runner.py` wraps ReAct into `run_baseline` and `run_evolved`. It owns 2Wiki answer postprocessing, reflection gating, retry selection, and `RunOutcome` attribution fields (`first_result`, `retry_result`, `selected_attempt`, etc.).
 - `agent/llm.py` is the backend switch. `LLM_BACKEND=azure` uses Azure OpenAI/AAD; `LLM_BACKEND=vllm` is also used for SGLang because both expose OpenAI-compatible `/v1`.
-- `tools/registry.py` registers tools by import side effect. The default benchmark profile is `web_search,wiki_search,browse,browse_many,final_answer`; visual/rich/all profiles expose additional image/browser tools.
+- `tools/registry.py` registers tools by import side effect. The default benchmark profile is `web_search,wiki_search,wiki_page,browser_open,browser_open_many,final_answer`; visual/rich/all profiles expose additional image/browser tools.
 - `tools/wiki.py` is offline wiki25 search/page lookup. Prefer the SQLite FTS index at `data/wiki25/wiki25_fts.sqlite`; the JSONL BM25 path is fallback.
-- `tools/search.py` multiplexes `SEARCH_BACKENDS` such as `ddg,wiki` and parallelizes configured backends.
+- `tools/search.py` sends `web_search` and `reverse_image_search` through the harness search-proxy; offline Wiki remains in `tools/wiki.py`.
 - `evaluation/datasets.py` normalizes task loaders. 2Wiki examples embed a relevance-ranked `Provided context` and strict answer-format rules; SimpleVQA materializes images under `logs/simplevqa_images`.
 - `memory/store.py` persists evolved runs as JSONL under the run memory root. For 2Wiki, seeded lessons/skills/policies exist but lesson injection, typed policies, and skills are opt-in.
 - `training/opd.py` exports offline preference data and LlamaFactory DPO configs; `training/slime_sii_rollout.py` integrates on-policy tool-use rollouts with slime.

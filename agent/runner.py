@@ -15,6 +15,7 @@ from .llm import chat
 from .react import run_react
 from .reflection import reflect
 from .scoring import judge_answer
+from tools.verify import verify_answer
 from harness.controller import HarnessConfig, HarnessResult
 from memory.store import MemoryStore, Episode, Lesson
 
@@ -29,12 +30,147 @@ class RunOutcome:
     selected_attempt: str = "first"
     retry_selected: bool = False
     retry_reason: str | None = None
-    reflection_useful: bool = False
+    reflection_useful: bool | None = None
     final_refinement: dict | None = None
+    gold_verification: dict | None = None
+    verified_reflection_memory: dict | None = None
 
 
 def _judge(predicted: str | None, expected: str | None) -> bool | None:
     return judge_answer(predicted, expected)
+
+
+def _runtime_mode() -> str:
+    mode = os.getenv("SII_AGENT_RUNTIME_MODE", "train").strip().lower()
+    return mode if mode in {"train", "test"} else "train"
+
+
+def _gold_verify_enabled(expected: str | None) -> bool:
+    if _runtime_mode() != "train" or expected is None:
+        return False
+    return os.getenv("SII_AGENT_ENABLE_GOLD_VERIFY", "1").strip().lower() not in {"0", "false", "no"}
+
+
+def _text_field(value: object, fallback: str) -> str:
+    text = str(value or "").strip()
+    return text if text else fallback
+
+
+def _generalize_memory_text(value: object) -> str:
+    text = " ".join(str(value or "").split())
+    replacements = {
+        "2WikiMultihopQA": "factual QA",
+        "2wiki": "factual QA",
+        "gold standard": "requested answer format",
+        "gold answer": "requested answer",
+        "gold label": "requested answer format",
+        "gold token": "requested answer token",
+        "gold string": "requested answer string",
+        "gold": "requested target",
+        "benchmark": "task",
+        "dataset": "task set",
+    }
+    for old, new in replacements.items():
+        text = re.sub(re.escape(old), new, text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*\((?:e\.g\.|for example)[^)]*\)", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def _generalize_list(value: object, limit: int = 8) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for item in value:
+        text = _generalize_memory_text(item)
+        if text:
+            items.append(text)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _generalize_reflection(reflection: dict | None) -> dict | None:
+    if not isinstance(reflection, dict):
+        return None
+    cleaned: dict = {}
+    for key, value in reflection.items():
+        if key == "skill_update" and isinstance(value, dict):
+            update = {}
+            for subkey, subvalue in value.items():
+                if subkey == "tags":
+                    tags = [
+                        tag
+                        for tag in _generalize_list(subvalue, limit=6)
+                        if tag.lower() not in {"2wiki", "benchmark", "dataset"}
+                    ]
+                    update[subkey] = tags
+                else:
+                    update[subkey] = _generalize_memory_text(subvalue)
+            cleaned[key] = update
+        elif isinstance(value, str):
+            cleaned[key] = _generalize_memory_text(value)
+        elif isinstance(value, list):
+            cleaned[key] = _generalize_list(value)
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
+def _memory_question(question: str) -> str:
+    text = str(question or "")
+    match = re.search(r"(?:^|\n)\s*Question:\s*(.*?)(?:\n\s*\n|$)", text, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return "Question pattern: " + _generalize_memory_text(match.group(1))[:500]
+    return "Question pattern: " + _generalize_memory_text(text)[:500]
+
+
+def _persist_forced_reflection_memory(
+    memory: MemoryStore,
+    task: str | None,
+    question: str,
+    reflection: dict | None,
+) -> dict:
+    if not isinstance(reflection, dict):
+        return {"lesson_added": False, "skill_added": False, "error": "reflection_not_json"}
+    if memory.read_only:
+        return {"lesson_added": False, "skill_added": False, "error": "memory_read_only"}
+    reflection = _generalize_reflection(reflection)
+    if reflection is None:
+        return {"lesson_added": False, "skill_added": False, "error": "reflection_not_json"}
+    lesson = Lesson(
+        ts=memory.now(),
+        question=_memory_question(question),
+        failure_mode=_text_field(reflection.get("failure_mode"), "verified_recovery_failure"),
+        root_cause=_text_field(reflection.get("root_cause"), "The first candidate answer failed training verification."),
+        corrective_strategy=_text_field(
+            reflection.get("corrective_strategy"),
+            "Before finalizing, verify the candidate answer against the strongest evidence and correct the reasoning path.",
+        ),
+        reusable_lesson=_text_field(
+            reflection.get("reusable_lesson"),
+            "Store only recovery patterns that turned a rejected answer into a verified correct answer.",
+        ),
+        outcome="verified_recovery",
+        score=0.7,
+    )
+    memory.add_lesson(lesson)
+    skill = memory.add_reflection_skill("general", _memory_question(question), reflection, force=True)
+    return {
+        "lesson_added": True,
+        "skill_added": skill is not None,
+        "skill_id": skill.id if skill is not None else None,
+    }
+
+
+def _internal_verify_recovered(result: HarnessResult) -> bool:
+    seen_failure = False
+    for row in result.internal_verify_results:
+        correct = row.get("correct")
+        if correct is False:
+            seen_failure = True
+        elif correct is True and seen_failure:
+            return True
+    return False
 
 
 def _redact_expected(text: str, expected: str | None) -> str:
@@ -51,82 +187,6 @@ def _redact_expected_obj(value: object, expected: str | None) -> object:
     if value is None or isinstance(value, bool):
         return value
     return _redact_expected(str(value), expected)
-
-
-def _useful_reflection(reflection: dict | None, task: str | None = None) -> bool:
-    if not reflection:
-        return False
-    failure_mode = str(reflection.get("failure_mode", "") or "").strip().lower()
-    if failure_mode in {
-        "",
-        "none",
-        "n/a",
-        "na",
-        "null",
-        "parse_error",
-        "reflection_error",
-        "supported_answer",
-        "correct",
-        "already_correct",
-        "no_failure",
-    }:
-        return False
-    lesson = str(reflection.get("reusable_lesson", "")).strip()
-    strategy = str(reflection.get("corrective_strategy", "")).strip()
-    if strategy.lower() in {"none", "none needed", "n/a", "na", "no strategy needed", "no retry needed"}:
-        return False
-    if not lesson or not strategy:
-        return False
-    if len(lesson) < 20 or len(lesson) > 400:
-        return False
-
-    text = f"{lesson}\n{strategy}".lower()
-    bad_phrases = (
-        "withhold",
-        "withheld",
-        "do not guess",
-        "do not answer",
-        "do not memorize",
-        "privacy",
-        "private",
-        "sensitive",
-        "cannot answer",
-        "refuse",
-        "refusal",
-        "insufficient evidence",
-        "state uncertainty",
-        "acknowledge uncertainty",
-        "search limitations",
-        "tool may have limitations",
-        "tool limitations",
-        "known entity knowledge",
-        "not available",
-        "doesn't exist",
-        "does not exist",
-        "answer is correct",
-        "already correct",
-        "no retry",
-        "no corrective action",
-    )
-    if task == "2wiki":
-        bad_phrases += (
-            "city of residence",
-            "primary film activity hub",
-            "film hub",
-            "lives and works in",
-            "based in x",
-            "current web",
-            "current job",
-            "current employer",
-            "external search should override",
-            "external sources over context",
-            "search over context",
-            "api tool invocation",
-            "tool invocation parameters",
-            "tool-call-parser",
-            "parser flags",
-        )
-    return not any(phrase in text for phrase in bad_phrases)
 
 
 _LOW_CONFIDENCE_PATTERNS = (
@@ -407,16 +467,15 @@ def _needs_self_reflection(result: HarnessResult, cfg: HarnessConfig) -> bool:
 
 
 def _allow_task_reflection(task: str | None) -> bool:
+    generic = os.getenv("SII_AGENT_ENABLE_REFLECTION")
+    if generic is not None:
+        return generic.strip().lower() in {"1", "true", "yes"}
     if task != "2wiki":
         return True
     value = os.getenv("SII_2WIKI_ENABLE_REFLECTION")
     if value is None:
         return False
     return value.strip().lower() in {"1", "true", "yes"}
-
-
-def _use_skill_updates(task: str | None) -> bool:
-    return task == "2wiki" and os.getenv("SII_2WIKI_ENABLE_SKILLS", "").strip().lower() in {"1", "true", "yes"}
 
 
 def _reflection_requests_retry(
@@ -527,7 +586,7 @@ def _choose_without_gold(
 def run_baseline(question: str, expected: str | None = None,
                  cfg: HarnessConfig | None = None,
                  task: str | None = None) -> RunOutcome:
-    res = run_react(question, cfg=cfg)
+    res = run_react(question, cfg=cfg, expected=expected, task=task)
     if task == "2wiki" and _allow_2wiki_postprocess():
         res.final_answer = _postprocess_2wiki_answer(res.final_answer)
     return RunOutcome(result=res, correct=_judge(res.final_answer, expected), first_result=res)
@@ -540,11 +599,12 @@ def run_evolved(question: str, expected: str | None = None,
                 allow_reflection: bool = True,
                 lesson_context: str | None = None,
                 use_gold_for_reflection: bool = False,
+                force_reflection: bool = False,
                 task: str | None = None) -> RunOutcome:
     cfg = cfg or HarnessConfig()
     memory = memory or MemoryStore()
     extra = lesson_context if lesson_context is not None else memory.render_for_prompt(question, task=task)
-    res = run_react(question, cfg=cfg, extra_system=extra or None)
+    res = run_react(question, cfg=cfg, extra_system=extra or None, expected=expected, task=task)
     if task == "2wiki" and _allow_2wiki_postprocess():
         res.final_answer = _postprocess_2wiki_evolved_answer(res.final_answer, question)
     final_refinement = None
@@ -556,10 +616,10 @@ def run_evolved(question: str, expected: str | None = None,
     retry_selected = False
     retry_reason = None
     reflection = None
-    reflection_useful = False
+    reflection_useful = None
 
     should_reflect = allow_reflection and _allow_task_reflection(task) and (
-        _needs_self_reflection(res, cfg) or use_gold_for_reflection
+        _needs_self_reflection(res, cfg) or use_gold_for_reflection or force_reflection
     )
     if should_reflect:
         reflection = reflect(
@@ -570,20 +630,6 @@ def run_evolved(question: str, expected: str | None = None,
             include_expected=use_gold_for_reflection,
         )
         safe_reflection = _redact_expected_obj(reflection or {}, expected)
-        reflection_useful = _useful_reflection(reflection, task=task)
-        if reflection_useful:
-            if _use_skill_updates(task) and not use_gold_for_reflection:
-                memory.add_reflection_skill(task, question, safe_reflection if isinstance(safe_reflection, dict) else None)
-            else:
-                memory.add_lesson(Lesson(
-                    ts=memory.now(),
-                    question=question,
-                    failure_mode=str(safe_reflection.get("failure_mode", "")),
-                    root_cause=str(safe_reflection.get("root_cause", "")),
-                    corrective_strategy=str(safe_reflection.get("corrective_strategy", "")),
-                    reusable_lesson=str(safe_reflection.get("reusable_lesson", "")),
-                    outcome="failure",
-                ))
         if allow_retry and _reflection_requests_retry(reflection, res, task=task):
             retry_reason = str((reflection or {}).get("failure_mode") or "hard_failure")
             extra2 = lesson_context if lesson_context is not None else memory.render_for_prompt(question, task=task)
@@ -597,7 +643,7 @@ def run_evolved(question: str, expected: str | None = None,
                 "unless a specific missing clue requires one more. Prefer one concise exact answer. "
                 "Do not refuse or withhold merely because evidence is incomplete; provide the best-supported answer."
             )
-            retry_res = run_react(question, cfg=_retry_config(cfg), extra_system=retry_hint)
+            retry_res = run_react(question, cfg=_retry_config(cfg), extra_system=retry_hint, expected=expected, task=task)
             if task == "2wiki" and _allow_2wiki_postprocess():
                 retry_res.final_answer = _postprocess_2wiki_evolved_answer(retry_res.final_answer, question)
             retry_refinement = None
@@ -609,7 +655,30 @@ def run_evolved(question: str, expected: str | None = None,
             if retry_selected:
                 final_refinement = retry_refinement
 
-    correct = _judge(res.final_answer, expected)
+    gold_verification = verify_answer(res.final_answer, expected, question=question) if _gold_verify_enabled(expected) else None
+    if gold_verification is not None and isinstance(gold_verification.get("correct"), bool):
+        correct = bool(gold_verification["correct"])
+    else:
+        correct = _judge(res.final_answer, expected)
+    verified_reflection_memory = None
+    if (
+        allow_reflection
+        and gold_verification is not None
+        and gold_verification.get("correct") is True
+        and _internal_verify_recovered(res)
+    ):
+        reflection = reflect(
+            question,
+            expected,
+            res,
+            correct=True,
+            include_expected=True,
+            force_memory=True,
+        )
+        verified_reflection_memory = _persist_forced_reflection_memory(memory, task, question, reflection)
+        reflection_useful = bool(
+            verified_reflection_memory.get("lesson_added") or verified_reflection_memory.get("skill_added")
+        )
     memory.add_episode(Episode(
         ts=memory.now(), question=question, answer=res.final_answer,
         correct=correct, steps=res.steps, tool_calls=res.tool_calls,
@@ -626,4 +695,6 @@ def run_evolved(question: str, expected: str | None = None,
         retry_reason=retry_reason,
         reflection_useful=reflection_useful,
         final_refinement=final_refinement,
+        gold_verification=gold_verification,
+        verified_reflection_memory=verified_reflection_memory,
     )

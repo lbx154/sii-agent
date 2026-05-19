@@ -174,7 +174,7 @@ def extract_features(record: dict[str, Any]) -> np.ndarray:
         float(record.get("steps") or 0),
         float(record.get("tool_calls") or 0),
         float(_tool_count(record, "search")),
-        float(_tool_count(record, "browse")),
+        float(_tool_count(record, "browser_open") + _tool_count(record, "browser_open_many")),
         float(_tool_count(record, "wiki")),
         float(_tool_count(record, "final_answer")),
         float(len(counts)),
@@ -820,7 +820,7 @@ def _tool_specs_for_record(record: dict[str, Any]) -> str:
     if task == "browsecomp-plus":
         names = ("search", "final_answer")
     else:
-        names = ("web_search", "wiki_search", "browse", "final_answer")
+        names = ("web_search", "wiki_search", "browser_open", "final_answer")
     return json.dumps(tool_specs(names), ensure_ascii=False)
 
 

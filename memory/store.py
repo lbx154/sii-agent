@@ -1,9 +1,13 @@
 """Long-term memory: episodic log + distilled lessons, file-backed JSONL.
-Retrieval = simple keyword overlap (good enough for SimpleQA/2Wiki, swap for embeddings later).
+
+Lesson retrieval defaults to a local dense LSA embedding index plus small
+task-feature reranking, with BM25 retained as a deterministic fallback.
 """
 from __future__ import annotations
+from collections import Counter
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -328,8 +332,22 @@ _2WIKI_POLICY_CARDS: tuple[dict, ...] = (
 )
 
 
+_LESSON_BM25_K1 = 1.5
+_LESSON_BM25_B = 0.75
+_LESSON_FEATURE_BOOST = 3.0
+_LESSON_RECENCY_BOOST = 0.05
+_LESSON_EMBEDDING_FEATURE_BOOST = 0.08
+_LESSON_EMBEDDING_RECENCY_BOOST = 0.005
+_LESSON_EMBEDDING_DIMS = 128
+_LESSON_EMBEDDING_MAX_FEATURES = 8192
+
+
+def _token_list(s: object) -> list[str]:
+    return [t.lower() for t in _TOK.findall(str(s or "")) if len(t) > 1]
+
+
 def _tokens(s: str) -> set[str]:
-    return {t.lower() for t in _TOK.findall(s or "") if len(t) > 1}
+    return set(_token_list(s))
 
 
 def _clean_value(value: object) -> str:
@@ -428,6 +446,23 @@ def _skill_text(skill: dict) -> str:
     )
 
 
+def _lesson_text(lesson: dict) -> str:
+    question = _original_question(_clean_value(lesson.get("question")))
+    failure_mode = _clean_value(lesson.get("failure_mode"))
+    root_cause = _clean_value(lesson.get("root_cause"))
+    corrective_strategy = _clean_value(lesson.get("corrective_strategy"))
+    reusable_lesson = _clean_value(lesson.get("reusable_lesson"))
+    tags = " ".join(_clean_list(lesson.get("tags")))
+    weighted_parts = (
+        [question] * 4
+        + [reusable_lesson] * 4
+        + [corrective_strategy] * 2
+        + [failure_mode] * 2
+        + [root_cause, tags]
+    )
+    return " ".join(part for part in weighted_parts if part)
+
+
 def _phrase_hits(question: str, triggers: object) -> int:
     q = f" {question.lower()} "
     hits = 0
@@ -489,30 +524,96 @@ def _enabled_env(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes"}
 
 
+def _stable_memory_id(kind: str, item: dict) -> str:
+    explicit = str(item.get("id") or item.get("memory_id") or "").strip()
+    if explicit:
+        return explicit
+    payload = json.dumps(item, ensure_ascii=False, sort_keys=True)
+    return f"{kind}_{hashlib.sha1(payload.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _generic_skill_title(title: str) -> bool:
+    value = title.strip().lower()
+    if not value:
+        return True
+    generic = (
+        "reflection skill",
+        "reflection update",
+        "context first",
+        "answer span",
+        "family chain",
+        "skill update",
+    )
+    return any(value == item or value.startswith(f"{item} ") for item in generic)
+
+
+def _fallback_skill_title(trigger: str, step: str, failure_mode: str) -> str:
+    source = step or trigger or failure_mode or "Use focused verification"
+    source = source.strip()
+    source = re.sub(r"[.;:].*$", "", source).strip()
+    words = source.split()
+    if len(words) > 8:
+        source = " ".join(words[:8])
+    return source[:120] or "Use focused verification"
+
+
+def _generalize_memory_text(value: object) -> str:
+    text = " ".join(str(value or "").split())
+    replacements = {
+        "2WikiMultihopQA": "factual QA",
+        "2wiki": "factual QA",
+        "gold standard": "requested answer format",
+        "gold answer": "requested answer",
+        "gold label": "requested answer format",
+        "gold token": "requested answer token",
+        "gold string": "requested answer string",
+        "gold": "requested target",
+        "benchmark": "task",
+        "dataset": "task set",
+    }
+    for old, new in replacements.items():
+        text = re.sub(re.escape(old), new, text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*\((?:e\.g\.|for example)[^)]*\)", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
 class MemoryStore:
     def __init__(self, root: str | os.PathLike = "logs/memory", read_only: bool = False):
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
+        if not read_only:
+            self.root.mkdir(parents=True, exist_ok=True)
         self.episodes_path = self.root / "episodes.jsonl"
         self.lessons_path = self.root / "lessons.jsonl"
         self.skills_path = self.root / "skills.jsonl"
         self.read_only = read_only
         self._lock = RLock()
+        self._lesson_bm25_key: tuple[object, ...] | None = None
+        self._lesson_bm25_index: dict[str, object] | None = None
+        self._lesson_embedding_key: tuple[object, ...] | None = None
+        self._lesson_embedding_index: dict[str, object] | None = None
 
     # ---------------- writers ----------------
     def add_episode(self, ep: Episode) -> None:
         if self.read_only:
             return
+        row = asdict(ep)
+        row.setdefault("id", _stable_memory_id("episode", row))
         with self._lock:
             with self.episodes_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(asdict(ep), ensure_ascii=False) + "\n")
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def add_lesson(self, lesson: Lesson) -> None:
         if self.read_only:
             return
+        row = asdict(lesson)
+        row.setdefault("id", _stable_memory_id("lesson", row))
         with self._lock:
             with self.lessons_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(asdict(lesson), ensure_ascii=False) + "\n")
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            self._lesson_bm25_key = None
+            self._lesson_bm25_index = None
+            self._lesson_embedding_key = None
+            self._lesson_embedding_index = None
 
     def add_skill(self, skill: Skill) -> bool:
         if self.read_only:
@@ -525,36 +626,60 @@ class MemoryStore:
                 f.write(json.dumps(asdict(skill), ensure_ascii=False) + "\n")
             return True
 
-    def add_reflection_skill(self, task: str | None, question: str, reflection: dict | None) -> Skill | None:
-        if task != "2wiki" or not isinstance(reflection, dict):
+    def add_reflection_skill(self, task: str | None, question: str, reflection: dict | None, force: bool = False) -> Skill | None:
+        if not isinstance(reflection, dict):
             return None
         update = reflection.get("skill_update")
         if not isinstance(update, dict):
-            return None
-        target = _clean_value(update.get("target_skill_id"))
-        if target not in _2WIKI_SEED_SKILL_IDS:
-            return None
-        trigger = _clean_value(update.get("trigger"))
-        step = _clean_value(update.get("step"))
-        verifier = _clean_value(update.get("verifier"))
-        bad_pattern = _clean_value(update.get("bad_pattern"))
+            if not force:
+                return None
+            update = {}
+        title = _clean_value(update.get("title"))
+        title = _generalize_memory_text(title)
+        raw_tags = update.get("tags")
+        tags = [
+            _generalize_memory_text(tag)
+            for tag in _clean_list(raw_tags)[:6]
+            if _generalize_memory_text(tag).lower() not in {"2wiki", "benchmark", "dataset"}
+        ]
+        trigger = _generalize_memory_text(_clean_value(update.get("trigger")))
+        step = _generalize_memory_text(_clean_value(update.get("step")))
+        verifier = _generalize_memory_text(_clean_value(update.get("verifier")))
+        bad_pattern = _generalize_memory_text(_clean_value(update.get("bad_pattern")))
+        root_cause = _generalize_memory_text(_clean_value(reflection.get("root_cause")))
+        corrective_strategy = _generalize_memory_text(_clean_value(reflection.get("corrective_strategy")))
+        reusable_lesson = _generalize_memory_text(_clean_value(reflection.get("reusable_lesson")))
+        if force and not trigger:
+            trigger = "Tasks with the same reasoning or tool-use failure pattern"
+        if force and (not step or len(step) < 20):
+            step = (
+                corrective_strategy
+                or reusable_lesson
+                or root_cause
+                or "Verify the candidate answer against the strongest available evidence before finalizing."
+            )
         if not step or len(step) < 20:
             return None
         verbs = ("identify", "verify", "extract", "search", "answer", "compare", "use", "return", "check", "resolve", "keep", "query")
-        if not any(verb in step.lower() for verb in verbs):
+        if not force and not any(verb in step.lower() for verb in verbs):
             return None
-        if _has_bad_skill_phrase(trigger, step, verifier, bad_pattern):
+        if not force and _has_bad_skill_phrase(trigger, step, verifier, bad_pattern):
             return None
-        failure_mode = _clean_value(reflection.get("failure_mode")) or "reflection_update"
-        root_cause = _clean_value(reflection.get("root_cause"))
+        failure_mode = _generalize_memory_text(_clean_value(reflection.get("failure_mode"))) or "reflection_update"
+        if _generic_skill_title(title):
+            title = _fallback_skill_title(trigger, step, failure_mode)
+        task_name = _generalize_memory_text(_clean_value(task) or "general") or "general"
+        if task_name.lower() in {"2wiki", "benchmark", "dataset"}:
+            task_name = "general"
         features = sorted(_question_features(question) - {"2wiki"})
+        target = _clean_value(update.get("target_skill_id")) or title
         skill = Skill(
             ts=self.now(),
-            id=_stable_skill_id("2wiki", target, trigger, step),
-            task="2wiki",
-            title=f"Reflection update for {target}",
+            id=_stable_skill_id(task_name, target, trigger, step),
+            task=task_name,
+            title=title[:120],
             description=(root_cause[:240] if root_cause else f"Update derived from {failure_mode}."),
-            tags=["2wiki", target, failure_mode, *features[:4]],
+            tags=[task_name, failure_mode, *tags, *features[:4]],
             triggers=[trigger] if trigger else [],
             steps=[step],
             verifier=[verifier] if verifier else [],
@@ -627,45 +752,348 @@ class MemoryStore:
                 break
         return selected
 
-    def retrieve_lessons(self, question: str, k: int = 3, task: str | None = None) -> list[dict]:
-        qtok = _tokens(question)
-        qfeatures = _question_features(question)
-        scored = []
+    def _lesson_file_key(self) -> tuple[int, int]:
+        try:
+            stat = self.lessons_path.stat()
+        except FileNotFoundError:
+            return (0, 0)
+        return (stat.st_mtime_ns, stat.st_size)
+
+    def _lesson_candidates(self, task: str | None) -> list[dict]:
+        if task == "2wiki" and not _enabled_env("SII_2WIKI_ENABLE_LESSONS"):
+            return []
+        candidates: list[dict] = []
         if (
             task == "2wiki"
             and not _enabled_env("SII_2WIKI_ENABLE_SKILLS")
             and _enabled_env("SII_2WIKI_ENABLE_LESSONS")
         ):
-            for l in _2WIKI_SEED_LESSONS:
-                tags = set(l.get("tags") or [])
-                specific_overlap = len((qfeatures - {"2wiki"}) & (tags - {"2wiki"}))
-                failure_mode = str(l.get("failure_mode", ""))
-                if failure_mode == "two_hop_context_policy":
-                    scored.append((30 + specific_overlap, 1.0, l))
-                elif failure_mode == "format_violation":
-                    scored.append((18 + specific_overlap, 1.0, l))
-                elif specific_overlap:
-                    scored.append((24 + 5 * specific_overlap, 1.0, l))
-        for l in self.all_lessons():
-            if task == "2wiki" and not _enabled_env("SII_2WIKI_ENABLE_LESSONS"):
-                break
-            failure_mode = _clean_value(l.get("failure_mode")).lower()
+            candidates.extend(dict(lesson) for lesson in _2WIKI_SEED_LESSONS)
+        for lesson in self.all_lessons():
+            failure_mode = _clean_value(lesson.get("failure_mode")).lower()
             if task == "2wiki" and failure_mode in {"", "none", "n/a", "na", "supported_answer", "correct", "already_correct"}:
                 continue
-            ltok = (
-                _tokens(l.get("question", ""))
-                | _tokens(l.get("failure_mode", ""))
-                | _tokens(l.get("root_cause", ""))
-                | _tokens(l.get("corrective_strategy", ""))
-                | _tokens(l.get("reusable_lesson", ""))
-            )
-            overlap = len(qtok & ltok)
-            feature_overlap = len(qfeatures & _question_features(str(l.get("question", "")) + " " + str(l.get("reusable_lesson", ""))))
-            score = overlap + 4 * feature_overlap
-            if score >= 2:
-                scored.append((score, _recency(l.get("ts")), l))
+            candidates.append(lesson)
+        return candidates
+
+    def _lesson_bm25(self, task: str | None) -> dict[str, object]:
+        key = (
+            task or "",
+            _enabled_env("SII_2WIKI_ENABLE_LESSONS"),
+            _enabled_env("SII_2WIKI_ENABLE_SKILLS"),
+            self._lesson_file_key(),
+        )
+        with self._lock:
+            if self._lesson_bm25_key == key and self._lesson_bm25_index is not None:
+                return self._lesson_bm25_index
+
+            docs = []
+            df: Counter[str] = Counter()
+            for lesson in self._lesson_candidates(task):
+                tokens = _token_list(_lesson_text(lesson))
+                counts = Counter(tokens)
+                length = sum(counts.values())
+                if length == 0:
+                    continue
+                df.update(counts.keys())
+                tags = " ".join(_clean_list(lesson.get("tags")))
+                docs.append(
+                    {
+                        "lesson": lesson,
+                        "counts": counts,
+                        "length": length,
+                        "features": _question_features(
+                            f"{lesson.get('question', '')} {lesson.get('reusable_lesson', '')} {tags}"
+                        ),
+                        "recency": _recency(lesson.get("ts")),
+                    }
+                )
+
+            n_docs = len(docs)
+            avgdl = (sum(int(doc["length"]) for doc in docs) / n_docs) if n_docs else 0.0
+            idf = {
+                term: math.log(1.0 + (n_docs - freq + 0.5) / (freq + 0.5))
+                for term, freq in df.items()
+            }
+            self._lesson_bm25_key = key
+            self._lesson_bm25_index = {
+                "docs": docs,
+                "avgdl": avgdl,
+                "idf": idf,
+            }
+            return self._lesson_bm25_index
+
+    def _lesson_embedding(self, task: str | None) -> dict[str, object] | None:
+        key = (
+            task or "",
+            _enabled_env("SII_2WIKI_ENABLE_LESSONS"),
+            _enabled_env("SII_2WIKI_ENABLE_SKILLS"),
+            self._lesson_file_key(),
+            os.getenv("SII_MEMORY_EMBEDDING_DIMS", str(_LESSON_EMBEDDING_DIMS)),
+            os.getenv("SII_MEMORY_EMBEDDING_MAX_FEATURES", str(_LESSON_EMBEDDING_MAX_FEATURES)),
+        )
+        with self._lock:
+            if self._lesson_embedding_key == key:
+                return self._lesson_embedding_index
+
+            lessons = self._lesson_candidates(task)
+            texts = [_lesson_text(lesson) for lesson in lessons]
+            docs = [
+                {
+                    "lesson": lesson,
+                    "features": _question_features(
+                        f"{lesson.get('question', '')} {lesson.get('reusable_lesson', '')} "
+                        f"{' '.join(_clean_list(lesson.get('tags')))}"
+                    ),
+                    "recency": _recency(lesson.get("ts")),
+                }
+                for lesson, text in zip(lessons, texts)
+                if text.strip()
+            ]
+            texts = [text for text in texts if text.strip()]
+            if not docs:
+                self._lesson_embedding_key = key
+                self._lesson_embedding_index = None
+                return None
+
+            try:
+                from sklearn.decomposition import TruncatedSVD
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                from sklearn.preprocessing import normalize
+            except Exception:
+                self._lesson_embedding_key = key
+                self._lesson_embedding_index = None
+                return None
+
+            try:
+                max_features = max(128, int(os.getenv("SII_MEMORY_EMBEDDING_MAX_FEATURES", str(_LESSON_EMBEDDING_MAX_FEATURES))))
+            except ValueError:
+                max_features = _LESSON_EMBEDDING_MAX_FEATURES
+            try:
+                requested_dims = max(2, int(os.getenv("SII_MEMORY_EMBEDDING_DIMS", str(_LESSON_EMBEDDING_DIMS))))
+            except ValueError:
+                requested_dims = _LESSON_EMBEDDING_DIMS
+
+            try:
+                vectorizer = TfidfVectorizer(
+                    lowercase=True,
+                    token_pattern=r"(?u)\b\w\w+\b",
+                    ngram_range=(1, 2),
+                    stop_words="english",
+                    sublinear_tf=True,
+                    max_features=max_features,
+                )
+                tfidf = vectorizer.fit_transform(texts)
+                if tfidf.shape[0] == 0 or tfidf.shape[1] == 0:
+                    raise ValueError("empty lesson embedding vocabulary")
+                n_components = min(requested_dims, tfidf.shape[0] - 1, tfidf.shape[1] - 1)
+                if n_components >= 2:
+                    svd = TruncatedSVD(n_components=n_components, random_state=0)
+                    doc_vectors = normalize(svd.fit_transform(tfidf), norm="l2")
+                    backend = "lsa_svd"
+                else:
+                    svd = None
+                    doc_vectors = normalize(tfidf, norm="l2")
+                    backend = "tfidf_cosine"
+            except Exception:
+                self._lesson_embedding_key = key
+                self._lesson_embedding_index = None
+                return None
+
+            self._lesson_embedding_key = key
+            self._lesson_embedding_index = {
+                "backend": backend,
+                "docs": docs,
+                "vectorizer": vectorizer,
+                "svd": svd,
+                "doc_vectors": doc_vectors,
+            }
+            return self._lesson_embedding_index
+
+    @staticmethod
+    def _bm25_score(
+        query_counts: Counter[str],
+        doc_counts: Counter[str],
+        doc_len: int,
+        avgdl: float,
+        idf: dict[str, float],
+    ) -> float:
+        if not query_counts or doc_len <= 0 or avgdl <= 0:
+            return 0.0
+        score = 0.0
+        norm = _LESSON_BM25_K1 * (1.0 - _LESSON_BM25_B + _LESSON_BM25_B * doc_len / avgdl)
+        for term, qtf in query_counts.items():
+            tf = doc_counts.get(term, 0)
+            if tf <= 0:
+                continue
+            score += idf.get(term, 0.0) * ((tf * (_LESSON_BM25_K1 + 1.0)) / (tf + norm)) * min(qtf, 3)
+        return score
+
+    def _retrieve_lessons_embedding(self, question: str, k: int, task: str | None) -> list[dict]:
+        index = self._lesson_embedding(task)
+        if not index:
+            return []
+        query = _original_question(question) or question
+        qfeatures = _question_features(question)
+        try:
+            from sklearn.preprocessing import normalize
+        except Exception:
+            return []
+        vectorizer = index.get("vectorizer")
+        doc_vectors = index.get("doc_vectors")
+        docs = index.get("docs")
+        if vectorizer is None or doc_vectors is None or not isinstance(docs, list):
+            return []
+        try:
+            q = vectorizer.transform([query])
+            svd = index.get("svd")
+            if svd is not None:
+                q_vec = normalize(svd.transform(q), norm="l2")
+                sims = doc_vectors @ q_vec[0]
+            else:
+                q_vec = normalize(q, norm="l2")
+                sims = (q_vec @ doc_vectors.T).toarray()[0]
+        except Exception:
+            return []
+
+        scored: list[tuple[float, float, dict]] = []
+        query_features = qfeatures - {"2wiki"}
+        for i, doc in enumerate(docs):
+            if not isinstance(doc, dict):
+                continue
+            lesson = doc.get("lesson")
+            if not isinstance(lesson, dict):
+                continue
+            features = doc.get("features")
+            feature_overlap = len(query_features & (features if isinstance(features, set) else set()))
+            recency = float(doc.get("recency") or 0.0)
+            score = float(sims[i]) + _LESSON_EMBEDDING_FEATURE_BOOST * feature_overlap + _LESSON_EMBEDDING_RECENCY_BOOST * recency
+            if score > 0:
+                scored.append((score, recency, lesson))
         scored.sort(key=lambda x: (-x[0], -x[1]))
-        return [l for _, _, l in scored[:k]]
+        return [lesson for _, _, lesson in scored[:k]]
+
+    def _retrieve_lessons_bm25(self, question: str, k: int, task: str | None) -> list[dict]:
+        query = _original_question(question) or question
+        query_counts = Counter(_token_list(query))
+        qfeatures = _question_features(question)
+        index = self._lesson_bm25(task)
+        docs = index.get("docs", [])
+        avgdl = float(index.get("avgdl") or 0.0)
+        idf = index.get("idf", {})
+        if not isinstance(docs, list) or not isinstance(idf, dict):
+            return []
+
+        scored: list[tuple[float, float, dict]] = []
+        query_features = qfeatures - {"2wiki"}
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            lesson = doc.get("lesson")
+            counts = doc.get("counts")
+            if not isinstance(lesson, dict) or not isinstance(counts, Counter):
+                continue
+            bm25 = self._bm25_score(query_counts, counts, int(doc.get("length") or 0), avgdl, idf)
+            features = doc.get("features")
+            feature_overlap = len(query_features & (features if isinstance(features, set) else set()))
+            recency = float(doc.get("recency") or 0.0)
+            score = bm25 + _LESSON_FEATURE_BOOST * feature_overlap + _LESSON_RECENCY_BOOST * recency
+            if score > 0:
+                scored.append((score, recency, lesson))
+        scored.sort(key=lambda x: (-x[0], -x[1]))
+        return [lesson for _, _, lesson in scored[:k]]
+
+    def retrieve_lessons(self, question: str, k: int = 3, task: str | None = None) -> list[dict]:
+        mode = os.getenv("SII_MEMORY_RETRIEVAL", "embedding").strip().lower()
+        if mode in {"bm25", "keyword", "lexical"}:
+            return self._retrieve_lessons_bm25(question, k, task)
+        lessons = self._retrieve_lessons_embedding(question, k, task)
+        if lessons:
+            return lessons
+        return self._retrieve_lessons_bm25(question, k, task)
+
+    def search(
+        self,
+        query: str,
+        k: int = 5,
+        task: str | None = None,
+        include_lessons: bool = True,
+        include_episodes: bool = False,
+        include_skills: bool = False,
+        include_seed: bool = True,
+    ) -> list[dict]:
+        q = _original_question(query)
+        qtok = _tokens(q)
+        qfeatures = _question_features(q)
+        scored: list[tuple[float, float, dict]] = []
+
+        if include_lessons:
+            if task == "2wiki" and include_seed:
+                for lesson in _2WIKI_SEED_LESSONS:
+                    tags = set(lesson.get("tags") or [])
+                    specific_overlap = len((qfeatures - {"2wiki"}) & (tags - {"2wiki"}))
+                    failure_mode = str(lesson.get("failure_mode", ""))
+                    if failure_mode == "two_hop_context_policy":
+                        score = 30 + specific_overlap
+                    elif failure_mode == "format_violation":
+                        score = 18 + specific_overlap
+                    elif specific_overlap:
+                        score = 24 + 5 * specific_overlap
+                    else:
+                        continue
+                    scored.append((float(score), 1.0, {"type": "lesson", "source": "seed", "item": lesson}))
+
+            for lesson in self.all_lessons():
+                failure_mode = _clean_value(lesson.get("failure_mode")).lower()
+                if task == "2wiki" and failure_mode in {"", "none", "n/a", "na", "supported_answer", "correct", "already_correct"}:
+                    continue
+                text = " ".join(
+                    str(lesson.get(key, ""))
+                    for key in ("question", "failure_mode", "root_cause", "corrective_strategy", "reusable_lesson")
+                )
+                overlap = len(qtok & _tokens(text))
+                feature_overlap = len(qfeatures & _question_features(text))
+                score = overlap + 4 * feature_overlap
+                if score >= 2:
+                    scored.append((float(score), _recency(lesson.get("ts")), {"type": "lesson", "source": "memory", "item": lesson}))
+
+        if include_episodes:
+            for episode in self.all_episodes():
+                text = f"{episode.get('question', '')} {episode.get('answer', '')}"
+                overlap = len(qtok & _tokens(text))
+                if overlap >= 2:
+                    score = overlap + (2 if episode.get("correct") is True else 0)
+                    scored.append((float(score), _recency(episode.get("ts")), {"type": "episode", "source": "memory", "item": episode}))
+
+        if include_skills and task == "2wiki":
+            candidates = list(_2WIKI_SEED_SKILLS) if include_seed else []
+            candidates.extend(skill for skill in self.all_skills() if skill.get("task") == task)
+            for skill in candidates:
+                tags = set(_clean_list(skill.get("tags")))
+                tag_overlap = len((qfeatures - {"2wiki"}) & (tags - {"2wiki"}))
+                phrase_overlap = _phrase_hits(q, skill.get("triggers"))
+                token_overlap = len(qtok & _tokens(_skill_text(skill)))
+                score = 10 * phrase_overlap + 6 * tag_overlap + min(token_overlap, 4)
+                if str(skill.get("source")) == "seeded":
+                    score += 2
+                if score > 0:
+                    source = "seed" if str(skill.get("source")) == "seeded" else "memory"
+                    scored.append((float(score), _recency(skill.get("ts")), {"type": "skill", "source": source, "item": skill}))
+
+        scored.sort(key=lambda row: (-row[0], -row[1]))
+        results: list[dict] = []
+        for score, recency, payload in scored[:max(1, k)]:
+            item = dict(payload["item"])
+            results.append(
+                {
+                    "type": payload["type"],
+                    "source": payload["source"],
+                    "score": score,
+                    "recency": recency,
+                    "item": item,
+                }
+            )
+        return results
 
     def all_episodes(self) -> list[dict]:
         return self._read(self.episodes_path)

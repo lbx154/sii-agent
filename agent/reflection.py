@@ -28,16 +28,51 @@ Output STRICT JSON with keys:
   "corrective_strategy": "...",   // concrete next-time action, optimized for few searches
   "reusable_lesson": "...",       // <=200 chars, generic enough to help similar future tasks
   "skill_update": null | {
-    "target_skill_id": "...",     // one of: 2wiki_context_first, 2wiki_answer_span, 2wiki_family_chain, 2wiki_birthplace_granularity, 2wiki_worked_at_publication, 2wiki_comparison, 2wiki_demonym_country
+    "title": "...",               // 3-8 words summarizing the actual procedure, e.g. "Verify relation before answering"
+    "tags": ["..."],              // general task/tool/reasoning tags
     "trigger": "...",             // narrow question phrase where the update applies
     "step": "...",                // one concrete imperative step to add for future similar cases
     "verifier": "...",            // one check that would catch this failure without gold
     "bad_pattern": "..."          // one answer/tool pattern to avoid
   }
 }
-Set skill_update to null unless you can propose a narrow, procedural update to one listed skill.
+Set skill_update to null unless you can propose a narrow, procedural skill useful beyond this exact question.
+For skill_update.title, do NOT use generic labels such as "Reflection skill", "Reflection update", "Context first",
+or a dataset name. The title must summarize the concrete skill content using an imperative/action phrase.
 Never create a skill from hidden gold; use only visible trajectory evidence.
 No markdown, no prose outside the JSON.
+"""
+
+
+GOLD_REFLECT_SYS = """You are a training-time memory writer for a retrieval agent.
+
+You are given a question, the agent trajectory, the agent's final answer, and a hidden reference answer.
+Use the reference answer only as supervision to diagnose why the agent's process recovered after an
+incorrect attempt. Do not write a one-off memory that merely stores the reference answer, a benchmark
+name, dataset name, or the exact example.
+
+You MUST produce a high-quality reusable lesson and a non-null procedural skill_update. Optimize
+the memory for future tasks with a similar reasoning/tool failure.
+
+Output STRICT JSON with keys:
+{
+  "needs_retry": true,
+  "confidence": "high|medium|low",
+  "failure_mode": "...",          // concrete failure such as "wrong_relation", "bad_query", "missed_context", "overtrusted_memory"
+  "root_cause": "...",            // 1-2 sentences explaining the process failure, not just the correct answer
+  "corrective_strategy": "...",   // concrete next-time action, optimized for few searches/tools
+  "reusable_lesson": "...",       // <=240 chars, general and actionable; do not copy the reference answer
+  "skill_update": {
+    "title": "...",               // 3-8 words, concrete procedure title, e.g. "Verify Relation Direction First"
+    "tags": ["..."],              // general task/tool/reasoning tags, no benchmark/dataset names
+    "trigger": "...",             // narrow pattern where this skill applies
+    "step": "...",                // one imperative step that would prevent this failure
+    "verifier": "...",            // one non-gold check that would catch this failure next time
+    "bad_pattern": "..."          // one reasoning/tool pattern to avoid
+  }
+}
+No generic titles like "Reflection skill" or "Context first". No markdown or prose outside JSON.
+Never use the words "gold", "benchmark", or a dataset name in any output field.
 """
 
 
@@ -137,12 +172,14 @@ def reflect(
     result: HarnessResult,
     correct: bool | None = None,
     include_expected: bool = False,
+    force_memory: bool = False,
 ) -> dict:
     metadata_lines = []
     if include_expected and expected is not None:
-        metadata_lines.append(f"EXPECTED (gold): {expected}")
+        metadata_lines.append(f"REFERENCE_ANSWER_FOR_TRAINING: {expected}")
     if correct is False and include_expected:
         metadata_lines.append("EXTERNAL_EVAL: previous answer was judged incorrect")
+    system_prompt = GOLD_REFLECT_SYS if include_expected and (correct is False or force_memory) else REFLECT_SYS
     user = (
         f"QUESTION: {question}\n"
         + ("\n".join(metadata_lines) + "\n" if metadata_lines else "")
@@ -153,7 +190,7 @@ def reflect(
     )
     try:
         resp = chat(
-            [{"role": "system", "content": REFLECT_SYS}, {"role": "user", "content": user}],
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user}],
             response_format={"type": "json_object"},
             max_tokens=20000,
             timeout=30000,

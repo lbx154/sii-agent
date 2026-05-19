@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import string
+import unicodedata
 
 HONORIFICS = {"dr", "prof", "professor", "mr", "mrs", "ms", "miss", "sir", "dame"}
 
@@ -11,6 +12,9 @@ def normalize_answer(text: str | None) -> str:
     """Lowercase, strip punctuation/articles, and normalize whitespace."""
     if not text:
         return ""
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"(?<=\d),(?=\d)", "", text)
     text = text.lower()
     text = "".join(" " if ch in string.punctuation else ch for ch in text)
     text = re.sub(r"\b(a|an|the)\b", " ", text)

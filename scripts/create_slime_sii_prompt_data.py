@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
 def default_allowed_tools(task: str) -> list[str]:
     if task == "browsecomp-plus":
         return ["search", "final_answer"]
-    return ["wiki_search", "web_search", "browse", "browse_many", "final_answer"]
+    return ["wiki_search", "web_search", "browser_open", "browser_open_many", "final_answer"]
 
 
 def main() -> None:
