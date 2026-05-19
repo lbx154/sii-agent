@@ -262,11 +262,38 @@ def _cap_timeout_env(name: str, max_seconds: float) -> None:
         os.environ[name] = str(int(cap) if cap.is_integer() else cap)
 
 
-def _load_rows(csv_path: Path, n: int, offset: int) -> tuple[list[str], list[dict[str, str]], list[tuple[int, dict[str, str]]]]:
+def _parse_indices(raw: str) -> list[int]:
+    indices: list[int] = []
+    seen: set[int] = set()
+    for part in re.split(r"[,\s]+", str(raw or "").strip()):
+        if not part:
+            continue
+        index = int(part)
+        if index < 0:
+            raise ValueError("--indices values must be non-negative")
+        if index not in seen:
+            indices.append(index)
+            seen.add(index)
+    return indices
+
+
+def _load_rows(
+    csv_path: Path,
+    n: int,
+    offset: int,
+    indices: list[int] | None = None,
+) -> tuple[list[str], list[dict[str, str]], list[tuple[int, dict[str, str]]]]:
     with csv_path.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         fieldnames = list(reader.fieldnames or [])
         all_rows = [dict(row) for row in reader]
+    if indices is not None:
+        selected = []
+        for idx in indices:
+            if idx >= len(all_rows):
+                raise IndexError(f"--indices value {idx} is outside CSV row range 0..{len(all_rows) - 1}")
+            selected.append((idx, all_rows[idx]))
+        return fieldnames, all_rows, selected
     selected: list[tuple[int, dict[str, str]]] = []
     limit = len(all_rows) if n <= 0 else n
     for idx, row in enumerate(all_rows):
@@ -876,6 +903,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["both", "baseline_no_memory", "memory_query_only"], default="both")
     parser.add_argument("--n", type=int, default=100, help="Number of rows to run. Use 0 for all rows.")
     parser.add_argument("--offset", type=int, default=0)
+    parser.add_argument("--indices", default="", help="Comma/space-separated original CSV row indices to run; overrides --n/--offset.")
     parser.add_argument("--concurrency", type=int, default=50)
     parser.add_argument("--max-steps", type=int, default=26)
     parser.add_argument("--max-llm-tokens", type=int, default=120000)
@@ -915,7 +943,8 @@ def main() -> None:
     run_root = Path(args.out) / run_name
     run_root.mkdir(parents=True, exist_ok=True)
 
-    fieldnames, input_rows, selected_rows = _load_rows(csv_path, args.n, args.offset)
+    selected_indices = _parse_indices(args.indices) if args.indices else None
+    fieldnames, input_rows, selected_rows = _load_rows(csv_path, args.n, args.offset, selected_indices)
     images_dir = run_root.resolve() / "images"
     image_metas = []
     for idx, row in selected_rows:
@@ -925,6 +954,7 @@ def main() -> None:
         "csv_path": str(csv_path),
         "n": len(selected_rows),
         "offset": args.offset,
+        "indices": selected_indices,
         "concurrency": args.concurrency,
         "backend": os.getenv("LLM_BACKEND"),
         "base_url": os.getenv("VLLM_BASE_URL"),
