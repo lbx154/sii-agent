@@ -29,6 +29,30 @@ _CACHE_MAX = 512
 _CACHE_LOCK = Lock()
 _EXPANSION_CACHE: OrderedDict[str, tuple[list[str], dict[str, Any]]] = OrderedDict()
 _RERANK_CACHE: OrderedDict[str, tuple[list[dict[str, Any]], dict[str, Any]]] = OrderedDict()
+_GENERAL_MEMORY_SCOPES = {"keep_general", "general", "target_general", "global"}
+_TASK_SPECIFIC_SCOPES = {"keep_task_specific", "keep_simplevqa", "task_specific"}
+_GENERAL_TASK_FAMILIES = {"general", "target_general", "web_research"}
+_VISUAL_TASK_FAMILIES = {"simplevqa", "visual_qa", "vqa_search", "ocr"}
+_TEXT_TASK_FAMILIES = {"browsecomp_special", "multihop_text", "comparison", "relation_chain", "2wiki"}
+_GENERAL_CATEGORIES = {
+    "global_verification",
+    "query_reformulation",
+    "evidence_triage",
+    "format",
+    "multilingual",
+    "tool_recovery",
+    "generic_reasoning",
+    "browser_navigation",
+}
+_CROSS_MODAL_GENERAL_CATEGORIES = {
+    "global_verification",
+    "query_reformulation",
+    "evidence_triage",
+    "format",
+    "multilingual",
+    "tool_recovery",
+    "generic_reasoning",
+}
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -57,6 +81,18 @@ def _include_incorrect_episodes() -> bool:
 
 def _show_episode_answers() -> bool:
     return _env_bool("SII_MEMORY_SHOW_EPISODE_ANSWERS", not _memory_read_only())
+
+
+def _safe_checklist_enabled() -> bool:
+    return _env_bool("SII_MEMORY_SAFE_CHECKLIST", True)
+
+
+def _memory_return_ref_limit() -> int:
+    return _clamp_int(os.getenv("SII_MEMORY_MAX_RETURN_REFS", "3"), 3, 0, 6)
+
+
+def _memory_guidance_char_limit() -> int:
+    return _clamp_int(os.getenv("SII_MEMORY_GUIDANCE_MAX_CHARS", "480"), 480, 240, 900)
 
 
 def _write_blocked(tool_name: str) -> str | None:
@@ -201,6 +237,54 @@ def _original_question(text: str) -> str:
     return " ".join(value.split())
 
 
+def _heuristic_decision_text(query: str, prompt_context: dict[str, Any]) -> str:
+    query_question = _original_question(query)
+    if query_question:
+        return query_question
+    return _original_question(str(prompt_context.get("prompt_text") or ""))
+
+
+def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
+    return any(term in text for term in terms)
+
+
+def _looks_visual_query(text: str, image_attached: bool) -> bool:
+    return image_attached or _contains_any(
+        text,
+        (
+            "image", "photo", "picture", "visual", "screenshot", "poster", "cover", "logo", "diagram", "map",
+            "图", "图片", "图中", "照片", "画面", "截图", "海报", "封面", "地图", "标志", "车牌",
+        ),
+    )
+
+
+def _looks_ocr_query(text: str) -> bool:
+    return _contains_any(
+        text,
+        (
+            "ocr", "text in the image", "cover text", "book cover", "printed", "inscription", "caption",
+            "label", "sign", "title", "abbreviation", "acronym",
+            "文字", "文本", "字样", "写着", "英文缩写", "缩写", "书名", "标题", "封面",
+            "这本书", "书籍", "牌匾", "标牌", "标语", "铭文", "碑文", "题字", "印章", "字幕",
+        ),
+    )
+
+
+def _looks_comparison_query(text: str) -> bool:
+    if _contains_any(
+        text,
+        (
+            "came out first", "died first", "born later", "born earlier", "released earlier", "released later",
+            "older", "younger", "earlier", "later", "same country", "same nationality", "different country",
+            "both located", "which film has", "which came first",
+            "更早", "较早", "更晚", "较晚", "最早", "最晚", "相同", "不同", "同一", "两者",
+            "两个", "二者", "比较", "是否都", "都位于", "哪个更", "哪一个更",
+        ),
+    ):
+        return True
+    return bool(re.search(r"\bwhich\b.*\b(or|first|earlier|later|older|younger|same|different|both|more|less)\b", text))
+
+
 def _normalize_queries(query: str, queries: list[str] | None) -> list[str]:
     candidates = [str(item or "").strip() for item in (queries or [])]
     if query:
@@ -306,6 +390,9 @@ def _score_record(kind: str, item: dict[str, Any], queries: list[str]) -> tuple[
 def _infer_memory_metadata(kind: str, item: dict[str, Any]) -> dict[str, Any]:
     text = _flatten_text(item).lower()
     explicit_task_family = str(item.get("task_family") or "").strip().lower()
+    memory_scope = str(item.get("memory_scope") or "").strip().lower()
+    category = str(item.get("category") or "").strip().lower()
+    tags = [str(tag).strip().lower() for tag in (item.get("tags") or []) if str(tag).strip()]
     task_family = explicit_task_family or "general"
     if explicit_task_family:
         task_family = explicit_task_family
@@ -317,7 +404,8 @@ def _infer_memory_metadata(kind: str, item: dict[str, Any]) -> dict[str, Any]:
         task_family = "2wiki"
     elif "film" in text or "director" in text:
         task_family = "film_director"
-    modality = (
+    explicit_modality = str(item.get("modality") or "").strip().lower()
+    modality = explicit_modality if explicit_modality in {"image", "text"} else (
         "image"
         if task_family in {"visual_qa", "vqa_search", "ocr"}
         or any(term in text for term in ("image", "photo", "visual", "screenshot", "picture", "ocr"))
@@ -336,10 +424,150 @@ def _infer_memory_metadata(kind: str, item: dict[str, Any]) -> dict[str, Any]:
             confidence = 0.6
     return {
         "task_family": task_family,
+        "memory_scope": memory_scope,
+        "category": category,
+        "tags": tags[:12],
         "modality": modality,
         "confidence": round(confidence, 3),
-        "has_explicit_metadata": any(key in item for key in ("task_family", "modality", "source_run", "confidence")),
+        "has_explicit_metadata": any(
+            key in item for key in ("task_family", "memory_scope", "category", "modality", "source_run", "confidence")
+        ),
         "source_run": str(item.get("source_run") or item.get("run") or item.get("run_root") or ""),
+    }
+
+
+def _current_memory_profile(query: str, prompt_context: dict[str, Any]) -> dict[str, Any]:
+    prompt_text = str(prompt_context.get("prompt_text") or "")
+    decision_text = _heuristic_decision_text(query, prompt_context)
+    decision_lower = decision_text.lower()
+    full_lower = f"{query}\n{prompt_text}".lower()
+    image_attached = bool(prompt_context.get("image_attached"))
+    visual = _looks_visual_query(decision_lower, image_attached=image_attached) or _contains_any(
+        full_lower,
+        ("image path:", "image local path", "image source:", "image file/source"),
+    )
+    ocr = _looks_ocr_query(decision_lower)
+    comparison = _looks_comparison_query(decision_lower)
+    task = str(prompt_context.get("task") or "").strip().lower()
+    if "simplevqa" in task:
+        task_family = "simplevqa"
+    elif "provided context" in full_lower or "2wiki" in task or "2wikimultihopqa" in full_lower:
+        task_family = "2wiki"
+    elif task in {"benchmark_csv", "special"}:
+        task_family = "visual_qa" if visual else "browsecomp_special"
+    elif visual:
+        task_family = "ocr" if ocr else "visual_qa"
+    elif comparison:
+        task_family = "comparison"
+    else:
+        task_family = "web_research"
+    return {
+        "task": task,
+        "task_family": task_family,
+        "modality": "image" if visual else "text",
+        "visual": visual,
+        "ocr": ocr,
+        "comparison": comparison,
+    }
+
+
+def _is_general_memory(result: dict[str, Any]) -> bool:
+    metadata = result.get("metadata") or {}
+    scope = str(metadata.get("memory_scope") or "").lower()
+    task_family = str(metadata.get("task_family") or "").lower()
+    category = str(metadata.get("category") or "").lower()
+    tags = {str(tag).lower() for tag in (metadata.get("tags") or [])}
+    if scope in _TASK_SPECIFIC_SCOPES:
+        return False
+    if scope in _GENERAL_MEMORY_SCOPES:
+        return True
+    if task_family in {"general", "target_general"}:
+        return True
+    return bool(category and category in _GENERAL_CATEGORIES) or bool(tags & _GENERAL_CATEGORIES)
+
+
+def _general_memory_transfers(result: dict[str, Any], profile: dict[str, Any]) -> bool:
+    metadata = result.get("metadata") or {}
+    modality = str(metadata.get("modality") or "").lower()
+    category = str(metadata.get("category") or "").lower()
+    tags = {str(tag).lower() for tag in (metadata.get("tags") or [])}
+    cross_modal_policy = bool(category and category in _CROSS_MODAL_GENERAL_CATEGORIES) or bool(
+        tags & _CROSS_MODAL_GENERAL_CATEGORIES
+    )
+    task_family = str(metadata.get("task_family") or "").lower()
+    if task_family in _VISUAL_TASK_FAMILIES and profile["modality"] != "image" and not cross_modal_policy:
+        return False
+    if task_family in _TEXT_TASK_FAMILIES and profile["modality"] != "text" and not cross_modal_policy:
+        return False
+    if not modality or modality == profile["modality"]:
+        return True
+    return cross_modal_policy
+
+
+def _is_strong_specific_memory(result: dict[str, Any], profile: dict[str, Any]) -> bool:
+    metadata = result.get("metadata") or {}
+    task_family = str(metadata.get("task_family") or "").lower()
+    modality = str(metadata.get("modality") or "").lower()
+    score = float(result.get("score") or 0.0)
+    matched_terms = list(result.get("matched_terms") or [])
+    if modality and modality != profile["modality"]:
+        return False
+    if profile["modality"] == "image":
+        if task_family not in _VISUAL_TASK_FAMILIES:
+            return False
+        return score >= 10.0 or len(matched_terms) >= 4
+    if profile["task_family"] == "browsecomp_special":
+        return task_family == "browsecomp_special" and (score >= 10.0 or len(matched_terms) >= 4)
+    if profile["task_family"] == "2wiki":
+        return task_family in {"2wiki", "multihop_text", "comparison", "relation_chain"} and (
+            score >= 10.0 or len(matched_terms) >= 4
+        )
+    if profile["task_family"] in {"comparison", "web_research"}:
+        return task_family in {"web_research", "multihop_text", "comparison", "relation_chain"} and (
+            score >= 12.0 or len(matched_terms) >= 5
+        )
+    return task_family in _TEXT_TASK_FAMILIES and task_family == profile["task_family"]
+
+
+def _layer_memory_results(
+    results: list[dict[str, Any]],
+    prompt_context: dict[str, Any],
+    query: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    profile = _current_memory_profile(query, prompt_context)
+    general: list[dict[str, Any]] = []
+    specific: list[dict[str, Any]] = []
+    rejected = 0
+    for result in results:
+        row = dict(result)
+        if _is_general_memory(row) and _general_memory_transfers(row, profile):
+            row["memory_layer"] = "general_policy"
+            row["applicability_reason"] = "cross-domain abstract policy"
+            general.append(row)
+        elif _is_strong_specific_memory(row, profile):
+            row["memory_layer"] = "task_specific"
+            row["applicability_reason"] = "strong task/modality match"
+            specific.append(row)
+        else:
+            rejected += 1
+    max_refs = _memory_return_ref_limit()
+    max_general = min(max_refs, _clamp_int(os.getenv("SII_MEMORY_MAX_GENERAL_REFS", "2"), 2, 0, max_refs))
+    max_specific = max(0, max_refs - max_general)
+    selected = general[:max_general] + specific[:max_specific]
+    if len(selected) < max_refs:
+        selected.extend(specific[max_specific : max_specific + (max_refs - len(selected))])
+    return selected[:max_refs], {
+        "enabled": True,
+        "profile": profile,
+        "input_candidates": len(results),
+        "kept": len(selected[:max_refs]),
+        "kept_general_policy": min(len(general), max_general),
+        "kept_task_specific": max(0, min(len(specific), max_refs - min(len(general), max_general))),
+        "rejected_as_not_applicable": rejected,
+        "policy": (
+            "general cross-domain memories are used only as abstract checklist policies; "
+            "task-specific memories require a strong task/modality match"
+        ),
     }
 
 
@@ -468,6 +696,12 @@ def _format_memory_result(result: dict[str, Any], max_chars: int) -> dict[str, A
 
 def _compact_memory_ref(result: dict[str, Any]) -> dict[str, Any]:
     item = result["item"]
+    metadata = result.get("metadata", {}) or {}
+    compact_metadata = {
+        key: metadata.get(key)
+        for key in ("task_family", "memory_scope", "category", "modality", "confidence")
+        if metadata.get(key) not in (None, "", [])
+    }
     base = {
         "kind": result["kind"],
         "type": result["type"],
@@ -475,15 +709,17 @@ def _compact_memory_ref(result: dict[str, Any]) -> dict[str, Any]:
         "source": result["source"],
         "score": result["score"],
         "lexical_score": result.get("lexical_score", result["score"]),
-        "metadata": result.get("metadata", {}),
-        "matched_fields": result["matched_fields"][:8],
-        "matched_terms": result["matched_terms"][:12],
+        "metadata": compact_metadata,
+        "memory_layer": result.get("memory_layer"),
+        "applicability_reason": result.get("applicability_reason"),
+        "matched_fields": result["matched_fields"][:4],
+        "matched_terms": result["matched_terms"][:6],
     }
     if result["kind"] == "lessons":
         base["summary"] = {
             "failure_mode": _short(item.get("failure_mode"), 100),
-            "strategy": _short(item.get("corrective_strategy"), 260),
-            "lesson": _short(item.get("reusable_lesson"), 260),
+            "strategy": _short(item.get("corrective_strategy"), 160),
+            "lesson": _short(item.get("reusable_lesson"), 160),
         }
     elif result["kind"] == "skills":
         base["summary"] = {
@@ -738,15 +974,17 @@ def _memory_query_expansion_enabled() -> bool:
 
 def _heuristic_memory_queries(query: str, prompt_context: dict[str, Any], max_queries: int = _MAX_QUERIES) -> list[str]:
     prompt_text = str(prompt_context.get("prompt_text") or "")
-    combined = f"{query}\n{prompt_text}".lower()
+    decision_text = _heuristic_decision_text(query, prompt_context)
+    decision_lower = decision_text.lower()
+    full_lower = f"{query}\n{prompt_text}".lower()
     queries: list[str] = []
     image_attached = bool(prompt_context.get("image_attached"))
-    visual = image_attached or any(
-        term in combined
-        for term in ("image", "photo", "picture", "visual", "screenshot", "poster", "cover", "logo", "diagram")
+    visual = _looks_visual_query(decision_lower, image_attached=image_attached) or _contains_any(
+        full_lower,
+        ("image path:", "image local path", "image source:", "image file/source"),
     )
-    ocr = any(term in combined for term in ("ocr", "text in the image", "label", "sign", "caption", "cover text", "book cover", "printed"))
-    comparison = any(term in combined for term in ("which", "older", "younger", "earlier", "first", "same", "different", "compare"))
+    ocr = _looks_ocr_query(decision_lower)
+    comparison = _looks_comparison_query(decision_lower)
     if visual:
         if ocr:
             queries.extend(
@@ -773,11 +1011,11 @@ def _heuristic_memory_queries(query: str, prompt_context: dict[str, Any], max_qu
         queries.append("ocr text extraction image answer format")
     if comparison:
         queries.append("comparison compare both candidates answer format")
-    if any(term in combined for term in ("father", "mother", "wife", "husband", "spouse", "child", "grandfather", "grandmother", "in-law")):
+    if any(term in decision_lower for term in ("father", "mother", "wife", "husband", "spouse", "child", "grandfather", "grandmother", "in-law")):
         queries.append("multi-hop relation chain verify each hop")
-    if "provided context" in combined or "2wiki" in combined:
+    if "provided context" in full_lower or "2wiki" in full_lower:
         queries.append("multi-hop text qa context evidence verification")
-    if any(term in combined for term in ("award", "publisher", "author", "designer", "director", "species", "chemical", "formula")):
+    if any(term in decision_lower for term in ("award", "publisher", "author", "designer", "director", "species", "chemical", "formula")):
         queries.append("exact entity name verification search strategy")
     queries.append("concise final answer requested format")
     return _merge_queries(queries)[:max_queries]
@@ -995,7 +1233,103 @@ def _rerank_memory_results(
         return results, meta
 
 
-def _fallback_guidance(refs: list[dict[str, Any]], max_chars: int) -> dict[str, Any]:
+def _memory_ref_text(ref: dict[str, Any]) -> str:
+    summary = ref.get("summary") or {}
+    metadata = ref.get("metadata") or {}
+    return " ".join(
+        str(part or "")
+        for part in (
+            summary.get("failure_mode"),
+            summary.get("strategy"),
+            summary.get("lesson"),
+            summary.get("title"),
+            " ".join(str(step) for step in (summary.get("steps") or [])),
+            " ".join(str(step) for step in (summary.get("verifier") or [])),
+            " ".join(str(step) for step in (summary.get("avoid") or [])),
+            metadata.get("task_family"),
+            metadata.get("memory_scope"),
+            metadata.get("category"),
+            " ".join(str(tag) for tag in (metadata.get("tags") or [])),
+        )
+    ).lower()
+
+
+def _safe_checklist_items(refs: list[dict[str, Any]], profile: dict[str, Any] | None = None) -> tuple[list[str], list[str]]:
+    apply: list[str] = []
+    avoid: list[str] = []
+    current_modality = str((profile or {}).get("modality") or "")
+
+    def add_apply(item: str) -> None:
+        if item and item not in apply and len(apply) < 3:
+            apply.append(item)
+
+    def add_avoid(item: str) -> None:
+        if item and item not in avoid and len(avoid) < 2:
+            avoid.append(item)
+
+    for ref in refs[:3]:
+        text = _memory_ref_text(ref)
+        if any(term in text for term in ("format", "granularity", "unit", "date", "answer span", "ticker", "abbreviation")):
+            add_apply("Before final_answer, copy the exact requested span; preserve units, full names, date format, and abbreviations/tickers.")
+        if current_modality == "image" and any(term in text for term in ("visual", "image", "ocr", "logo", "screenshot", "cover", "photo")):
+            add_apply("For image questions, first extract visible text/visual identity, then verify the answer with current search evidence.")
+        if any(term in text for term in ("query", "search", "evidence", "triage", "verification", "hallucinated", "wrong_tool")):
+            add_apply("Use memory only as a checklist: verify the final candidate against current tool evidence before answering.")
+            add_avoid("Do not let memory choose the answer or replace current evidence.")
+        if any(term in text for term in ("constraint", "multi-hop", "relation", "comparison", "candidate", "self_contradictory")):
+            add_apply("Check each required constraint separately and reject candidates that satisfy only part of the question.")
+            add_avoid("Do not follow a candidate after a missing or contradicted constraint.")
+        if any(term in text for term in ("browser", "page", "open", "tool_recovery")):
+            add_apply("Open or inspect only promising sources; if a source does not support the target field, switch query instead of looping.")
+    if not apply:
+        add_apply("Use memory only as a generic verification checklist; solve from current evidence and keep the final answer concise.")
+        add_avoid("Do not treat retrieved memory as evidence for the current answer.")
+    return apply[:3], avoid[:2]
+
+
+def _safe_checklist_guidance(
+    refs: list[dict[str, Any]],
+    max_chars: int,
+    *,
+    source: str,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    apply, avoid = _safe_checklist_items(refs, profile)
+    guidance = "Memory checklist only, not evidence: " + " | ".join(apply)
+    supporting_refs = [
+        {
+            "kind": str(ref.get("kind")),
+            "id": str(ref.get("id")),
+            "why": _short(str(ref.get("applicability_reason") or ref.get("memory_layer") or "applicable checklist"), 120),
+        }
+        for ref in refs[:3]
+    ]
+    return {
+        "guidance": _short(guidance, max_chars),
+        "apply": [_short(item, 180) for item in apply[:3]],
+        "avoid": [_short(item, 160) for item in avoid[:2]],
+        "supporting_refs": supporting_refs,
+        "summary_source": source,
+    }
+
+
+def _compact_query_expansion_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(meta, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    for key in ("enabled", "expanded", "cache", "error", "image_attached"):
+        if key in meta:
+            compact[key] = meta[key]
+    added = meta.get("added")
+    if isinstance(added, list):
+        compact["added_count"] = len(added)
+        compact["added_preview"] = [_short(item, 120) for item in added[:3]]
+    return compact
+
+
+def _fallback_guidance(refs: list[dict[str, Any]], max_chars: int, profile: dict[str, Any] | None = None) -> dict[str, Any]:
+    if _safe_checklist_enabled():
+        return _safe_checklist_guidance(refs, max_chars, source="safe_checklist_fallback", profile=profile)
     apply: list[str] = []
     avoid: list[str] = []
     supporting_refs: list[dict[str, str]] = []
@@ -1031,17 +1365,20 @@ def _summarize_memory_guidance(
     refs: list[dict[str, Any]],
     *,
     max_chars: int,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not refs:
         return {
-            "guidance": "No relevant reusable memory was found; solve from current evidence and avoid inventing unsupported facts.",
+            "guidance": "No applicable reusable memory was found; solve from current evidence and avoid inventing unsupported facts.",
             "apply": [],
             "avoid": [],
             "supporting_refs": [],
             "summary_source": "empty",
         }
+    if _safe_checklist_enabled():
+        return _safe_checklist_guidance(refs, max_chars, source="safe_checklist", profile=profile)
     if os.getenv("SII_MEMORY_SEARCH_LLM_SUMMARY", "1").strip().lower() in {"0", "false", "no"}:
-        return _fallback_guidance(refs, max_chars)
+        return _fallback_guidance(refs, max_chars, profile=profile)
     try:
         from agent.llm import chat
 
@@ -1049,11 +1386,11 @@ def _summarize_memory_guidance(
             "You compress retrieved long-term memory for a general ReAct agent. "
             "You must transfer reusable methods from memory to the current problem, not copy old answers. "
             "Consider the full current prompt and any attached image together with the memory refs when deciding what transfers. "
-            "Do not dump records. Produce only the most useful, task-relevant guidance. "
-            "Memory is guidance, not evidence; tell the agent what procedure/checks to apply, not what final answer to give. "
-            "For web-search tasks, convert memory into concrete search discipline: which constraint to anchor first, "
-            "when to quote exact phrases, when to reject a candidate, and what answer-specific field must be verified. "
-            "If an attached image is present, inspect it directly and mention how visual clues should guide search/verification. "
+            "Do not dump records. Produce only the most useful, task-relevant checklist. "
+            "Memory is guidance, not evidence; tell the agent what generic checks to apply, not what final answer to give. "
+            "Never infer current candidates, entities, source names, dates, teams, directions, or answers from the current prompt/image. "
+            "For web-search tasks, convert memory into generic search discipline: verify each constraint, quote exact phrases, reject partial matches, and preserve requested answer format. "
+            "If an attached image is present, give only generic visual/OCR verification advice; do not identify the image. "
             "Do not mention gold answers, gold standards, benchmark names, dataset names, exact examples, or record dumps. "
             "If records mention gold/benchmark-specific wording, generalize it to requested-answer formatting and current-task verification. "
             "If a record looks stale, harmful, duplicate, or too specific, mention that it should be inspected with memory_get before update/delete. "
@@ -1072,14 +1409,15 @@ def _summarize_memory_guidance(
             "max_guidance_chars": max_chars,
             "output_schema": {
                 "guidance": f"single concise paragraph, <= {max_chars} chars",
-                "apply": ["2-5 concrete instructions"],
-                "avoid": ["0-4 pitfalls, especially candidate drift or answering with failed constraints"],
+                "apply": ["1-3 generic checklist items"],
+                "avoid": ["0-2 pitfalls, especially treating memory as evidence"],
                 "supporting_refs": [{"kind": "lessons|skills|episodes", "id": "record id", "why": "short reason"}],
             },
             "style_rules": [
                 "general, not benchmark-specific",
                 "never say gold answer/gold standard",
                 "do not use examples or exact entity names",
+                "do not name or imply current answer candidates",
                 "do not reveal full record content",
                 "transfer only reusable search/verification procedures that fit the current prompt and image",
                 "if no reusable memory is specific enough, say to solve from current evidence and do not invent unsupported answers",
@@ -1120,13 +1458,13 @@ def _summarize_memory_guidance(
             raise ValueError("memory summary missing guidance")
         return {
             "guidance": guidance,
-            "apply": _clean_str_list([_sanitize_guidance_text(item) for item in (parsed.get("apply") or [])], 5, 220),
-            "avoid": _clean_str_list([_sanitize_guidance_text(item) for item in (parsed.get("avoid") or [])], 4, 180),
-            "supporting_refs": supporting_refs or _fallback_guidance(refs, max_chars)["supporting_refs"],
+            "apply": _clean_str_list([_sanitize_guidance_text(item) for item in (parsed.get("apply") or [])], 3, 180),
+            "avoid": _clean_str_list([_sanitize_guidance_text(item) for item in (parsed.get("avoid") or [])], 2, 160),
+            "supporting_refs": supporting_refs or _fallback_guidance(refs, max_chars, profile=profile)["supporting_refs"],
             "summary_source": "llm",
         }
     except Exception as exc:  # noqa: BLE001
-        fallback = _fallback_guidance(refs, max_chars)
+        fallback = _fallback_guidance(refs, max_chars, profile=profile)
         fallback["summary_error"] = f"{type(exc).__name__}: {_short(exc, 240)}"
         return fallback
 
@@ -1146,7 +1484,7 @@ def _summarize_memory_guidance(
                 "default": [],
                 "description": "Focused query phrases generated by the agent: entities, relation words, failure modes, or task patterns.",
             },
-            "k": {"type": "integer", "default": 8, "minimum": 1, "maximum": 20},
+            "k": {"type": "integer", "default": 3, "minimum": 1, "maximum": 20},
             "task": {"type": "string", "default": "general"},
             "include_lessons": {"type": "boolean", "default": True},
             "include_episodes": {"type": "boolean", "default": True},
@@ -1154,7 +1492,7 @@ def _summarize_memory_guidance(
             "include_seed": {"type": "boolean", "default": False},
             "auto_prefetch": {"type": "boolean", "default": False},
             "max_chars_per_item": {"type": "integer", "default": 900, "minimum": 120, "maximum": 3000},
-            "guidance_max_chars": {"type": "integer", "default": 900, "minimum": 240, "maximum": 1800},
+            "guidance_max_chars": {"type": "integer", "default": 480, "minimum": 240, "maximum": 900},
         },
         "required": [],
     },
@@ -1162,7 +1500,7 @@ def _summarize_memory_guidance(
 def memory_search(
     query: str = "",
     queries: list[str] | None = None,
-    k: int = 8,
+    k: int = 3,
     task: str = "general",
     include_lessons: bool = True,
     include_episodes: bool = True,
@@ -1170,11 +1508,11 @@ def memory_search(
     include_seed: bool = False,
     auto_prefetch: bool = False,
     max_chars_per_item: int = 900,
-    guidance_max_chars: int = 900,
+    guidance_max_chars: int = 480,
 ) -> str:
-    k = _clamp_int(k, 8, 1, 20)
+    k = _clamp_int(k, 3, 1, 20)
     max_chars_per_item = _clamp_int(max_chars_per_item, 900, 120, 3000)
-    guidance_max_chars = _clamp_int(guidance_max_chars, 900, 240, 1800)
+    guidance_max_chars = min(_clamp_int(guidance_max_chars, 480, 240, 900), _memory_guidance_char_limit())
     root = _memory_root()
     if not str(query or "").strip() and queries:
         query = str(queries[0])
@@ -1209,9 +1547,17 @@ def memory_search(
         results.extend(kind_results)
     results.sort(key=lambda row: (-float(row["score"]), str(row["kind"]), str(row["id"])))
     results = _apply_metadata_soft_rerank(results, prompt_context)
-    results, rerank = _rerank_memory_results(query, normalized_queries, results, k=max(k, 1), auto_prefetch=bool(auto_prefetch))
-    compact_refs = [_compact_memory_ref(result) for result in results[:k]]
-    guidance = _summarize_memory_guidance(query, normalized_queries, compact_refs, max_chars=guidance_max_chars)
+    results, layering = _layer_memory_results(results, prompt_context, query)
+    results, rerank = _rerank_memory_results(query, normalized_queries, results, k=max(_memory_return_ref_limit(), 1), auto_prefetch=bool(auto_prefetch))
+    return_limit = min(k, _memory_return_ref_limit())
+    compact_refs = [_compact_memory_ref(result) for result in results[:return_limit]]
+    guidance = _summarize_memory_guidance(
+        query,
+        normalized_queries,
+        compact_refs,
+        max_chars=guidance_max_chars,
+        profile=layering.get("profile") if isinstance(layering, dict) else None,
+    )
     trace_summary = _summarize_current_trace()
     return json.dumps(
         {
@@ -1219,11 +1565,13 @@ def memory_search(
             "runtime_mode": _runtime_mode(),
             "read_only": _memory_read_only(),
             "query": query,
-            "initial_queries": initial_queries,
-            "heuristic_queries": heuristic_queries,
-            "queries_used": normalized_queries,
-            "query_expansion": query_expansion,
+            "initial_queries": initial_queries[:5],
+            "heuristic_queries": heuristic_queries[:5],
+            "queries_used": normalized_queries[:5],
+            "queries_used_count": len(normalized_queries),
+            "query_expansion": _compact_query_expansion_meta(query_expansion),
             "rerank": rerank,
+            "layering": layering,
             "scanned_records": scanned,
             "guidance_context": {
                 "used_current_prompt": bool(prompt_context["prompt_text"]),
@@ -1235,8 +1583,10 @@ def memory_search(
             "guidance": guidance,
             "record_refs": compact_refs,
             "full_records_suppressed": True,
+            "suppressed_result_count": max(0, len(results) - len(compact_refs)),
             "usage_note": (
-                "Use the guidance as an action plan, not as evidence. record_refs are compact ids/summaries only; "
+                "Use the guidance only as a short checklist, not as evidence or a source of answer candidates. "
+                "record_refs are compact ids/summaries only; "
                 "use memory_get for full content before risky updates/deletes. "
                 "Use memory_update/delete only when the returned id clearly identifies stale or bad memory. "
                 "Memory is guidance, not evidence; verify current answers from current context/tools."

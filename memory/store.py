@@ -505,6 +505,47 @@ def _original_question(question: str) -> str:
     return (match.group(1) if match else question or "").strip()
 
 
+def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
+    return any(term in text for term in terms)
+
+
+def _looks_visual_query(text: str) -> bool:
+    return _contains_any(
+        text,
+        (
+            "image", "photo", "picture", "visual", "screenshot", "poster", "cover", "logo", "diagram", "map",
+            "图", "图片", "图中", "照片", "画面", "截图", "海报", "封面", "地图", "标志", "车牌",
+        ),
+    )
+
+
+def _looks_ocr_query(text: str) -> bool:
+    return _contains_any(
+        text,
+        (
+            "ocr", "text in the image", "cover text", "book cover", "printed", "inscription", "caption",
+            "label", "sign", "title", "abbreviation", "acronym",
+            "文字", "文本", "字样", "写着", "英文缩写", "缩写", "书名", "标题", "封面",
+            "这本书", "书籍", "牌匾", "标牌", "标语", "铭文", "碑文", "题字", "印章", "字幕",
+        ),
+    )
+
+
+def _looks_comparison_query(text: str) -> bool:
+    if _contains_any(
+        text,
+        (
+            "came out first", "died first", "born later", "born earlier", "released earlier", "released later",
+            "older", "younger", "earlier", "later", "same country", "same nationality", "different country",
+            "both located", "which film has", "which came first",
+            "更早", "较早", "更晚", "较晚", "最早", "最晚", "相同", "不同", "同一", "两者",
+            "两个", "二者", "比较", "是否都", "都位于", "哪个更", "哪一个更",
+        ),
+    ):
+        return True
+    return bool(re.search(r"\bwhich\b.*\b(or|first|earlier|later|older|younger|same|different|both|more|less)\b", text))
+
+
 def _question_features(question: str) -> set[str]:
     q = _original_question(question).lower()
     tokens = _tokens(q)
@@ -605,12 +646,16 @@ def _lesson_text(lesson: dict) -> str:
 def _lesson_query_variants(question: str) -> list[str]:
     q = _original_question(question) or question or ""
     lower = q.lower()
+    full_lower = (question or "").lower()
     tokens = _tokens(q)
     variants = [q]
-    visual = any(term in lower for term in ("image", "photo", "picture", "visual", "logo", "poster", "cover", "screenshot"))
-    ocr = any(term in lower for term in ("ocr", "text in the image", "label", "sign", "caption", "cover text", "book cover", "printed"))
-    comparison = any(term in lower for term in ("which", "older", "younger", "earlier", "first", "same", "different", "compare"))
-    if visual or "image local path" in lower or "image source" in lower:
+    visual = _looks_visual_query(lower) or _contains_any(
+        full_lower,
+        ("image path:", "image local path", "image source:", "image file/source"),
+    )
+    ocr = _looks_ocr_query(lower)
+    comparison = _looks_comparison_query(lower)
+    if visual:
         if ocr:
             variants.extend(
                 [
@@ -638,7 +683,7 @@ def _lesson_query_variants(question: str) -> list[str]:
         variants.append("comparison compare both candidates answer format")
     if tokens & {"father", "mother", "wife", "husband", "spouse", "child", "grandfather", "grandmother"}:
         variants.append("multi-hop relation chain verify each hop")
-    if "provided context" in lower or "2wiki" in lower:
+    if "provided context" in full_lower or "2wiki" in full_lower:
         variants.append("multi-hop text qa context evidence verification")
     if any(term in lower for term in ("award", "publisher", "author", "designer", "director", "species", "chemical", "formula")):
         variants.append("exact entity name verification search strategy")
