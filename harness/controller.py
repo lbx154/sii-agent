@@ -33,6 +33,7 @@ class HarnessResult:
     tool_call_counts: dict[str, int] = field(default_factory=dict)
     finish_reasons: dict[str, int] = field(default_factory=dict)
     short_memory_stats: dict[str, int] = field(default_factory=dict)
+    internal_verify_results: list[dict[str, Any]] = field(default_factory=list)
 
 
 class StepGuard:

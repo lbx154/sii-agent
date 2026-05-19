@@ -274,37 +274,3 @@ def get_document(docid: str) -> str:
     if text is None:
         return json.dumps({"error": f"Document with docid '{docid}' not found"}, ensure_ascii=False)
     return json.dumps({"docid": str(docid), "text": text}, ensure_ascii=False, indent=2)
-
-
-@register(
-    "browsecomp_search",
-    "Legacy alias for BrowseComp-Plus search. Prefer the official-compatible `search` tool.",
-    {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Search query"},
-        },
-        "required": ["query"],
-        "additionalProperties": False,
-    },
-)
-def browsecomp_search(query: str, k: int = DEFAULT_K) -> str:
-    _ = k
-    return search(query)
-
-
-@register(
-    "browsecomp_get_document",
-    "Legacy alias for BrowseComp-Plus get_document. Prefer the official-compatible `get_document` tool.",
-    {
-        "type": "object",
-        "properties": {
-            "docid": {"type": "string", "description": "BrowseComp-Plus document id"},
-        },
-        "required": ["docid"],
-        "additionalProperties": False,
-    },
-)
-def browsecomp_get_document(docid: str, max_chars: int | None = None) -> str:
-    _ = max_chars
-    return get_document(docid)

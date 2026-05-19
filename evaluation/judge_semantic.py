@@ -52,6 +52,24 @@ def _json_from_text(text: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _judge_from_text(text: str) -> dict[str, Any] | None:
+    parsed = _json_from_text(text)
+    if parsed is not None and "correct" in parsed:
+        return parsed
+
+    # Small local models sometimes emit JSON-like text with unescaped quotes in
+    # "reason". Keep the judge usable by recovering the boolean decision.
+    match = re.search(r'"?correct"?\s*:\s*(true|false|"true"|"false")', text or "", flags=re.IGNORECASE)
+    if not match:
+        return None
+    correct = match.group(1).strip('"').lower() == "true"
+    reason = ""
+    reason_match = re.search(r'"?reason"?\s*:\s*"?(.*?)"?\s*}?\s*$', text or "", flags=re.IGNORECASE | re.S)
+    if reason_match:
+        reason = reason_match.group(1).strip().strip('"')
+    return {"correct": correct, "reason": reason}
+
+
 def _load_run(path: Path) -> list[dict[str, Any]]:
     runs_jsonl = path / "runs.jsonl" if path.is_dir() else path
     records = []
@@ -108,7 +126,7 @@ def _judge_one(client: Any, model: str, record: dict[str, Any], max_retries: int
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
             content = response.choices[0].message.content or ""
-            parsed = _json_from_text(content)
+            parsed = _judge_from_text(content)
             if parsed is None or "correct" not in parsed:
                 raise ValueError(f"could not parse judge JSON: {content[:300]}")
             correct = parsed.get("correct")

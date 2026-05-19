@@ -1,9 +1,10 @@
-"""Browser tools: static page fetches plus optional Playwright sessions."""
+"""Browser tools backed by Playwright sessions."""
 from __future__ import annotations
 
 import json
 import os
 import queue
+import re
 import threading
 import time
 import uuid
@@ -13,9 +14,11 @@ from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 import httpx
-from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
 from .registry import register
+
+load_dotenv()
 
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -24,10 +27,28 @@ _HEADERS = {
 _PLAYWRIGHT_INSTALL_HINT = "Run `python -m playwright install chromium` to enable browser_* tools."
 _BROWSER_MAX_SESSIONS = 4
 _BROWSER_IDLE_SECONDS = 15 * 60
+_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "both", "but", "by", "did", "do",
+    "does", "for", "from", "had", "has", "have", "he", "her", "his", "how", "in",
+    "is", "it", "its", "of", "on", "or", "she", "that", "the", "their", "this",
+    "to", "was", "were", "what", "when", "where", "which", "who", "whom", "whose",
+    "why", "with", "you", "your", "answer", "answering", "candidate", "context",
+    "first", "paragraphs", "provided", "question", "ranked", "relevance", "use",
+    "using", "wiki", "wikipedia",
+}
+_TOKEN_RE = re.compile(r"[\wÀ-ÖØ-öø-ÿĀ-žḀ-ỿ]+(?:['’.-][\wÀ-ÖØ-öø-ÿĀ-žḀ-ỿ]+)*", re.UNICODE)
 
 
 def _clamp(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, int(value)))
+
+
+def _default_extract_chars() -> int:
+    try:
+        value = int(os.getenv("BROWSER_EXTRACT_MAX_CHARS", "12000"))
+    except ValueError:
+        value = 12000
+    return _clamp(value, 1000, 50000)
 
 
 def _is_http_url(url: str) -> bool:
@@ -39,9 +60,152 @@ def _json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
+def _normalize_text(text: str) -> str:
+    return " ".join(str(text or "").split())
+
+
+def _canonical_extract_query(query: str) -> str:
+    query = str(query or "").strip()
+    if not query:
+        return ""
+    match = re.search(r"(?:^|\n)\s*Question:\s*(.*)", query, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        query = match.group(1)
+    query = re.split(
+        r"\n\s*\n|\s+Use the relevance-ranked\b|\s+Use the relevant\b|\s+Provided context\b",
+        query,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    return _normalize_text(query)[:1000]
+
+
+def _query_tokens(query: str) -> list[str]:
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for raw in _TOKEN_RE.findall(query.lower()):
+        token = raw.strip("'’.-_")
+        if len(token) < 2 or token in _STOPWORDS or token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tokens[:48]
+
+
+def _query_phrases(tokens: list[str]) -> list[str]:
+    phrases: list[str] = []
+    for size in (4, 3, 2):
+        for i in range(0, max(0, len(tokens) - size + 1)):
+            phrase = " ".join(tokens[i:i + size])
+            if len(phrase) >= 8:
+                phrases.append(phrase)
+    return phrases[:32]
+
+
+def _chunk_text(text: str, chunk_chars: int = 900, overlap: int = 180) -> list[tuple[int, str]]:
+    if len(text) <= chunk_chars:
+        return [(0, text)]
+    chunks: list[tuple[int, str]] = []
+    step = max(1, chunk_chars - overlap)
+    for start in range(0, len(text), step):
+        chunk = text[start:start + chunk_chars]
+        if chunk:
+            chunks.append((start, chunk))
+        if start + chunk_chars >= len(text):
+            break
+    return chunks
+
+
+def _score_chunk(chunk: str, tokens: list[str], phrases: list[str]) -> int:
+    text = chunk.lower()
+    score = 0
+    for token in tokens:
+        count = text.count(token)
+        if count:
+            score += min(count, 3) * (3 if len(token) >= 6 else 1)
+    for phrase in phrases:
+        if phrase in text:
+            score += 10
+    return score
+
+
+def _extract_relevant_text(text: str, query: str, max_chars: int) -> tuple[str, dict[str, Any]]:
+    budget = max_chars if max_chars > 0 else _default_extract_chars()
+    if len(text) <= budget:
+        return text, {
+            "mode": "full_text_short_enough",
+            "selected_chunks": [{"start": 0, "end": len(text), "score": None}],
+        }
+
+    tokens = _query_tokens(query)
+    if not tokens:
+        return text[:budget], {
+            "mode": "head_fallback_no_query_terms",
+            "selected_chunks": [{"start": 0, "end": min(len(text), budget), "score": None}],
+        }
+
+    phrases = _query_phrases(tokens)
+    scored = [
+        (score, start, chunk)
+        for start, chunk in _chunk_text(text)
+        if (score := _score_chunk(chunk, tokens, phrases)) > 0
+    ]
+    if not scored:
+        return text[:budget], {
+            "mode": "head_fallback_no_relevant_match",
+            "query_terms": tokens,
+            "selected_chunks": [{"start": 0, "end": min(len(text), budget), "score": 0}],
+        }
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    selected: list[tuple[int, int, int, str]] = []
+    used_ranges: list[tuple[int, int]] = []
+    used_chars = 0
+    for score, start, chunk in scored:
+        end = start + len(chunk)
+        if any(not (end <= used_start or start >= used_end) for used_start, used_end in used_ranges):
+            continue
+        separator_cost = 24 if selected else 0
+        if used_chars + len(chunk) + separator_cost > budget and selected:
+            continue
+        selected.append((start, end, score, chunk))
+        used_ranges.append((start, end))
+        used_chars += len(chunk) + separator_cost
+        if used_chars >= budget:
+            break
+
+    selected.sort(key=lambda item: item[0])
+    parts = [
+        f"[excerpt {i}, chars {start}-{end}, score {score}]\n{chunk.strip()}"
+        for i, (start, end, score, chunk) in enumerate(selected, 1)
+    ]
+    rendered = "\n\n---\n\n".join(parts)
+    return rendered[:budget], {
+        "mode": "query_focused_extract",
+        "query_terms": tokens,
+        "selected_chunks": [
+            {"start": start, "end": end, "score": score}
+            for start, end, score, _ in selected
+        ],
+    }
+
+
 def _aio_base_url() -> str | None:
-    base_url = os.getenv("AIO_SANDBOX_BASE_URL", "").strip().rstrip("/")
+    base_url = (
+        os.getenv("AIO_SANDBOX_BASE_URL", "")
+        or os.getenv("SANDBOX_BASE_URL", "")
+        or os.getenv("BROWSER_SERVICE_URL", "")
+    ).strip().rstrip("/")
     return base_url or None
+
+
+def _sandbox_headers() -> dict[str, str]:
+    token = (
+        os.getenv("SANDBOX_API_TOKEN", "")
+        or os.getenv("BROWSER_API_TOKEN", "")
+        or os.getenv("AIO_SANDBOX_API_TOKEN", "")
+    )
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 def _normalize_ws_url(cdp_url: str, base_url: str) -> str:
@@ -56,30 +220,45 @@ def _normalize_ws_url(cdp_url: str, base_url: str) -> str:
 
 
 def _aio_browser_info(base_url: str) -> dict[str, Any]:
-    response = httpx.get(f"{base_url}/v1/browser/info", timeout=10)
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"AIO browser info response must be an object: {payload}")
-    if payload.get("success") is False:
-        raise RuntimeError(payload.get("message") or "AIO browser info request failed")
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-    if not isinstance(data, dict):
-        raise RuntimeError(f"AIO browser info response missing data: {payload}")
+    headers = _sandbox_headers()
+    aio_error: BaseException | None = None
+    try:
+        response = httpx.get(f"{base_url}/v1/browser/info", headers=headers, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"AIO browser info response must be an object: {payload}")
+        if payload.get("success") is False:
+            raise RuntimeError(payload.get("message") or "AIO browser info request failed")
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        if not isinstance(data, dict):
+            raise RuntimeError(f"AIO browser info response missing data: {payload}")
+        data = dict(data)
+        data.setdefault("backend", "aio-sandbox")
+    except Exception as exc:  # noqa: BLE001
+        aio_error = exc
+        try:
+            response = httpx.get(f"{base_url}/browser/cdp_url", headers=headers, timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"browser-service cdp response must be an object: {payload}")
+            if payload.get("success") is False:
+                raise RuntimeError(payload.get("message") or "browser-service cdp request failed")
+            data = dict(payload)
+            data["backend"] = "browser-service"
+        except Exception as browser_service_error:  # noqa: BLE001
+            raise RuntimeError(
+                "remote browser discovery failed: "
+                f"AIO endpoint error={type(aio_error).__name__}: {aio_error}; "
+                "browser-service endpoint error="
+                f"{type(browser_service_error).__name__}: {browser_service_error}"
+            ) from browser_service_error
     cdp_url = data.get("cdp_url")
     if not cdp_url:
-        raise RuntimeError(f"AIO browser info response missing cdp_url: {payload}")
+        raise RuntimeError(f"remote browser response missing cdp_url: {payload}")
     data["cdp_url"] = _normalize_ws_url(str(cdp_url), base_url)
     return data
-
-
-def _html_snapshot(html: str, url: str, max_chars: int) -> dict[str, str]:
-    soup = BeautifulSoup(html, "lxml")
-    for t in soup(["script", "style", "noscript", "header", "footer", "nav"]):
-        t.decompose()
-    text = " ".join(soup.get_text(" ").split())
-    title = (soup.title.string or "").strip() if soup.title else ""
-    return {"title": title, "url": url, "text": text[:max_chars]}
 
 
 def _format_playwright_error(exc: BaseException) -> str:
@@ -94,11 +273,17 @@ def _wait_until(wait_until: str) -> str:
     return wait_until if wait_until in allowed else "domcontentloaded"
 
 
-def _snapshot(page: Any, max_chars: int = 4000, max_links: int = 20, max_controls: int = 20) -> str:
-    max_chars = _clamp(max_chars, 200, 20000)
+def _snapshot(
+    page: Any,
+    max_chars: int = 0,
+    max_links: int = 20,
+    max_controls: int = 20,
+    extract_query: str = "",
+) -> str:
+    max_chars = max(0, int(max_chars))
     max_links = _clamp(max_links, 0, 100)
     max_controls = _clamp(max_controls, 0, 100)
-    text = page.locator("body").inner_text(timeout=5000) if page.locator("body").count() else ""
+    text = _normalize_text(page.locator("body").inner_text(timeout=5000) if page.locator("body").count() else "")
     links = page.evaluate(
         """(limit) => Array.from(document.querySelectorAll('a')).slice(0, limit).map((a) => ({
             text: (a.innerText || a.getAttribute('aria-label') || '').trim().slice(0, 160),
@@ -118,15 +303,30 @@ def _snapshot(page: Any, max_chars: int = 4000, max_links: int = 20, max_control
         }))""",
         max_controls,
     )
-    return _json(
-        {
-            "title": page.title(),
-            "url": page.url,
-            "text": " ".join(text.split())[:max_chars],
-            "links": links,
-            "controls": controls,
+    focused_query = _canonical_extract_query(extract_query)
+    if focused_query:
+        rendered_text, extract_meta = _extract_relevant_text(text, focused_query, max_chars)
+    else:
+        rendered_text = text[:max_chars] if max_chars else text
+        extract_meta = {
+            "mode": "full_text" if not max_chars or len(text) <= max_chars else "manual_truncate",
+            "selected_chunks": [{"start": 0, "end": len(rendered_text), "score": None}],
         }
-    )
+
+    return _json({
+        "title": page.title(),
+        "url": page.url,
+        "text": rendered_text,
+        "text_mode": extract_meta["mode"],
+        "extract_query": focused_query,
+        "full_text_chars": len(text),
+        "returned_text_chars": len(rendered_text),
+        "omitted_text_chars": max(0, len(text) - len(rendered_text)),
+        "query_terms": extract_meta.get("query_terms", []),
+        "selected_chunks": extract_meta.get("selected_chunks", []),
+        "links": links,
+        "controls": controls,
+    })
 
 
 def _looks_like_text_target(target: str) -> bool:
@@ -372,7 +572,7 @@ _BROWSER_MANAGER = _BrowserManager()
 
 @register(
     "aio_sandbox_status",
-    "Check whether an All-in-One Sandbox browser backend is configured and reachable.",
+    "Check whether a remote sandbox/browser-service backend is configured and reachable.",
     {
         "type": "object",
         "properties": {},
@@ -384,7 +584,7 @@ def aio_sandbox_status() -> str:
         return _json(
             {
                 "configured": False,
-                "message": "Set AIO_SANDBOX_BASE_URL=http://127.0.0.1:8080 to use All-in-One Sandbox.",
+                "message": "Set SANDBOX_BASE_URL=http://127.0.0.1:8080 for browser-service, or AIO_SANDBOX_BASE_URL for All-in-One Sandbox.",
             }
         )
     try:
@@ -403,6 +603,7 @@ def aio_sandbox_status() -> str:
             "configured": True,
             "base_url": base_url,
             "reachable": True,
+            "backend": info.get("backend"),
             "cdp_url": info.get("cdp_url"),
             "vnc_url": info.get("vnc_url"),
             "viewport": info.get("viewport"),
@@ -412,85 +613,9 @@ def aio_sandbox_status() -> str:
 
 
 @register(
-    "browse",
-    "Fetch a URL and return its main readable text (truncated). "
-    "Use after web_search to read a specific page.",
-    {
-        "type": "object",
-        "properties": {
-            "url": {"type": "string"},
-            "max_chars": {"type": "integer", "default": 4000, "minimum": 200, "maximum": 20000},
-        },
-        "required": ["url"],
-    },
-)
-def browse(url: str, max_chars: int = 4000) -> str:
-    try:
-        if not _is_http_url(url):
-            return "ERROR: url must be an http(s) URL"
-        max_chars = _clamp(max_chars, 200, 20000)
-        r = httpx.get(url, headers=_HEADERS, timeout=20, follow_redirects=True)
-        r.raise_for_status()
-    except Exception as e:  # noqa: BLE001
-        return f"ERROR fetching {url}: {e}"
-    snapshot = _html_snapshot(r.text, str(r.url), max_chars)
-    return f"TITLE: {snapshot['title']}\nURL: {snapshot['url']}\n\n{snapshot['text']}"
-
-
-@register(
-    "browse_many",
-    "Fetch multiple static URLs concurrently and return JSON page text snapshots. "
-    "Use when several independent pages need to be read in parallel.",
-    {
-        "type": "object",
-        "properties": {
-            "urls": {
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": 1,
-                "maxItems": 20,
-            },
-            "max_chars": {"type": "integer", "default": 2000, "minimum": 200, "maximum": 10000},
-            "concurrency": {"type": "integer", "default": 4, "minimum": 1, "maximum": 16},
-        },
-        "required": ["urls"],
-    },
-)
-def browse_many(urls: list[str], max_chars: int = 2000, concurrency: int = 4) -> str:
-    if not urls:
-        return "ERROR: urls must contain at least one URL"
-    max_chars = _clamp(max_chars, 200, 10000)
-    concurrency = _clamp(concurrency, 1, 16)
-    limited_urls = urls[:20]
-    results: list[dict[str, Any] | None] = [None] * len(limited_urls)
-
-    def fetch_one(index: int, url: str, client: httpx.Client) -> dict[str, Any]:
-        if not _is_http_url(url):
-            return {"index": index, "url": url, "ok": False, "error": "url must be an http(s) URL"}
-        try:
-            response = client.get(url)
-            response.raise_for_status()
-            snapshot = _html_snapshot(response.text, str(response.url), max_chars)
-            return {"index": index, "ok": True, **snapshot}
-        except Exception as exc:  # noqa: BLE001
-            return {"index": index, "url": url, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
-
-    with httpx.Client(headers=_HEADERS, timeout=20, follow_redirects=True) as client:
-        with ThreadPoolExecutor(max_workers=min(concurrency, len(limited_urls))) as pool:
-            futures = {
-                pool.submit(fetch_one, index, url, client): index
-                for index, url in enumerate(limited_urls)
-            }
-            for future in as_completed(futures):
-                index = futures[future]
-                results[index] = future.result()
-
-    return _json({"results": results})
-
-
-@register(
     "browser_open",
-    "Open an http(s) URL in a persistent sandbox browser session and return JSON text/links/forms.",
+    "Open an http(s) URL in a persistent sandbox browser session and return JSON text/links/forms. "
+    "When extract_query is provided, the full page is read first and only relevant excerpts are returned.",
     {
         "type": "object",
         "properties": {
@@ -502,7 +627,17 @@ def browse_many(urls: list[str], max_chars: int = 2000, concurrency: int = 4) ->
                 "enum": ["commit", "domcontentloaded", "load", "networkidle"],
             },
             "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1000, "maximum": 120000},
-            "max_chars": {"type": "integer", "default": 4000, "minimum": 200, "maximum": 20000},
+            "max_chars": {
+                "type": "integer",
+                "default": 0,
+                "minimum": 0,
+                "description": "Maximum returned text characters; 0 uses full text unless extract_query is set, then uses the default extraction budget.",
+            },
+            "extract_query": {
+                "type": "string",
+                "default": "",
+                "description": "Optional question/query used to return only relevant excerpts from the full page text.",
+            },
         },
         "required": ["url"],
     },
@@ -512,16 +647,17 @@ def browser_open(
     session_id: str = "default",
     wait_until: str = "domcontentloaded",
     timeout_ms: int = 30000,
-    max_chars: int = 4000,
+    max_chars: int = 0,
+    extract_query: str = "",
 ) -> str:
     if not _is_http_url(url):
         return "ERROR: url must be an http(s) URL"
     timeout_ms = _clamp(timeout_ms, 1000, 120000)
-    max_chars = _clamp(max_chars, 200, 20000)
+    max_chars = max(0, int(max_chars))
 
     def action(page: Any) -> str:
         page.goto(url, wait_until=_wait_until(wait_until), timeout=timeout_ms)
-        return _snapshot(page, max_chars=max_chars)
+        return _snapshot(page, max_chars=max_chars, extract_query=extract_query)
 
     return _BROWSER_MANAGER.run(session_id, action, timeout_ms / 1000 + 5)
 
@@ -529,7 +665,8 @@ def browser_open(
 @register(
     "browser_open_many",
     "Open up to four http(s) URLs concurrently in separate sandbox browser sessions and return JSON snapshots. "
-    "Use for JavaScript-rendered pages that cannot be handled by static browse_many.",
+    "Use when several independent pages need to be read in parallel. When extract_query is provided, each full page "
+    "is read first and only relevant excerpts are returned.",
     {
         "type": "object",
         "properties": {
@@ -546,7 +683,17 @@ def browser_open(
                 "enum": ["commit", "domcontentloaded", "load", "networkidle"],
             },
             "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1000, "maximum": 120000},
-            "max_chars": {"type": "integer", "default": 3000, "minimum": 200, "maximum": 20000},
+            "max_chars": {
+                "type": "integer",
+                "default": 0,
+                "minimum": 0,
+                "description": "Maximum returned text characters per page; 0 uses full text unless extract_query is set, then uses the default extraction budget.",
+            },
+            "extract_query": {
+                "type": "string",
+                "default": "",
+                "description": "Optional shared question/query used to return only relevant excerpts from each full page.",
+            },
             "concurrency": {"type": "integer", "default": 4, "minimum": 1, "maximum": 4},
         },
         "required": ["urls"],
@@ -557,14 +704,15 @@ def browser_open_many(
     session_prefix: str = "bulk",
     wait_until: str = "domcontentloaded",
     timeout_ms: int = 30000,
-    max_chars: int = 3000,
+    max_chars: int = 0,
+    extract_query: str = "",
     concurrency: int = 4,
 ) -> str:
     if not urls:
         return "ERROR: urls must contain at least one URL"
     limited_urls = urls[:_BROWSER_MAX_SESSIONS]
     timeout_ms = _clamp(timeout_ms, 1000, 120000)
-    max_chars = _clamp(max_chars, 200, 20000)
+    max_chars = max(0, int(max_chars))
     concurrency = _clamp(concurrency, 1, _BROWSER_MAX_SESSIONS)
     prefix = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in session_prefix) or "bulk"
     call_id = uuid.uuid4().hex[:8]
@@ -578,6 +726,7 @@ def browser_open_many(
             wait_until=wait_until,
             timeout_ms=timeout_ms,
             max_chars=max_chars,
+            extract_query=extract_query,
         )
         try:
             snapshot: Any = json.loads(raw)
@@ -604,12 +753,23 @@ def browser_open_many(
 
 @register(
     "browser_text",
-    "Return the current sandbox browser page as JSON with title, URL, visible text, links, and controls.",
+    "Return the current sandbox browser page as JSON with title, URL, visible text, links, and controls. "
+    "When extract_query is provided, the full page is read first and only relevant excerpts are returned.",
     {
         "type": "object",
         "properties": {
             "session_id": {"type": "string", "default": "default"},
-            "max_chars": {"type": "integer", "default": 4000, "minimum": 200, "maximum": 20000},
+            "max_chars": {
+                "type": "integer",
+                "default": 0,
+                "minimum": 0,
+                "description": "Maximum returned text characters; 0 uses full text unless extract_query is set, then uses the default extraction budget.",
+            },
+            "extract_query": {
+                "type": "string",
+                "default": "",
+                "description": "Optional question/query used to return only relevant excerpts from the current page text.",
+            },
             "max_links": {"type": "integer", "default": 20, "minimum": 0, "maximum": 100},
             "max_controls": {"type": "integer", "default": 20, "minimum": 0, "maximum": 100},
         },
@@ -617,19 +777,27 @@ def browser_open_many(
 )
 def browser_text(
     session_id: str = "default",
-    max_chars: int = 4000,
+    max_chars: int = 0,
+    extract_query: str = "",
     max_links: int = 20,
     max_controls: int = 20,
 ) -> str:
     def action(page: Any) -> str:
-        return _snapshot(page, max_chars=max_chars, max_links=max_links, max_controls=max_controls)
+        return _snapshot(
+            page,
+            max_chars=max_chars,
+            max_links=max_links,
+            max_controls=max_controls,
+            extract_query=extract_query,
+        )
 
     return _BROWSER_MANAGER.run(session_id, action, 15)
 
 
 @register(
     "browser_click",
-    "Click a CSS selector or visible text in a sandbox browser session, then return the updated page JSON.",
+    "Click a CSS selector or visible text in a sandbox browser session, then return the updated page JSON. "
+    "When extract_query is provided, the full updated page is read first and only relevant excerpts are returned.",
     {
         "type": "object",
         "properties": {
@@ -645,7 +813,17 @@ def browser_text(
                 "enum": ["commit", "domcontentloaded", "load", "networkidle"],
             },
             "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1000, "maximum": 120000},
-            "max_chars": {"type": "integer", "default": 4000, "minimum": 200, "maximum": 20000},
+            "max_chars": {
+                "type": "integer",
+                "default": 0,
+                "minimum": 0,
+                "description": "Maximum returned text characters after clicking; 0 uses full text unless extract_query is set, then uses the default extraction budget.",
+            },
+            "extract_query": {
+                "type": "string",
+                "default": "",
+                "description": "Optional question/query used to return only relevant excerpts after clicking.",
+            },
         },
         "required": ["target"],
     },
@@ -656,10 +834,11 @@ def browser_click(
     by: str = "auto",
     wait_until: str = "domcontentloaded",
     timeout_ms: int = 30000,
-    max_chars: int = 4000,
+    max_chars: int = 0,
+    extract_query: str = "",
 ) -> str:
     timeout_ms = _clamp(timeout_ms, 1000, 120000)
-    max_chars = _clamp(max_chars, 200, 20000)
+    max_chars = max(0, int(max_chars))
 
     def action(page: Any) -> str:
         locator = _resolve_locator(page, target, by=by)
@@ -668,7 +847,7 @@ def browser_click(
             page.wait_for_load_state(_wait_until(wait_until), timeout=min(timeout_ms, 10000))
         except Exception:  # noqa: BLE001
             pass
-        return _snapshot(page, max_chars=max_chars)
+        return _snapshot(page, max_chars=max_chars, extract_query=extract_query)
 
     return _BROWSER_MANAGER.run(session_id, action, timeout_ms / 1000 + 5)
 
@@ -676,7 +855,8 @@ def browser_click(
 @register(
     "browser_type",
     "Fill an input/textarea/contenteditable target in a sandbox browser session, optionally pressing Enter. "
-    "Targets can be css=..., label=..., placeholder=..., name=..., visible text, or auto-resolved.",
+    "Targets can be css=..., label=..., placeholder=..., name=..., visible text, or auto-resolved. "
+    "When extract_query is provided, the full updated page is read first and only relevant excerpts are returned.",
     {
         "type": "object",
         "properties": {
@@ -693,7 +873,17 @@ def browser_click(
             },
             "submit": {"type": "boolean", "default": False},
             "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1000, "maximum": 120000},
-            "max_chars": {"type": "integer", "default": 4000, "minimum": 200, "maximum": 20000},
+            "max_chars": {
+                "type": "integer",
+                "default": 0,
+                "minimum": 0,
+                "description": "Maximum returned text characters after typing; 0 uses full text unless extract_query is set, then uses the default extraction budget.",
+            },
+            "extract_query": {
+                "type": "string",
+                "default": "",
+                "description": "Optional question/query used to return only relevant excerpts after typing.",
+            },
         },
         "required": ["target", "text"],
     },
@@ -705,10 +895,11 @@ def browser_type(
     by: str = "auto",
     submit: bool = False,
     timeout_ms: int = 30000,
-    max_chars: int = 4000,
+    max_chars: int = 0,
+    extract_query: str = "",
 ) -> str:
     timeout_ms = _clamp(timeout_ms, 1000, 120000)
-    max_chars = _clamp(max_chars, 200, 20000)
+    max_chars = max(0, int(max_chars))
 
     def action(page: Any) -> str:
         locator = _resolve_fill_locator(page, target, by=by)
@@ -719,7 +910,7 @@ def browser_type(
                 page.wait_for_load_state("domcontentloaded", timeout=min(timeout_ms, 10000))
             except Exception:  # noqa: BLE001
                 pass
-        return _snapshot(page, max_chars=max_chars)
+        return _snapshot(page, max_chars=max_chars, extract_query=extract_query)
 
     return _BROWSER_MANAGER.run(session_id, action, timeout_ms / 1000 + 5)
 
