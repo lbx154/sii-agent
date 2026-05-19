@@ -1,6 +1,7 @@
 """Evaluate baseline vs evolved on a benchmark; write per-run JSONL + summary."""
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -63,6 +64,16 @@ def _chunks(items: list[dict], size: int) -> Iterable[list[dict]]:
         yield items[start:start + size]
 
 
+def _examples_digest(examples: list[dict]) -> str:
+    h = hashlib.sha1()
+    for ex in examples:
+        h.update(str(ex.get("id", "")).encode("utf-8"))
+        h.update(b"\0")
+        h.update(str(ex.get("question", "")).encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
 def _record(
     ex: dict,
     outcome: RunOutcome,
@@ -118,6 +129,7 @@ def _run_one(
     lesson_context: str | None = None,
     allow_reflection: bool = True,
     use_gold_for_reflection: bool = False,
+    force_reflection: bool = False,
     save_traces: bool = False,
 ) -> dict:
     if mode == "baseline":
@@ -131,6 +143,7 @@ def _run_one(
             lesson_context=lesson_context,
             allow_reflection=allow_reflection,
             use_gold_for_reflection=use_gold_for_reflection,
+            force_reflection=force_reflection,
             task=ex.get("task"),
         )
     return _record(ex, outcome, save_traces=save_traces, lesson_context=lesson_context)
@@ -146,6 +159,7 @@ def _run_parallel_batch(
     lesson_contexts: dict[str, str] | None = None,
     allow_reflection: bool = True,
     use_gold_for_reflection: bool = False,
+    force_reflection: bool = False,
     save_traces: bool = False,
     batch_index: int | None = None,
 ) -> Iterable[dict]:
@@ -161,6 +175,7 @@ def _run_parallel_batch(
                 (lesson_contexts or {}).get(ex["id"]),
                 allow_reflection,
                 use_gold_for_reflection,
+                force_reflection,
                 save_traces,
             )
             for ex in examples
@@ -204,8 +219,11 @@ def run(
     offset: int,
     memory_root: str | None,
     memory_mode: str,
+    memory_k: int,
+    include_success_memory: bool,
     allow_reflection: bool,
     use_gold_for_reflection: bool,
+    force_reflection: bool,
     save_traces: bool,
     tool_profile: str | None = None,
     short_memory: bool = False,
@@ -262,6 +280,11 @@ def run(
     split = split or DEFAULT_SPLITS[task]
     examples = load_examples(task, n, offset, split=split, shuffle=shuffle, seed=seed)
     t0 = time.time()
+    success_memory_enabled = mode == "evolved" and (task != "2wiki" or include_success_memory)
+    memory_context_count = 0
+    memory_context_nonempty = 0
+    memory_context_total_chars = 0
+    memory_context_max_chars = 0
     maintenance_reports: list[dict] = []
 
     if mode == "baseline":
@@ -274,6 +297,7 @@ def run(
             f"{task}/{mode}",
             allow_reflection=allow_reflection,
             use_gold_for_reflection=use_gold_for_reflection,
+            force_reflection=force_reflection,
             save_traces=save_traces,
         )
     else:
@@ -281,6 +305,7 @@ def run(
         batch_size = max(1, batch_size)
 
         def evolved_records() -> Iterable[dict]:
+            nonlocal memory_context_count, memory_context_nonempty, memory_context_total_chars, memory_context_max_chars
             total_batches = (len(examples) + batch_size - 1) // batch_size
             processed = 0
             next_maintenance = max(1, memory_maintenance_interval) if memory_maintenance_interval > 0 else None
@@ -292,13 +317,20 @@ def run(
                         if self_retrieval_memory
                         else memory.render_for_prompt(
                             ex["question"],
-                            k=3,
+                            k=memory_k,
                             task=task,
-                            include_successes=(task != "2wiki"),
+                            include_successes=success_memory_enabled,
                         )
                     )
                     for ex in batch
                 }
+                for context in lesson_contexts.values():
+                    context_len = len(context or "")
+                    memory_context_count += 1
+                    memory_context_total_chars += context_len
+                    memory_context_max_chars = max(memory_context_max_chars, context_len)
+                    if context_len:
+                        memory_context_nonempty += 1
                 batch_records = list(_run_parallel_batch(
                     batch,
                     mode,
@@ -309,6 +341,7 @@ def run(
                     lesson_contexts,
                     allow_reflection=allow_reflection,
                     use_gold_for_reflection=use_gold_for_reflection,
+                    force_reflection=force_reflection,
                     save_traces=save_traces,
                     batch_index=i,
                 ))
@@ -355,7 +388,11 @@ def run(
     f_jsonl.close()
     summary = {
         "task": task, "split": split, "mode": mode, "n": n_total,
+        "run_dir": str(out),
         "offset": offset,
+        "first_id": examples[0]["id"] if examples else None,
+        "last_id": examples[-1]["id"] if examples else None,
+        "examples_sha1": _examples_digest(examples),
         "shuffle": shuffle,
         "seed": seed if shuffle else None,
         "accuracy": n_correct / n_total if n_total else 0.0,
@@ -373,9 +410,17 @@ def run(
         "runtime_mode": runtime_mode,
         "memory_mode": effective_memory_mode if mode == "evolved" else None,
         "requested_memory_mode": requested_memory_mode if mode == "evolved" else None,
+        "memory_k": memory_k if mode == "evolved" else None,
+        "success_memory_enabled": success_memory_enabled if mode == "evolved" else None,
+        "memory_context_records": memory_context_count if mode == "evolved" else None,
+        "memory_context_nonempty": memory_context_nonempty if mode == "evolved" else None,
+        "memory_context_avg_chars": (memory_context_total_chars / memory_context_count) if memory_context_count else None,
+        "memory_context_max_chars": memory_context_max_chars if mode == "evolved" else None,
         "allow_reflection": allow_reflection if mode == "evolved" else None,
         "use_gold_for_reflection": use_gold_for_reflection if mode == "evolved" else None,
         "requested_use_gold_for_reflection": requested_gold_reflection if mode == "evolved" else None,
+        "force_reflection": force_reflection if mode == "evolved" else None,
+        "memory_retrieval": os.getenv("SII_MEMORY_RETRIEVAL", "embedding") if mode == "evolved" else None,
         "save_traces": save_traces,
         "tool_profile": tool_profile or os.getenv("SII_AGENT_TOOL_PROFILE", "benchmark"),
         "short_memory": short_memory,
@@ -430,11 +475,27 @@ def main():
         default="read_write",
         help="Evolved mode only. read_write reuses/appends global memory by default; fresh explicitly clears it; read_only reuses without writing.",
     )
+    p.add_argument(
+        "--memory-k",
+        type=int,
+        default=3,
+        help="Evolved mode only: number of relevant lessons/success memories to retrieve.",
+    )
+    p.add_argument(
+        "--include-success-memory",
+        action="store_true",
+        help="Evolved mode only: include successful episode memories in prompts. For 2Wiki this is off by default unless set.",
+    )
     p.add_argument("--no-reflection", action="store_true")
     p.add_argument(
         "--gold-reflection",
         action="store_true",
         help="Pass gold answers into reflection. Off by default to avoid answer leakage in memory.",
+    )
+    p.add_argument(
+        "--force-reflection",
+        action="store_true",
+        help="Evolved mode only: run reflection on every sample without passing gold unless --gold-reflection is also set.",
     )
     p.add_argument("--save-traces", action="store_true")
     p.add_argument("--short-memory", action="store_true", help="Enable per-attempt compact working memory.")
@@ -491,8 +552,11 @@ def main():
         args.offset,
         args.memory_root,
         args.memory_mode,
+        args.memory_k,
+        args.include_success_memory,
         not args.no_reflection,
         args.gold_reflection,
+        args.force_reflection,
         args.save_traces,
         args.tool_profile,
         args.short_memory,

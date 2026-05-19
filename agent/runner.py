@@ -599,6 +599,7 @@ def run_evolved(question: str, expected: str | None = None,
                 allow_reflection: bool = True,
                 lesson_context: str | None = None,
                 use_gold_for_reflection: bool = False,
+                force_reflection: bool = False,
                 task: str | None = None) -> RunOutcome:
     cfg = cfg or HarnessConfig()
     memory = memory or MemoryStore()
@@ -618,7 +619,7 @@ def run_evolved(question: str, expected: str | None = None,
     reflection_useful = None
 
     should_reflect = allow_reflection and _allow_task_reflection(task) and (
-        _needs_self_reflection(res, cfg) or use_gold_for_reflection
+        _needs_self_reflection(res, cfg) or use_gold_for_reflection or force_reflection
     )
     if should_reflect:
         reflection = reflect(
