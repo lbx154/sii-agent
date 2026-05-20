@@ -16,3 +16,8 @@ indexes/
 third_party/
 saves/
 *.pdf
+
+# Services runtime
+services/*/.venv/
+services/*/node_modules/
+*.csv
