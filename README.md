@@ -62,9 +62,22 @@ pip install -r requirements.txt
 huggingface-cli download Qwen/Qwen3.5-9B --local-dir ./Qwen3.5-9B
 ```
 
-**方式二：用已经 merge 好的 OPD v13 权重**（如果你有的话）
+**方式二：下载已训练好的权重**
 
-把 merged 权重放在 `saves/qwen35-9b/merged/v13_step_final_opd_32k_full_lora_manual_merged` 这种路径下即可。下一步启动服务时指定路径。
+我们提供了两个公开的微调版本：
+
+- OPD 偏好蒸馏版本：[Takagiv/qwen35-9b-sii-opd-best](https://huggingface.co/Takagiv/qwen35-9b-sii-opd-best)
+- SFT 监督微调版本：[Takagiv/sft217-aligned-lr1e5-b8-e3-20260519-1330](https://huggingface.co/Takagiv/sft217-aligned-lr1e5-b8-e3-20260519-1330)
+
+```bash
+# 下载 OPD 版本
+huggingface-cli download Takagiv/qwen35-9b-sii-opd-best --local-dir ./saves/qwen35-9b-sii-opd-best
+
+# 或下载 SFT 版本
+huggingface-cli download Takagiv/sft217-aligned-lr1e5-b8-e3-20260519-1330 --local-dir ./saves/sft217-aligned
+```
+
+下载完后在启动 SGLang 时把 `SGLANG_MODEL` 指向对应路径即可。
 
 ### 第三步：启动模型推理服务
 
