@@ -468,9 +468,88 @@ python -m evaluation.judge_semantic \
 - semantic judge accuracy
 - baseline 与 evolved 的绝对分数和净差值
 
-## OPD / 偏好蒸馏
+## 训练启动（slime / OPD / RL）
 
-高级入口在 `training/opd.py`。典型流程是先保存 baseline/evolved 轨迹，再用专家模型构造偏好数据，导出 LlamaFactory DPO 配置：
+训练相关代码只提交入口脚本和 hook，数据、模型、日志和 checkpoint 都放在 `data/`、`indexes/`、`saves/`、`logs/`、`Qwen*/` 或 `third_party/` 下，默认被 `.gitignore` 排除。
+
+### 1. 准备基础环境
+
+```bash
+export SLIME_PYTHON=/root/myslime_env/bin/python
+export PYTHONPATH=/root/sii-agent:/root/sii-agent/third_party/slime:/root/sii-agent/third_party/Megatron-LM:${PYTHONPATH:-}
+```
+
+Qwen3.5-9B 需要先转换成 slime/Megatron 的 torch-dist 格式：
+
+```bash
+bash scripts/slime/convert-qwen3.5-9B.sh
+```
+
+### 2. 生成训练 prompt 数据
+
+2Wiki + BrowseComp-Plus 的常规 OPD smoke 数据：
+
+```bash
+PYTHON_BIN="${SLIME_PYTHON}" bash scripts/slime/prepare-sii-opd-data.sh
+```
+
+BrowseComp-Plus + MMSearch + benchmark CSV 的浏览器/视觉训练数据：
+
+```bash
+PYTHON_BIN="${SLIME_PYTHON}" bash scripts/slime/prepare-agent-opd-browser-data.sh
+```
+
+上面命令会写入 `data/slime/*.jsonl` 和 `data/slime/benchmark_images/`，这些是运行产物，不要提交。
+
+### 3. 启动 Agent OPD 训练
+
+主入口是 `scripts/slime/run-sii-qwen3.5-9B-opd.sh`，rollout hook 是 `training/slime_sii_rollout.py`。默认会启动 teacher SGLang、Ray 和 slime 训练任务；如果 teacher/Ray 已经在跑，显式设置复用开关：
+
+```bash
+SLIME_PYTHON=/root/myslime_env/bin/python \
+STUDENT_HF_CHECKPOINT=/root/sii-agent/Qwen3.5-9B \
+STUDENT_TORCH_DIST=/root/sii-agent/Qwen3.5-9B_torch_dist \
+TEACHER_HF_CHECKPOINT=/root/sii-agent/Qwen3.6-27B \
+PROMPT_DATA=/root/sii-agent/data/slime/sii_agent_browser_opd_train.jsonl \
+EVAL_PROMPT_DATA=/root/sii-agent/data/slime/sii_benchmark_answered_browser_eval.jsonl \
+REUSE_TEACHER=0 \
+REUSE_RAY=0 \
+bash scripts/slime/run-sii-qwen3.5-9B-opd.sh
+```
+
+常用覆盖项：
+
+| 变量 | 默认值 | 说明 |
+|---|---:|---|
+| `SII_SLIME_TRAIN_STEPS` | `26` | 本次提交的训练步数预算 |
+| `ROLLOUT_BATCH_SIZE` / `N_SAMPLES_PER_PROMPT` | `32` / `8` | rollout 并发和每题采样数 |
+| `SII_SLIME_MAX_STEPS` | `26` | 单条 ReAct 轨迹最大工具步 |
+| `SII_TRAIN_DROP_TRUNCATED` | `1` | 过滤截断样本 |
+| `SII_TRAIN_REQUIRE_FINAL_ANSWER` | `1` | 只保留有最终答案的样本 |
+| `SII_DISABLE_VISION_TOOLS_WHEN_UNAVAILABLE` | `1` | VLM endpoint 不通时自动移除视觉工具 |
+
+### 4. 启动纯 GRPO RL（无 teacher / 无 OPD）
+
+纯 RL 入口是 `scripts/slime/run-sii-qwen35-9b-rl.sh`，hook 是 `training/slime_sii_rl.py`。它使用同一套 Agent 工具注册表，只用规则奖励和轻量 tool-use shaping：
+
+```bash
+SLIME_PYTHON=/root/myslime_env/bin/python \
+PROMPT_DATA=/root/sii-agent/data/slime/sii_browsecomp_mmsearch_train_all.jsonl \
+EVAL_PROMPT_DATA=/root/sii-agent/data/slime/sii_browsecomp_test_64.jsonl \
+bash scripts/slime/run-sii-qwen35-9b-rl.sh
+```
+
+快速 smoke 可以缩小 batch：
+
+```bash
+PROMPT_DATA=/root/sii-agent/data/slime/sii_browsecomp_mmsearch_train_smoke32.jsonl \
+NUM_ROLLOUT=4 ROLLOUT_BATCH_SIZE=4 N_SAMPLES_PER_PROMPT=4 GLOBAL_BATCH_SIZE=8 \
+bash scripts/slime/run-sii-qwen35-9b-rl.sh
+```
+
+### 5. 离线 OPD / DPO 导出
+
+离线入口在 `training/opd.py`。典型流程是先保存 baseline/evolved 轨迹，再用专家模型构造偏好数据，导出 LlamaFactory DPO 配置：
 
 ```bash
 python -m evaluation.run_eval \
@@ -503,8 +582,6 @@ python -m training.opd \
 ```
 
 默认导出模式 `--lf-export-mode answer` 只优化最终答案文本，通常最稳；`final_tool` / `action` 会更强地改变工具策略，适合单独 ablation。
-
-slime 在线 Agent OPD 的接入点是 `training/slime_sii_rollout.py`，脚本在 `scripts/slime/` 下。
 
 ## 常见坑
 

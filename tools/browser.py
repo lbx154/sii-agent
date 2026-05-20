@@ -1078,6 +1078,14 @@ def browser_open_many(
         service_session_id = ""
         close_error = ""
         try:
+            if _looks_like_pdf_url(url):
+                return {
+                    "index": index,
+                    "session_id": "",
+                    "url": url,
+                    "ok": True,
+                    "snapshot": json.loads(_pdf_snapshot(url, max_chars=max_chars, extract_query=extract_query)),
+                }
             service_session_id = _service_session_id(session_prefix or "bulk")
             new_tab = _browser_service_request(
                 "POST",

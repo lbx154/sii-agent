@@ -15,6 +15,7 @@ MODEL_ARGS=(
    --normalization RMSNorm
    --apply-layernorm-1p
    --position-embedding-type rope
+   --no-rope-fusion
    --norm-epsilon 1e-6
    --rotary-percent 0.25
    --swiglu
@@ -25,4 +26,5 @@ MODEL_ARGS=(
 
    # qwen3.5 specific
    --attention-output-gate
+   --no-gradient-accumulation-fusion
 )

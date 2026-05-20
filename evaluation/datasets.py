@@ -2,6 +2,7 @@
 from __future__ import annotations
 import base64
 import hashlib
+import json
 import os
 import random
 import re
@@ -13,12 +14,14 @@ DEFAULT_SPLITS = {
     "simplevqa": "test",
     "2wiki": "validation",
     "browsecomp-plus": "test",
+    "mmsearch": "train",
 }
 AVAILABLE_SPLITS = {
     "simpleqa": ("test", "few_shot"),
     "simplevqa": ("test",),
     "2wiki": ("train", "validation", "test"),
     "browsecomp-plus": ("test",),
+    "mmsearch": ("train", "end2end"),
 }
 
 
@@ -249,7 +252,13 @@ def load_browsecomp_plus(n: int | None = None, split: str = "test") -> Iterator[
 
     from evaluation.run_browsecomp import DEFAULT_CANARY, load_examples as load_browsecomp_examples
 
-    rows = load_browsecomp_examples(source=None, n=0 if n is None else n, offset=0, canary=DEFAULT_CANARY)
+    local_source = Path(os.getenv("BROWSECOMP_PLUS_LOCAL_JSONL", "data/browsecomp-plus/browsecomp_plus_decrypted.jsonl"))
+    rows = load_browsecomp_examples(
+        source=local_source if local_source.exists() else None,
+        n=0 if n is None else n,
+        offset=0,
+        canary=DEFAULT_CANARY,
+    )
     for i, ex in enumerate(rows):
         evidence_docids = [
             str(doc.get("docid"))
@@ -267,11 +276,150 @@ def load_browsecomp_plus(n: int | None = None, split: str = "test") -> Iterator[
         }
 
 
+def _mmsearch_root() -> Path:
+    return Path(os.getenv("MMSEARCH_DATA_ROOT", "data/mmsearch"))
+
+
+def _mmsearch_image_cache_dir() -> Path:
+    return Path(os.getenv("MMSEARCH_IMAGE_CACHE", "data/mmsearch/materialized_images"))
+
+
+def _safe_filename(value: object) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "item")).strip("_") or "item"
+
+
+def _materialize_mmsearch_image(image: object, sample_id: object, suffix: str = "query") -> str:
+    cache = _mmsearch_image_cache_dir()
+    cache.mkdir(parents=True, exist_ok=True)
+    path = cache / f"{_safe_filename(sample_id)}_{suffix}.png"
+    if not path.exists():
+        if hasattr(image, "save"):
+            image.save(path)
+        else:
+            raise TypeError(f"Unsupported MMSearch image type: {type(image).__name__}")
+    return str(path.resolve())
+
+
+def _mmsearch_train_image_path(raw_path: object, data_id: object) -> str:
+    raw = Path(str(raw_path or ""))
+    root = _mmsearch_root() / "MMSearch_Train"
+    candidates = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    basename = raw.name or f"{data_id}.jpg"
+    candidates.extend(
+        [
+            root / "images" / "fvqa" / basename,
+            root / "images" / basename,
+            root / "fvqa" / basename,
+        ]
+    )
+    for path in candidates:
+        if path.exists():
+            return str(path.resolve())
+    raise FileNotFoundError(
+        "MMSearch train image not found. Expected the FVQA tarball to be extracted under "
+        f"{root / 'images' / 'fvqa'}; missing basename: {basename}"
+    )
+
+
+def _mmsearch_prompt(question: str, image_path: str | None) -> str:
+    if image_path:
+        return (
+            "You are answering an MMSearch visual factual question.\n"
+            f"Image path: {image_path}\n"
+            f"Question: {question}\n\n"
+            "Use visual/OCR evidence first. If `visual_web_search` is available, call it with the image path and exact question. "
+            "Otherwise call `image_to_text` or `image_to_search_queries`, then use web/wiki/browser tools to verify the answer. "
+            "Do not treat a visual guess as proven without search evidence when the question asks for an external fact. "
+            "When done, call `final_answer` with only the concise answer phrase."
+        )
+    return (
+        "You are answering an MMSearch factual question.\n"
+        f"Question: {question}\n\n"
+        "No local image is provided for this sample. Use web/wiki/browser retrieval tools to verify the answer. "
+        "When done, call `final_answer` with only the concise answer phrase."
+    )
+
+
+def _prompt_text(messages: object) -> str:
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, dict) and str(message.get("role") or "").lower() == "user":
+                content = str(message.get("content") or "").strip()
+                if content:
+                    return content
+        for message in messages:
+            if isinstance(message, dict) and str(message.get("content") or "").strip():
+                return str(message.get("content")).strip()
+    return str(messages or "").strip()
+
+
+def load_mmsearch(n: int | None = None, split: str = "train") -> Iterator[dict]:
+    if split not in AVAILABLE_SPLITS["mmsearch"]:
+        raise ValueError(f"Unsupported MMSearch split '{split}'. Available: {AVAILABLE_SPLITS['mmsearch']}")
+
+    root = _mmsearch_root()
+    if split == "train":
+        path = root / "MMSearch_Train" / "fvqa_train.jsonl"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"{path} not found. Download Raymond-Qiancx/MMSearch_Train to {root / 'MMSearch_Train'}."
+            )
+        with path.open("r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if n is not None and i >= n:
+                    break
+                if not line.strip():
+                    continue
+                ex = json.loads(line)
+                data_id = ex.get("data_id") or i
+                question = _prompt_text(ex.get("prompt"))
+                image_path = _mmsearch_train_image_path(ex.get("images"), data_id)
+                reward = ex.get("reward_model") or {}
+                yield {
+                    "id": f"mmsearch-train-{data_id}",
+                    "task": "mmsearch",
+                    "split": "train",
+                    "question": _mmsearch_prompt(question, image_path),
+                    "image": image_path,
+                    "answer": reward.get("ground_truth"),
+                    "category": ex.get("category"),
+                    "data_source": ex.get("data_source"),
+                }
+        return
+
+    from datasets import load_dataset
+
+    ds = load_dataset(str(root / "CaraJ-MMSearch"), "end2end", split="end2end")
+    for i, ex in enumerate(ds):
+        if n is not None and i >= n:
+            break
+        sample_id = ex.get("sample_id") or i
+        image_path = _materialize_mmsearch_image(ex["query_image"], sample_id) if ex.get("query_image") is not None else None
+        record = {
+            "id": f"mmsearch-end2end-{sample_id}",
+            "task": "mmsearch",
+            "split": "end2end",
+            "question": _mmsearch_prompt(str(ex["query"]), image_path),
+            "answer": ex.get("gt_answer"),
+            "alternative_answers": ex.get("alternative_gt_answers") or [],
+            "area": ex.get("area"),
+            "subfield": ex.get("subfield"),
+            "timestamp": ex.get("timestamp"),
+            "gt_requery": ex.get("gt_requery"),
+        }
+        if image_path:
+            record["image"] = image_path
+        yield record
+
+
 LOADERS = {
     "simpleqa": load_simpleqa,
     "simplevqa": load_simplevqa,
     "2wiki": load_2wiki,
     "browsecomp-plus": load_browsecomp_plus,
+    "mmsearch": load_mmsearch,
 }
 
 

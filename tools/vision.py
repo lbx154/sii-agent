@@ -136,6 +136,22 @@ def _env_api_key() -> str:
     return api_key
 
 
+def _is_local_base_url(base_url: str) -> bool:
+    hostname = urlparse(base_url).hostname
+    return hostname in {"127.0.0.1", "localhost", "::1"}
+
+
+def _assert_local_vlm_ready(base_url: str) -> None:
+    if os.getenv("VISION_SKIP_ENDPOINT_CHECK", "0").lower() in {"1", "true", "yes"}:
+        return
+    if not _is_local_base_url(base_url):
+        return
+    try:
+        httpx.get(f"{base_url.rstrip('/')}/models", timeout=1.0)
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"local VLM endpoint is not reachable: {base_url}") from exc
+
+
 def _is_http_url(source: str) -> bool:
     parsed = urlparse(source)
     return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
@@ -216,6 +232,7 @@ def _call_vision(model: str, image_data_url: str, prompt: str, max_tokens: int) 
     from openai import OpenAI
 
     base_url = _env_base_url()
+    _assert_local_vlm_ready(base_url)
     client = OpenAI(api_key=_env_api_key(), base_url=base_url, timeout=90)
     messages = [
         {
